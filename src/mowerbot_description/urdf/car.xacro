@@ -1,0 +1,13 @@
+<!-- 整車 -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="main_car">
+    <!-- PI -->
+    <xacro:property name="PI" value="3.141592653"/>
+
+    <!-- 包含子文件, 要在參數定義之後, 子文件才能使用父文件的参數 -->
+    <xacro:include filename="car_base.xacro"/>
+    <xacro:include filename="car_radar.xacro"/>
+</robot>
+
+
+
+<!--輪子半徑 0.17m 車子總長約 0.95x0.46x0.46 輪胎 1kg 車體57.2kg 電池16.2kg-->

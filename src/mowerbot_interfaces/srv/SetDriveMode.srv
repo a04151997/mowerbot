@@ -1,0 +1,3 @@
+uint8 mode #0:移動建圖 1:導航割草 2:搖桿控制割草
+---
+bool success
