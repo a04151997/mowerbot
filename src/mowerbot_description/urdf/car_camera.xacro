@@ -1,0 +1,64 @@
+<!-- camera -->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <!-- 攝像機尺寸-->
+    <xacro:property name="camera_length" value="0.11"/>
+    <xacro:property name="camera_width" value="0.25"/>
+    <xacro:property name="camera_height" value="0.08"/>
+
+    <!-- 攝像機偏移量 -->
+    <xacro:property name="camera_joint_x" value="${car_length / 2.0 - 0.02}"/>
+    <xacro:property name="camera_joint_y" value="0.0"/>
+    <xacro:property name="camera_joint_z" value="${car_height / 2.0 + camera_height / 2.0}"/>
+
+    <!-- 顏色 -->
+    <material name="red">
+        <color rgba="1.0 0.0 0.0 0.8"/>
+    </material>
+
+    <!-- 攝像機幾何 -->
+    <link name="camera">
+        <visual>
+            <geometry>
+                <box size="${camera_length} ${camera_width} ${camera_height}"/>
+            </geometry>
+            <material name="red"/>
+        </visual>
+    </link>
+
+    <!-- 攝像機關聯到base_link -->
+    <joint name="camera2base_link" type="fixed">
+        <parent link="base_link"/>
+        <child link="camera"/>
+        <origin xyz="${camera_joint_x} ${camera_joint_y} ${camera_joint_z}"/>
+    </joint>
+
+
+    <gazebo reference="camera">
+        <material>Gazebo/Red</material>
+        
+        <sensor name="main_camera" type="camera">
+            <always_on>true</always_on>
+            <visualize>true</visualize> 
+            <update_rate>30.0</update_rate> <camera name="head">
+                <horizontal_fov>1.3962634</horizontal_fov> <image>
+                    <width>640</width>  <height>480</height> <format>R8G8B8</format> </image>
+                <clip>
+                    <near>0.02</near> <far>300</far>    </clip>
+                <noise>
+                    <type>gaussian</type>
+                    <mean>0.0</mean>
+                    <stddev>0.007</stddev> 
+                </noise>
+            </camera>
+            
+            <plugin name="camera_controller" filename="libgazebo_ros_camera.so">
+                <alwaysOn>true</alwaysOn>
+                <updateRate>0.0</updateRate> <cameraName>camera</cameraName>
+                <imageTopicName>image_raw</imageTopicName> 
+                <cameraInfoTopicName>camera_info</cameraInfoTopicName>
+                <frameName>camera</frameName> 
+            </plugin>
+        </sensor>
+    </gazebo>
+
+</robot>

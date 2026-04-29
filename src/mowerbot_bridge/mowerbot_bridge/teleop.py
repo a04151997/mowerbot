@@ -13,14 +13,14 @@ class MowerTeleop(Node):
             parameters=[
                 ('scale_linear', 0.7),('scale_angular', 1.2),
                 ('axis_linear', 1),('axis_angular',0),
-                ('button_a', 0),('button_b', 1),('button_x',2),('button_y',3),('button_deadman',4)
+                ('button_a', 0),('button_b', 1),('button_x',2),('button_y',3),('button_deadman',4),('button_stop',5)
             ]
         )
 
 
         self.p = {k: self.get_parameter(k).value for k in ['scale_linear' ,'scale_angular' ,
          'axis_linear' , 'axis_angular' , 
-         'button_a' , 'button_b' , 'button_x' , 'button_y' , 'button_deadman'
+         'button_a' , 'button_b' , 'button_x' , 'button_y' , 'button_deadman','button_stop'
         ]
         }
 
@@ -42,6 +42,23 @@ class MowerTeleop(Node):
         if self.last_button is None:
             self.last_button = list(data.buttons)
             return
+        
+        is_estop_pressed = data.buttons[self.p['button_stop']] == 1
+        if is_estop_pressed:
+            # 立即發布全 0 的 Twist 強制煞車
+            stop_twist = Twist()
+            stop_twist.linear.x = 0.0
+            stop_twist.angular.z = 0.0
+            self.vel_pub.publish(stop_twist)
+        # 確保按鍵按下的瞬間 (Rising edge) 才呼叫服務，避免持續按住造成服務塞車
+            if self.last_button[self.p['button_stop']] == 0:
+                # 第二道防線：通知 Manager 進入急停模式
+                # Manager 收到此模式後，必須拒絕轉發任何後續的移動指令
+                self.call_service(4) 
+                self.get_logger().error('觸發緊急停止,所有功能已鎖定')
+            self.last_button = list(data.buttons)
+            return
+
         LB_ishold = data.buttons[self.p['button_deadman']] ==1
         if LB_ishold:            
                 if data.buttons[self.p['button_a']] == 1 and self.last_button[self.p['button_a']] == 0:

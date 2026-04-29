@@ -6,6 +6,8 @@
     <!-- 包含子文件, 要在參數定義之後, 子文件才能使用父文件的参數 -->
     <xacro:include filename="car_base.xacro"/>
     <xacro:include filename="car_radar.xacro"/>
+    <xacro:include filename="car_camera.xacro"/>
+    <xacro:include filename="car_imu.xacro"/>
 </robot>
 
 

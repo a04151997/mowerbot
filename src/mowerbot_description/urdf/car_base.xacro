@@ -1,28 +1,26 @@
-<!-- 底盤 -->
-<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
-    <!-- 車體尺寸 -->
-    <xacro:property name="car_length" value="3.0"/>
-    <xacro:property name="car_width" value="1.5"/>
-    <xacro:property name="car_height" value="0.6"/>
-
-    <!-- 離地間隙 -->
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mowerbot">
+    <xacro:property name="car_length" value="0.95"/>
+    <xacro:property name="car_width" value="0.46"/>
+    <xacro:property name="car_height" value="0.46"/>
+    <xacro:property name="car_mass" value="73.4"/> 
     <xacro:property name="ground_height" value="0.2"/>
 
-    <!-- 包含子文件, 要在參數定義之後, 子文件才能使用父文件的参數 -->
+    <xacro:include filename="car_inertia.xacro"/>
     <xacro:include filename="car_wheels.xacro"/>
 
-    <!-- 顏色 -->
     <material name="yellow">
         <color rgba="0.9 0.6 0.0 0.7"/>
     </material>
 
-    <!-- 根坐標 -->
     <link name="map"/>
-
-    <!-- 底盤在map的投影點 -->
     <link name="base_footprint"/>
 
-    <!-- 底盤 -->
+    <joint name="footprint_to_map" type="fixed">
+        <parent link="map"/>
+        <child link="base_footprint"/>
+    </joint>
+
     <link name="base_link">
         <visual>
             <geometry>
@@ -30,18 +28,40 @@
             </geometry>
             <material name="yellow"/>
         </visual>
+        <collision>
+            <geometry>
+                <box size="${car_length} ${car_width} ${car_height}"/>
+            </geometry>
+        </collision>
+        <xacro:box_inertia m="${car_mass}" w="${car_length}" h="${car_width}" d="${car_height}" o_xyz="0 0 -0.18"/>
     </link>
 
-    <!-- 投影點關聯到地圖 -->
-    <joint name="footprint_to_map" type="fixed">
-        <parent link="map"/>
-        <child link="base_footprint"/>
-    </joint>
-
-    <!-- 底盤關聯到投影點 -->
     <joint name="base_to_footprint" type="fixed">
         <parent link="base_footprint"/>
         <child link="base_link"/>
-        <origin xyz="0.0 0.0 ${car_height / 2.0 + ground_height}"/>
+        <origin xyz="0.0 0.0 ${car_height / 2.0 + ground_height}" rpy="0 0 0"/>
     </joint>
+
+    <gazebo>
+        <plugin name="mowerbot_diff_drive" filename="libgazebo_ros_diff_drive.so">
+            <left_joint>left_rear_wheel_joint</left_joint>
+            <right_joint>right_rear_wheel_joint</right_joint>
+
+            <wheel_separation>0.58</wheel_separation>
+            <wheel_diameter>0.34</wheel_diameter>
+
+            <max_wheel_torque>200</max_wheel_torque> <max_wheel_acceleration>1.0</max_wheel_acceleration>
+
+            <command_topic>cmd_vel</command_topic>
+            <odometry_topic>odom</odometry_topic>
+            <odometry_frame>odom</odometry_frame>
+            <robot_base_frame>base_footprint</robot_base_frame>
+
+            <update_rate>30</update_rate>
+            <publish_odom>true</publish_odom>
+            <publish_odom_tf>true</publish_odom_tf>
+            <publish_wheel_tf>true</publish_wheel_tf>
+        </plugin>
+    </gazebo>
+
 </robot>
