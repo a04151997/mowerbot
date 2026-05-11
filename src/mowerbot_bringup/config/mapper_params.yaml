@@ -1,0 +1,29 @@
+
+slam_toolbox:
+  ros__parameters:
+    # 核心參數
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_loss_function: None
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function_type: HuberLoss
+
+    # 坐標系定義 (與你的 URDF 對齊)
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_footprint # 使用底盤投影點作為基準
+    scan_topic: /scan # 訂閱你 radar.xacro 發布的話題
+
+    # 物理與感測器限制
+    max_laser_range: 12.0 # 配合你雷達外掛程式的設定
+    minimum_time_interval: 0.1 
+    transform_timeout: 1.0
+    tf_buffer_duration: 30.
+    stack_size_to_use: 40000000 # 避免大場地時記憶體崩潰
+
+    # 建圖精度
+    resolution: 0.05 # 5公分解析度
+    max_range: 12.0
+    min_range: 0.15 # 避開車體干擾  

@@ -15,16 +15,13 @@ setup(
     zip_safe=True,
     maintainer='a',
     maintainer_email='a0987747836@gmail.com',
-    description='TODO: Package description',
+    description='MowerBot 決策與管理套件',
     license='TODO: License declaration',
-    extras_require={
-        'test': [
-            'pytest',
-        ],
-    },
+    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'manager = mowerbot_action.manager:main',
+            # 關鍵點：'執行檔名稱 = 套件名.檔名:函數名'
+            'mower_manager = mowerbot_action.manager:main'
         ],
     },
 )

@@ -1,59 +1,82 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch_ros.actions import Node
+from launch.substitutions import LaunchConfiguration
+# 注意：SetParameter 位於 launch_ros.actions 之中
+from launch_ros.actions import Node, SetParameter
 
 def generate_launch_description():
     # 1. 取得各個套件的路徑
     bringup_dir = get_package_share_directory('mowerbot_bringup')
     description_dir = get_package_share_directory('mowerbot_description')
+    bridge_dir = get_package_share_directory('mowerbot_bridge')
 
-    # 2. 引入機器人模型 (Include description.launch.py)
-    # 我們不直接跑 display，而是跑只載入模型、不帶 GUI 的 launch
+    # 2. 宣告 Launch 參數
+    use_sim_time = LaunchConfiguration('use_sim_time', default='true')
+
+    # 3. 定義節點與包含的 Launch 檔案
+    
+    # 機器人描述檔與狀態發布器
     robot_description_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(description_dir, 'launch', 'robot_state_publisher.launch.py')
-        )
+        ),
+        launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # 3. 啟動手把驅動節點
+    # 關節狀態發布器 (解決前輪不顯示的關鍵)
+    joint_state_publisher = Node(
+        package='joint_state_publisher',
+        executable='joint_state_publisher',
+        name='joint_state_publisher',
+        parameters=[{'use_sim_time': use_sim_time}]
+    )
+
+    # SLAM 建圖
+    slam_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(bringup_dir, 'launch', 'mapping.launch.py')
+        ),
+        launch_arguments={'use_sim_time': use_sim_time}.items()
+    )
+
+    # 手把硬體驅動
     joy_node = Node(
         package='joy',
         executable='joy_node',
         name='joy_node',
-        parameters=[{'dev': '/dev/input/js0'}] # 視你的設備路徑而定
+        parameters=[{'deadzone': 0.05, 'use_sim_time': use_sim_time}]
     )
 
-    # 4. 啟動你的手把組合鍵控制節點 (Teleop)
+    # 手把控制邏輯
     teleop_node = Node(
         package='mowerbot_bridge',
         executable='teleop_node',
         name='mower_teleop',
-        # 如果你有參數檔，放在這裡
-        # parameters=[os.path.join(bringup_dir, 'config', 'teleop.yaml')]
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
     )
 
-    # 5. 啟動你的大腦管理節點 (Manager)
+    # 模式管理與 Watchdog
     manager_node = Node(
         package='mowerbot_action',
-        executable='manager',
-        name='mower_manager'
+        executable='mower_manager',
+        name='mower_manager',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
     )
 
-    # 6. 啟動 RViz2 (視覺化)
-    rviz_node = Node(
-        package='rviz2',
-        executable='rviz2',
-        name='rviz2',
-        arguments=['-d', os.path.join(description_dir, 'rviz', 'mower_view.rviz')]
-    )
-
+    # 4. 回傳 LaunchDescription
     return LaunchDescription([
+        # 【核心修正】全域設定模擬時間參數
+        SetParameter(name='use_sim_time', value=use_sim_time),
+
         robot_description_launch,
+        joint_state_publisher,
+        slam_launch,
         joy_node,
         teleop_node,
-        manager_node,
-        rviz_node
+        manager_node
     ])
