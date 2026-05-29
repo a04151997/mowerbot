@@ -50,6 +50,15 @@ def generate_launch_description():
         parameters=[{'deadzone': 0.05, 'use_sim_time': use_sim_time}]
     )
 
+    # 邊界提取節點
+    boundary_node = Node(
+        package='mowerbot_action',
+        executable='map_to_boundary',
+        name='map_to_boundary',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
+    )
+
     # 手把控制邏輯
     teleop_node = Node(
         package='mowerbot_bridge',
@@ -78,5 +87,6 @@ def generate_launch_description():
         slam_launch,
         joy_node,
         teleop_node,
-        manager_node
+        manager_node,
+        boundary_node,
     ])

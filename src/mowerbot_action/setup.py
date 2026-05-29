@@ -21,7 +21,8 @@ setup(
     entry_points={
         'console_scripts': [
             # 關鍵點：'執行檔名稱 = 套件名.檔名:函數名'
-            'mower_manager = mowerbot_action.manager:main'
+            'mower_manager = mowerbot_action.manager:main',
+            'map_to_boundary = mowerbot_action.map_to_boundary:main',
         ],
     },
 )

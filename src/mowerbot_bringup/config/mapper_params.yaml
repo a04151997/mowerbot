@@ -2,6 +2,7 @@
 slam_toolbox:
   ros__parameters:
     # 核心參數
+    use_sim_time: true
     solver_plugin: solver_plugins::CeresSolver
     ceres_loss_function: None
     ceres_linear_solver: SPARSE_NORMAL_CHOLESKY

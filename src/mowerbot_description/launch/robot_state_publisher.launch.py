@@ -11,7 +11,7 @@ def generate_launch_description():
     # 讀取並處理 Xacro (指向你的主檔案 car.xacro)
     xacro_file = os.path.join(pkg_path, 'urdf', 'car.xacro')
     robot_description_config = xacro.process_file(xacro_file)
-    params = {'robot_description': robot_description_config.toxml()}
+    params = {'robot_description': robot_description_config.toxml(), 'use_sim_time': True}
 
     # 定義發布器節點
     node_robot_state_publisher = Node(
