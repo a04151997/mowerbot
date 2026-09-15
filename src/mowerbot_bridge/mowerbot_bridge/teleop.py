@@ -73,16 +73,24 @@ class MowerTeleop(Node):
                 elif data.buttons[self.p['button_y']] == 1 and self.last_button[self.p['button_y']] == 0:
                     self.call_service(3) #導航
                     self.get_logger().info('切換導航模式')
-        #處理速度輸出
-        twist = Twist()
-        linear_val = data.axes[self.p['axis_linear']]
-        angular_val = data.axes[self.p['axis_angular']]
-        if abs(linear_val) < 0.05: linear_val = 0.0
-        if abs(angular_val) < 0.05: angular_val = 0.0
-        twist.linear.x = linear_val * self.p['scale_linear']            #指令速度(Twist)=搖桿推動量(Joy Data)x最大速限(Scale)
-        twist.angular.z = angular_val * self.p['scale_angular']
 
-        self.vel_pub.publish(twist)
+                #處理速度輸出：只有按住 LB (deadman) 時才把搖桿值算進 twist
+                twist = Twist()
+                linear_val = data.axes[self.p['axis_linear']]
+                angular_val = data.axes[self.p['axis_angular']]
+                if abs(linear_val) < 0.05: linear_val = 0.0
+                if abs(angular_val) < 0.05: angular_val = 0.0
+                twist.linear.x = linear_val * self.p['scale_linear']            #指令速度(Twist)=搖桿推動量(Joy Data)x最大速限(Scale)
+                twist.angular.z = angular_val * self.p['scale_angular']
+
+                self.vel_pub.publish(twist)
+        else:
+            # 沒按住 LB：持續發布全 0 的 Twist，確保車體停住而不是維持上一個速度
+            stop_twist = Twist()
+            stop_twist.linear.x = 0.0
+            stop_twist.angular.z = 0.0
+            self.vel_pub.publish(stop_twist)
+
         self.last_button = list(data.buttons)
 
     def call_service(self,mode):

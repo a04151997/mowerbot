@@ -4,6 +4,7 @@ from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
 # 注意：SetParameter 位於 launch_ros.actions 之中
 from launch_ros.actions import Node, SetParameter
 
@@ -17,13 +18,19 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
 
     # 3. 定義節點與包含的 Launch 檔案
-    
+
     # 機器人描述檔與狀態發布器
+    # 模擬時 gazebo.launch.py 已經啟動 robot_state_publisher
+    # (spawn_entity 需要從 /robot_description 讀 URDF)，
+    # 這裡再啟動一次會出現兩個同名節點同時對 /tf 與 /robot_description 發布相同內容，
+    # 產生大量 TF_REPEATED_DATA 警告，所以預設 false；
+    # 之後跑實體車 (沒有 Gazebo) 時要用 start_rsp:=true 啟動它。
     robot_description_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(description_dir, 'launch', 'robot_state_publisher.launch.py')
         ),
-        launch_arguments={'use_sim_time': use_sim_time}.items()
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
+        condition=IfCondition(LaunchConfiguration('start_rsp'))
     )
 
     # 關節狀態發布器 (解決前輪不顯示的關鍵)
@@ -47,7 +54,10 @@ def generate_launch_description():
         package='joy',
         executable='joy_node',
         name='joy_node',
-        parameters=[{'deadzone': 0.05, 'use_sim_time': use_sim_time}]
+        parameters=[
+            os.path.join(bridge_dir, 'config', 'joystick.yaml'),
+            {'use_sim_time': use_sim_time}
+        ]
     )
 
     # 邊界提取節點
@@ -65,6 +75,18 @@ def generate_launch_description():
         executable='teleop_node',
         name='mower_teleop',
         output='screen',
+        parameters=[
+            os.path.join(bridge_dir, 'config', 'joystick.yaml'),
+            {'use_sim_time': use_sim_time}
+        ]
+    )
+
+    # F2C 路徑規劃伺服器 (C++)
+    f2c_server_node = Node(
+        package='mowerbot_planner',
+        executable='f2c_server',
+        name='f2c_server',
+        output='screen',
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
@@ -79,6 +101,14 @@ def generate_launch_description():
 
     # 4. 回傳 LaunchDescription
     return LaunchDescription([
+        # 模擬時預設不啟動 robot_state_publisher (由 gazebo.launch.py 負責)
+        DeclareLaunchArgument(
+            'start_rsp',
+            default_value='false',
+            description='Start robot_state_publisher. Keep false under Gazebo '
+                        '(gazebo.launch.py already starts it); set true on the real robot.'
+        ),
+
         # 【核心修正】全域設定模擬時間參數
         SetParameter(name='use_sim_time', value=use_sim_time),
 
@@ -87,6 +117,7 @@ def generate_launch_description():
         slam_launch,
         joy_node,
         teleop_node,
+        f2c_server_node,
         manager_node,
         boundary_node,
     ])

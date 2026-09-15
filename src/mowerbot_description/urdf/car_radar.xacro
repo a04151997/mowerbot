@@ -7,7 +7,9 @@
     <!-- 雷達偏移量 -->
     <xacro:property name="radar_joint_x" value="0.0"/>
     <xacro:property name="radar_joint_y" value="0.0"/>
-    <xacro:property name="radar_joint_z" value="${car_height / 2.0 + radar_height / 2.0}"/>
+    <!-- 抬高到 0.45：雷達佔據 z = 0.40 ~ 0.50，完全高於相機頂端的 0.31，
+         避免 360 度掃描一直掃到車頭前方 0.455m 的相機 -->
+    <xacro:property name="radar_joint_z" value="0.45"/>
 
     <!-- 顏色 -->
     <material name="blue">
@@ -22,6 +24,7 @@
             </geometry>
             <material name="blue"/>
         </visual>
+        <xacro:cylinder_inertia m="0.2" r="${radar_radius}" h="${radar_height}"/>
     </link>
 
     <!-- 雷達關聯到base_link -->

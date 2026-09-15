@@ -23,6 +23,7 @@
             </geometry>
             <material name="red"/>
         </visual>
+        <xacro:box_inertia m="0.1" w="${camera_length}" h="${camera_width}" d="${camera_height}"/>
     </link>
 
     <!-- 攝像機關聯到base_link -->

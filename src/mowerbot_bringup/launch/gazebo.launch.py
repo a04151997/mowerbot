@@ -9,10 +9,16 @@ from launch_ros.actions import Node
 def generate_launch_description():
     # 1. 取得相關路徑
     pkg_description = get_package_share_directory('mowerbot_description')
+    pkg_bringup = get_package_share_directory('mowerbot_bringup')
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
+
+    # world 檔放在 mowerbot_bringup/worlds 底下
+    world_file = os.path.join(pkg_bringup, 'worlds', 'mow_field.world')
 
     # 2. 定義參數：是否啟動模擬時間 (在 Gazebo 裡必須為 True)
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
+    # 是否開啟 Gazebo GUI (gzclient)。自動化測試時用 gui:=false 跑無頭模式比較快
+    gui = LaunchConfiguration('gui', default='true')
 
     # 3. 引入 robot_state_publisher (發布 URDF)
     # 這裡直接呼叫你之前寫好的描述檔 launch
@@ -27,7 +33,8 @@ def generate_launch_description():
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_gazebo_ros, 'launch', 'gazebo.launch.py')
-        )
+        ),
+        launch_arguments={'world': world_file, 'gui': gui}.items()
     )
 
     # 5. 呼叫 gazebo_ros 的節點來「生成」機器人
@@ -43,6 +50,11 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument(
+            'gui',
+            default_value='true',
+            description='Start the Gazebo GUI (gzclient). Set false for headless runs.'
+        ),
         robot_state_publisher,
         gazebo,
         spawn_entity

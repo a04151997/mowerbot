@@ -1,0 +1,140 @@
+# ==========================================================================
+# Nav2 區域路徑控制 (只裝 controller_server)
+#
+# 本專案的 mower_manager 直接呼叫 FollowPath action，路徑由 F2C 產生，
+# 因此不需要 planner_server / bt_navigator / behavior_server /
+# smoother_server / waypoint_follower。
+# ==========================================================================
+
+controller_server:
+  ros__parameters:
+    use_sim_time: true
+    controller_frequency: 20.0
+    min_x_velocity_threshold: 0.001
+    min_y_velocity_threshold: 0.5
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["general_goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    # 割草機速度慢，進度檢查的時間給寬一點，避免正常慢速前進被誤判成卡住
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.5
+      movement_time_allowance: 15.0
+
+    # 覆蓋作業不在意最終朝向，yaw 容忍放寬
+    general_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.25
+      yaw_goal_tolerance: 0.5
+      stateful: true
+
+    FollowPath:
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+
+      # 速度上限：對應 teleop 的 scale_linear 0.7 / scale_angular 1.2
+      max_vel_x: 0.7
+      min_vel_x: 0.0          # 不允許倒車 (割草機無後方感測器)
+      max_vel_y: 0.0
+      min_vel_y: 0.0
+      max_vel_theta: 1.2
+      max_speed_xy: 0.7
+      min_speed_xy: 0.0       # 必須是 0，否則 DWB 不會取樣「原地旋轉」
+      min_speed_theta: 0.0
+
+      # 加速度：由 URDF 的 max_wheel_acceleration 3.0 rad/s^2 與輪半徑 0.17 m 推導
+      # 線加速度 = 3.0 x 0.17 = 0.51 m/s^2
+      # 角加速度 = (0.51 - (-0.51)) / 輪距 0.58 = 1.76 rad/s^2，保守取 1.5
+      acc_lim_x: 0.5
+      acc_lim_y: 0.0
+      acc_lim_theta: 1.5
+      decel_lim_x: -0.5
+      decel_lim_y: 0.0
+      decel_lim_theta: -1.5
+
+      vx_samples: 20
+      vy_samples: 5
+      vtheta_samples: 20
+      sim_time: 2.0
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.2
+      xy_goal_tolerance: 0.25
+      trans_stopped_velocity: 0.25
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign",
+                "PathAlign", "PathDist", "GoalDist"]
+
+      # 權重說明：以下四項都調回 Nav2 預設值。
+      # 上一版為了對抗「相鄰割草線互相干擾」把 PathAlign/PathDist 調高、
+      # GoalAlign/GoalDist 調低，但那組偏移本身就是車子停擺的原因：
+      # DWB 的 PathDist/GoalDist 是 MapGridCritic，用 local costmap 的網格距離場
+      # 評分，沒有路徑順序的概念，線距 0.5 m 時距離場幾乎是平的，調權重解不了。
+      # 現在路徑已經在 mower_manager 端分解成一條一條的割草線，
+      # 控制器視野裡永遠只有一條直線，不再需要在相鄰路徑之間做取捨，
+      # 因此回到預設值即可，GoalDist 也重新成為車子前進的動力來源。
+      BaseObstacle.scale: 0.02
+      PathAlign.scale: 32.0                    # 原本 40.0，改回 Nav2 預設
+      PathAlign.forward_point_distance: 0.5    # 車長 0.95 m，預設 0.1 太短
+      GoalAlign.scale: 24.0                    # 原本 8.0，改回 Nav2 預設
+      GoalAlign.forward_point_distance: 0.5
+      PathDist.scale: 32.0                     # 原本 40.0，改回 Nav2 預設
+      GoalDist.scale: 24.0                     # 原本 10.0，改回 Nav2 預設
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      use_sim_time: true
+      update_frequency: 5.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_footprint
+      rolling_window: true
+      width: 5
+      height: 5
+      resolution: 0.05
+
+      # 車體實際尺寸：長 0.95 m，寬度要算到輪子外緣
+      # 輪中心 +-0.29 m，輪寬 0.1 m -> 外緣 +-0.34 m，總寬 0.68 m
+      footprint: "[[0.475, 0.34], [0.475, -0.34], [-0.475, -0.34], [-0.475, 0.34]]"
+
+      plugins: ["obstacle_layer", "inflation_layer"]
+
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: true
+        observation_sources: scan
+        scan:
+          topic: /scan
+          max_obstacle_height: 2.0
+          clearing: true
+          marking: true
+          data_type: "LaserScan"
+          # 配合 car_radar.xacro 裡雷達的 12 m 量測上限
+          raytrace_max_range: 12.0
+          raytrace_min_range: 0.0
+          obstacle_max_range: 11.5
+          obstacle_min_range: 0.0
+
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        enabled: true
+        cost_scaling_factor: 3.0
+        # 車體內切半徑 0.34 m，膨脹半徑不能設太大，
+        # 否則割草機無法貼近邊界作業
+        inflation_radius: 0.45
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    use_sim_time: true
+    autostart: true
+    node_names: ["controller_server"]
+    bond_timeout: 4.0

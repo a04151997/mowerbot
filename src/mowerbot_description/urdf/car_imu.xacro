@@ -10,6 +10,7 @@
                 <color rgba="0.0 0.0 0.0 1.0"/>
             </material>
         </visual>
+        <xacro:box_inertia m="0.02" w="0.02" h="0.02" d="0.02"/>
     </link>
 
     <joint name="imu_joint" type="fixed">

@@ -8,8 +8,14 @@
   <license>TODO: License declaration</license>
 
   <depend>mowerbot_action</depend>
+  <depend>mowerbot_planner</depend>
   <depend>mowerbot_description</depend>
   <depend>joy</depend>
+  <depend>mowerbot_bridge</depend>
+  <depend>slam_toolbox</depend>
+  <depend>robot_state_publisher</depend>
+  <depend>joint_state_publisher</depend>
+  <depend>gazebo_ros</depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

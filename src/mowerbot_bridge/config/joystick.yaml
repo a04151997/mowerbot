@@ -1,0 +1,23 @@
+# 按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
+# 滾輪左右是0 上下是1 左LB是4 右LB是5
+
+joy_node:
+    ros__parameters:
+        device_id: 0            # 預設手把為 0
+        autorepeat_rate: 20.0   # 每秒重複發送 20 次訊號
+        deadzone: 0.05          # 避免搖桿太敏感
+
+mower_teleop:
+    ros__parameters:
+        # speed
+        scale_linear: 0.7
+        scale_angular: 1.2
+        axis_linear: 1
+        axis_angular: 0
+
+        button_a: 0             # 建圖
+        button_b: 1             # F2C
+        button_x: 2             # 手動
+        button_y: 3             # 導航
+        button_deadman: 4       # 安全鈕 (LB)，按住才會輸出速度
+        button_stop: 5          # 緊急停止
