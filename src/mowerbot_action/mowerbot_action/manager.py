@@ -41,6 +41,26 @@ class MowerManager(Node):
         # 所以這裡查 map -> base_footprint，保持在同一個座標系。
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        # 跑道 (lead-in) 長度，單位公尺。
+        # 每條割草線送出去之前，會先在它的起點「往後」沿著同一個方向延伸這段距離，
+        # 讓車子掉完頭有一段共線的距離可以把橫向誤差收斂掉，
+        # 真正進入割草段時已經貼在線上。這是農機的 headland(地頭)概念。
+        # 設 0 代表停用跑道。
+        #
+        # 預設 0.5 m 是實測掃描 L = 0.5 / 1.0 / 1.5 之後選的 (數據見
+        # docs/simulation_results.md)。三個值的覆蓋落差在誤差內分不出高下
+        # (最大 0.635~0.672 m，超標比例 14.1~16.5%)，都沒有達到 < 0.25 m 的目標；
+        # 真正有差別的是「有沒有跑道」：L = 0 時第 3 條割草線會因為
+        # "Controller patience exceeded" 直接 ABORTED，車子無法在原地掉頭接上
+        # 一條剛好起點就在旁邊的路徑。所以跑道是可靠度功能而不是覆蓋品質功能。
+        # 既然覆蓋品質分不出高下，就取「能用的最小值」：L 同時是階段 2 的地頭寬度，
+        # 而地頭會直接吃掉可作業面積 (5x5 m 的地上 L=1.5 只剩 2 m 寬可割)。
+        self.declare_parameter('lead_in_length', 0.5)
+        self.lead_in_length = float(
+            self.get_parameter('lead_in_length').value)
+        self.get_logger().info(
+            f'🛬 跑道 (lead-in) 長度 = {self.lead_in_length:.2f} m')
         # 模式標籤說明現況：
         # mode 1 與 mode 3 在 nav_vel_cb 裡的行為完全相同(兩者都轉發 /cmd_vel_nav)，
         # 唯一差別是切到 mode 1 會觸發 call_f2c_planner() 去規劃並執行覆蓋任務。
@@ -287,6 +307,71 @@ class MowerManager(Node):
             f'🚗 產生 approach 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
         return approach
 
+    # 跑道的航點間距，與割草線、approach 一致
+    LEAD_IN_WAYPOINT_SPACING = 0.1
+
+    def build_lead_in(self, swath, index, total):
+        """在割草線起點「往後」延伸一段共線的跑道，回傳 跑道 + 割草線 的完整路徑。
+
+        幾何：割草線從 A 到 B，方向 d = normalize(B - A)，
+        跑道起點 = A - L*d，所以整條路徑是 (A - L*d) -> A -> ... -> B，全部共線。
+        因為跟割草線共線，不會在單一路徑內產生方向劇變，
+        也就不會重新引入我們做逐條分解想消滅的問題。
+
+        為什麼需要：實測每條割草線的最大覆蓋落差固定卡在 0.47~0.50 m，
+        而 0.5 m 正是割草線間距。代表車子每次掉頭都是「切進去」而不是從端點
+        進入，每條線開頭大約 0.5~1 m 根本沒走到。跑道就是給車子一段
+        「還沒開始算覆蓋」的距離先把橫向誤差收斂掉。
+
+        L <= 0 時直接回傳原本的割草線 (停用跑道)。
+        """
+        if self.lead_in_length <= 0.0 or len(swath.poses) < 2:
+            return swath
+
+        a = swath.poses[0].pose.position
+        b = swath.poses[-1].pose.position
+        dx, dy = b.x - a.x, b.y - a.y
+        norm = math.hypot(dx, dy)
+        if norm < 1e-9:
+            return swath
+        ux, uy = dx / norm, dy / norm
+
+        # 跑道起點 = A - L*d
+        sx = a.x - self.lead_in_length * ux
+        sy = a.y - self.lead_in_length * uy
+
+        num_segments = max(
+            1, int(round(self.lead_in_length / self.LEAD_IN_WAYPOINT_SPACING)))
+
+        out = Path()
+        out.header.frame_id = swath.header.frame_id
+        out.header.stamp = swath.header.stamp
+
+        # 跑道航點的朝向就是割草線的行進方向 (共線)
+        yaw = math.atan2(uy, ux)
+        qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        # k 只跑到 num_segments - 1：第 num_segments 個點就是 A 本身，
+        # 由後面接上的割草線提供，避免重複航點。
+        for k in range(num_segments):
+            ratio = float(k) / float(num_segments)
+            pose = PoseStamped()
+            pose.header = out.header
+            pose.pose.position.x = sx + (a.x - sx) * ratio
+            pose.pose.position.y = sy + (a.y - sy) * ratio
+            pose.pose.orientation.z = qz
+            pose.pose.orientation.w = qw
+            out.poses.append(pose)
+
+        n_lead = len(out.poses)
+        out.poses.extend(swath.poses)
+
+        # 這個分界之後接刀盤控制時會用到：跑道段刀盤要關，割草段才打開。
+        self.get_logger().info(
+            f'🛬 割草線 {index}/{total} 加跑道：長度 {self.lead_in_length:.2f} m，'
+            f'起點 ({sx:.2f}, {sy:.2f}) -> A ({a.x:.2f}, {a.y:.2f})；'
+            f'航點 0..{n_lead - 1} 為跑道段，{n_lead}..{len(out.poses) - 1} 為割草段')
+        return out
+
     def split_path_into_swaths(self, path_msg):
         """把整條覆蓋路徑依「行進方向反轉」切成一條一條的割草線。
 
@@ -453,7 +538,13 @@ class MowerManager(Node):
                     return
 
                 total = len(swaths)
+                # 每條割草線前面接上共線的跑道，讓車子掉完頭先收斂橫向誤差，
+                # 進入真正的割草段時已經貼在線上。
+                swaths = [self.build_lead_in(sw, i + 1, total)
+                          for i, sw in enumerate(swaths)]
                 queue = [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
+                # swaths[0] 已經是「跑道 + 第 1 條割草線」，所以 approach 的終點
+                # 自然就是跑道起點而不是 A，所有割草線的處理方式一致。
                 approach = self.build_approach_path(robot_xy, swaths[0])
                 if approach is not None:
                     queue.insert(0, (approach, 'approach'))

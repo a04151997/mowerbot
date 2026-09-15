@@ -96,7 +96,11 @@ def generate_launch_description():
         executable='mower_manager',
         name='mower_manager',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            # 跑道 (lead-in) 長度，讓實測可以掃不同數值而不用重建
+            'lead_in_length': LaunchConfiguration('lead_in_length'),
+        }]
     )
 
     # 4. 回傳 LaunchDescription
@@ -107,6 +111,14 @@ def generate_launch_description():
             default_value='false',
             description='Start robot_state_publisher. Keep false under Gazebo '
                         '(gazebo.launch.py already starts it); set true on the real robot.'
+        ),
+
+        # 每條割草線前面的跑道 (lead-in) 長度，單位公尺，0 代表停用
+        DeclareLaunchArgument(
+            'lead_in_length',
+            default_value='0.5',
+            description='Lead-in (headland run-up) length in metres prepended to '
+                        'each mowing swath. 0 disables it.'
         ),
 
         # 【核心修正】全域設定模擬時間參數

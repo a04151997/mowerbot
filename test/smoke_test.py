@@ -63,6 +63,24 @@ STAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
 LOGDIR = os.path.join(WS, 'test', 'logs', STAMP)
 os.makedirs(LOGDIR, exist_ok=True)
 
+# 每條割草線前面的跑道 (lead-in) 長度，單位公尺。
+# None = 不覆寫，直接用 mower_control.launch.py 的預設值。
+# 用 --lead-in=L 或環境變數 MOWERBOT_LEAD_IN 指定，
+# 目的是讓 L 的實測掃描不用每次重建 workspace。
+LEAD_IN = os.environ.get('MOWERBOT_LEAD_IN')
+for _a in sys.argv[1:]:
+    if _a.startswith('--lead-in'):
+        LEAD_IN = _a.split('=', 1)[1] if '=' in _a else None
+LEAD_IN = float(LEAD_IN) if LEAD_IN not in (None, '') else None
+
+
+def mower_control_cmd():
+    """mower_control.launch.py 的啟動指令，需要時帶上 lead_in_length 覆寫"""
+    cmd = ['ros2', 'launch', 'mowerbot_bringup', 'mower_control.launch.py']
+    if LEAD_IN is not None:
+        cmd.append('lead_in_length:=%.3f' % LEAD_IN)
+    return cmd
+
 
 class Tee(object):
     """把 stdout 同時寫到終端機與 transcript 檔"""
@@ -606,7 +624,7 @@ def phase_c():
             record('C', cid, name, 'SKIP', 'gazebo.launch.py 啟動失敗，無法測試')
         return
     ctl = bg_start('C_mower_control',
-                   ['ros2', 'launch', 'mowerbot_bringup', 'mower_control.launch.py'])
+                   mower_control_cmd())
     sub('等待系統穩定 (25 秒)...')
     time.sleep(25)
 
@@ -1383,7 +1401,7 @@ def phase_n():
     sub('等待 Gazebo 起來 (18 秒)...')
     time.sleep(18)
     ctl = bg_start('N_mower_control',
-                   ['ros2', 'launch', 'mowerbot_bringup', 'mower_control.launch.py'])
+                   mower_control_cmd())
     sub('等待 mower_control 穩定 (20 秒)...')
     time.sleep(20)
     nav = bg_start('N_navigation',
@@ -1594,6 +1612,32 @@ def phase_n():
             % arc_dev)
         sub('   量到的其實是線距不是循跡誤差，已改用上面的逐割草線指派)')
 
+        # 把 N3 的關鍵數值另存一份 JSON，方便掃描不同跑道長度 L 時做對照表，
+        # 不用再從 log 文字裡回頭剖析。
+        try:
+            import json
+            with open(os.path.join(LOGDIR, 'n3_metrics.json'), 'w') as fh:
+                json.dump({
+                    'lead_in': LEAD_IN,
+                    'swaths': st['total'],
+                    'completed': st['completed'],
+                    'failures': len(st['failures']),
+                    'done': st['done'],
+                    'elapsed_s': elapsed,
+                    'end_err_m': end_err,
+                    'gap_max_m': gap_max,
+                    'gap_mean_m': gap_mean,
+                    'gap_median_m': gap_med,
+                    'gap_over_025': gap_over,
+                    'gap_n': gap_n,
+                    'gap_over_pct': (100.0 * gap_over / gap_n) if gap_n else None,
+                    'per_swath_max_dev': per_swath,
+                    'moved_m': moved,
+                    'path_len_m': total_len,
+                }, fh, indent=2)
+        except Exception as exc:
+            sub('(n3_metrics.json 存檔失敗: %s)' % exc)
+
         n3_ok = (st['total'] > 0 and not st['failures']
                  and st['completed'] == st['total'] and st['done']
                  and end_err < 0.3)
@@ -1783,6 +1827,8 @@ def main():
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
             phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDN'
+        elif arg.startswith('--lead-in'):
+            pass          # 已在模組載入時解析成 LEAD_IN
         elif arg in ('-h', '--help'):
             print(__doc__)
             return 0
@@ -1792,6 +1838,9 @@ def main():
     print('ROS_DOMAIN_ID : %s' % ENV['ROS_DOMAIN_ID'])
     print('log 目錄      : %s' % LOGDIR)
     print('要跑的 Phase  : %s' % ' '.join(phases))
+    print('跑道長度 L    : %s'
+          % ('%.2f m (覆寫)' % LEAD_IN if LEAD_IN is not None
+             else '(用 launch 預設值)'))
 
     try:
         if 'A' in phases:

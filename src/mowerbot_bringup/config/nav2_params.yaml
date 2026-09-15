@@ -27,7 +27,12 @@ controller_server:
     # 覆蓋作業不在意最終朝向，yaw 容忍放寬
     general_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.25
+      # 0.25 -> 0.10：goal checker 的容忍值等於「允許每條割草線提早多少距離結束」。
+      # 設 0.25 時，每一條割草線都可以在距離終點 0.25 m 的地方就判定 SUCCEEDED
+      # 而切換到下一條，等於每條線的尾端天生就少割半個刀盤寬 (刀盤 0.5 m)。
+      # 實測前兩條以外的割草線最大覆蓋落差固定卡在 0.47~0.50 m，
+      # 收緊到 0.10 m 讓車子必須真的走到端點才算完成。
+      xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.5
       stateful: true
 
@@ -62,7 +67,10 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      xy_goal_tolerance: 0.25
+      # 與上面 general_goal_checker 同步收緊 (理由見該處註解)。
+      # DWB 自己也有一份 xy_goal_tolerance，兩處不一致時行為會不好預期，
+      # 所以兩邊都要改。
+      xy_goal_tolerance: 0.10
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
