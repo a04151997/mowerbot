@@ -6,6 +6,8 @@ mowerbot workspace 自動化冒煙測試 (可重複執行)
 用法:
     python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/L/N
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
+    python3 test/smoke_test.py --overlap=0.3           # 覆寫割草線重疊率
+    python3 test/smoke_test.py --world=demo_lawn.world # 換模擬世界
 
 特性:
     - 會自行 source /opt/ros/humble 與本 workspace 的 install/setup.bash
@@ -74,11 +76,50 @@ for _a in sys.argv[1:]:
 LEAD_IN = float(LEAD_IN) if LEAD_IN not in (None, '') else None
 
 
+# 割草線重疊率。None = 不覆寫，直接用 mower_control.launch.py 的預設值 (0.2)。
+# 用 --overlap=R 或環境變數 MOWERBOT_OVERLAP 指定，理由同 LEAD_IN：
+# 讓重疊率的實測掃描不用每次重建 workspace。
+OVERLAP = os.environ.get('MOWERBOT_OVERLAP')
+for _a in sys.argv[1:]:
+    if _a.startswith('--overlap'):
+        OVERLAP = _a.split('=', 1)[1] if '=' in _a else None
+OVERLAP = float(OVERLAP) if OVERLAP not in (None, '') else None
+# mower_control.launch.py 的 overlap_ratio 預設值。沒有覆寫時，測試自己呼叫 F2C
+# 拿參考路徑也要用這個值，否則量到的是別條路徑的落差。兩邊必須同步修改。
+DEFAULT_OVERLAP = 0.4
+
+# 實際刀盤寬，單位公尺。這是車體的物理屬性，不隨重疊率改變，
+# 覆蓋落差的判定基準固定是它的一半 (COVERAGE_TOL)。
+BLADE_WIDTH = 0.5
+COVERAGE_TOL = BLADE_WIDTH / 2.0
+# 割草線間距 = 刀盤寬 x (1 - 重疊率)，要與 mower_manager 算出來的一致，
+# 測試自己呼叫 F2C 拿參考路徑時必須用同一個值，否則量到的是別條路徑的落差。
+SWATH_SPACING = BLADE_WIDTH * (1.0 - (OVERLAP if OVERLAP is not None else DEFAULT_OVERLAP))
+
+# 模擬世界檔名。None = 用 gazebo.launch.py 的預設值 (mow_field.world)。
+# 用 --world=<檔名> 或環境變數 MOWERBOT_WORLD 指定。
+WORLD = os.environ.get('MOWERBOT_WORLD')
+for _a in sys.argv[1:]:
+    if _a.startswith('--world'):
+        WORLD = _a.split('=', 1)[1] if '=' in _a else None
+WORLD = WORLD or None
+
+
 def mower_control_cmd():
-    """mower_control.launch.py 的啟動指令，需要時帶上 lead_in_length 覆寫"""
+    """mower_control.launch.py 的啟動指令，需要時帶上 lead_in_length / overlap_ratio 覆寫"""
     cmd = ['ros2', 'launch', 'mowerbot_bringup', 'mower_control.launch.py']
     if LEAD_IN is not None:
         cmd.append('lead_in_length:=%.3f' % LEAD_IN)
+    if OVERLAP is not None:
+        cmd.append('overlap_ratio:=%.3f' % OVERLAP)
+    return cmd
+
+
+def gazebo_cmd():
+    """gazebo.launch.py 的啟動指令 (無頭)，需要時帶上 world 覆寫"""
+    cmd = ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py', 'gui:=false']
+    if WORLD is not None:
+        cmd.append('world:=%s' % WORLD)
     return cmd
 
 
@@ -618,7 +659,7 @@ def tf_echo(parent, child, dur=5):
 def phase_c():
     hdr('Phase C  模擬整合測試 (gazebo.launch.py gui:=false + mower_control.launch.py)')
     gz = bg_start('C_gazebo',
-                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py', 'gui:=false'])
+                  gazebo_cmd())
     sub('等待 Gazebo 起來 (18 秒)...')
     time.sleep(18)
     if not gz.alive():
@@ -1005,9 +1046,11 @@ def coverage_gap(pts, traj):
     割草線」的指派問題 —— 方向反過來算，從路徑看向軌跡。approach 多走的路只會
     讓覆蓋更好、不會更差，所以也不需要扣除。
 
-    刀盤寬 0.5 m，所以航點離實際軌跡超過 0.25 m 的地方就是沒割到的縫。
+    判定基準固定是「實際刀盤寬的一半」= BLADE_WIDTH / 2 = 0.25 m，
+    航點離實際軌跡超過這個距離的地方就是沒割到的縫。
+    重疊率只會縮小割草線間距，不會改變刀盤寬，所以這個門檻不隨重疊率變動。
 
-    回傳 (最大落差, 平均, 中位, 超過 0.25 m 的航點數, 總航點數, 最差的位置)。
+    回傳 (最大落差, 平均, 中位, 超過門檻的航點數, 總航點數, 最差的位置)。
     """
     if len(traj) < 2 or not pts:
         return (float('nan'),) * 3 + (0, 0, (float('nan'), float('nan')))
@@ -1023,7 +1066,7 @@ def coverage_gap(pts, traj):
             worst, worst_pt = d, (px, py)
     ordered = sorted(vals)
     return (worst, sum(vals) / len(vals), ordered[len(ordered) // 2],
-            sum(1 for v in vals if v > 0.25), len(vals), worst_pt)
+            sum(1 for v in vals if v > COVERAGE_TOL), len(vals), worst_pt)
 
 
 def lateral_deviation_per_swath(traj, swaths, trim_radius=None):
@@ -1429,7 +1472,7 @@ def build_mow_path(rig, x0, y0):
 def phase_n():
     hdr('Phase N  Nav2 區域路徑控制 (gazebo gui:=false + mower_control + navigation)')
     gz = bg_start('N_gazebo',
-                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py', 'gui:=false'])
+                  gazebo_cmd())
     sub('等待 Gazebo 起來 (18 秒)...')
     time.sleep(18)
     ctl = bg_start('N_mower_control',
@@ -1498,14 +1541,19 @@ def phase_n():
                    (bcx + half, bcy + half), (bcx - half, bcy + half)]
         for cx, cy in corners:
             req.boundary.points.append(Point32(x=float(cx), y=float(cy), z=0.0))
-        req.tool_width = 0.5
+        req.tool_width = SWATH_SPACING
         req.turning_radius = 1.0
         sub('測試邊界 = %.1fm x %.1fm，中心 (%.2f, %.2f)'
             % (half * 2, half * 2, bcx, bcy))
         sub('四個角座標: %s' % ['(%.2f, %.2f)' % c for c in corners])
         inside = (bcx - half <= x0 <= bcx + half) and (bcy - half <= y0 <= bcy + half)
         sub('是否包含車子起始位置 (%.2f, %.2f) = %s' % (x0, y0, inside))
-        sub('tool_width = 0.50 m, turning_radius = 1.00 m')
+        sub('實際刀盤寬 = %.2f m, 重疊率 = %.2f, tool_width (割草線間距) = %.3f m, '
+            'turning_radius = 1.00 m'
+            % (BLADE_WIDTH, OVERLAP if OVERLAP is not None else DEFAULT_OVERLAP,
+               SWATH_SPACING))
+        sub('(與 mower_manager 的 blade_width x (1 - overlap_ratio) 一致，'
+            '否則量到的是別條路徑的落差)')
         print('')
         sub('障礙物淨空檢查 (要求全部 >= %.1f m):' % MIN_OBSTACLE_CLEARANCE)
         clearances = boundary_clearances(corners)
@@ -1534,7 +1582,7 @@ def phase_n():
         sub('success        = %s' % resp.success)
         sub('航點總數       = %d' % len(pts))
         sub('平均間距       = %.4f m  (判定門檻 < 0.15)' % avg_gap)
-        sub('最大間距       = %.4f m  (= 刀盤寬度，那是兩條割草線之間的橫向連接段)' % max_gap)
+        sub('最大間距       = %.4f m  (= 割草線間距，那是兩條割草線之間的橫向連接段)' % max_gap)
         sub('路徑總長       = %.2f m' % total_len)
         sub('frame_id       = %s' % f2c_path.header.frame_id)
         obstacles = [(3.5, 2.0), (-4.2, 5.5), (6.0, -5.0), (-6.5, -3.0)]
@@ -1639,11 +1687,13 @@ def phase_n():
         sub('終點位置誤差         = %.3f m  (判定門檻 < 0.3)' % end_err)
         gap_max, gap_mean, gap_med, gap_over, gap_n, gap_pt = coverage_gap(pts, traj)
         print('')
-        sub('【覆蓋品質】刀盤寬 0.5 m，指令航點離實際軌跡超過 0.25 m 就是沒割到的縫')
+        sub('【覆蓋品質】實際刀盤寬 %.2f m，指令航點離實際軌跡超過 %.2f m 就是沒割到的縫'
+            % (BLADE_WIDTH, COVERAGE_TOL))
         sub('  最大覆蓋落差       = %.3f m   於 (%.2f, %.2f)' % (gap_max, gap_pt[0], gap_pt[1]))
         sub('  平均 / 中位        = %.3f m / %.3f m' % (gap_mean, gap_med))
-        sub('  超過 0.25 m 的航點 = %d / %d  (%.1f%%)'
-            % (gap_over, gap_n, 100.0 * gap_over / gap_n if gap_n else 0.0))
+        sub('  超過 %.2f m 的航點 = %d / %d  (%.1f%%)'
+            % (COVERAGE_TOL, gap_over, gap_n,
+               100.0 * gap_over / gap_n if gap_n else 0.0))
         print('')
         sub('最大橫向偏差         = %.3f m   (逐割草線指派，與上面的覆蓋落差互相印證)'
             % max_dev)
@@ -1663,6 +1713,11 @@ def phase_n():
             with open(os.path.join(LOGDIR, 'n3_metrics.json'), 'w') as fh:
                 json.dump({
                     'lead_in': LEAD_IN,
+                    'world': WORLD or 'mow_field.world',
+                    'blade_width': BLADE_WIDTH,
+                    'overlap_ratio': OVERLAP if OVERLAP is not None else DEFAULT_OVERLAP,
+                    'swath_spacing': SWATH_SPACING,
+                    'coverage_tol': COVERAGE_TOL,
                     'headland': read_headland_state(ctl),
                     'swaths': st['total'],
                     'completed': st['completed'],
@@ -1947,13 +2002,13 @@ def phase_l():
 
     def skip_rest(reason, start_at):
         allc = [('L1', '建圖模式開車建出地圖'), ('L2', 'serialize_map 與 save_map 存檔'),
-                ('L3', '切換到定位模式'), ('L4', 'map -> odom TF 與 /map 一致性')]
+                ('L3', '切換到定位模式'), ('L4', 'map -> odom TF 與 /map 穩定性')]
         for cid, name in allc:
             if cid >= start_at:
                 record('L', cid, name, 'SKIP', reason)
 
     gz = bg_start('L_gazebo',
-                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py', 'gui:=false'])
+                  gazebo_cmd())
     sub('等待 Gazebo 起來 (18 秒)...')
     time.sleep(18)
     ctl = bg_start('L_mower_control', mower_control_cmd())
@@ -2063,16 +2118,30 @@ def phase_l():
             return
 
         # ---- L4 TF 與 /map ----
-        hdr('L4  確認 map -> odom 的 TF 存在、/map 有發布且尺寸與存檔時一致')
+        # 判定標準在階段 7 由使用者放寬。原本要求「/map 尺寸與存檔時完全一致」，
+        # 但這對 SLAM 地圖本來就不成立：地圖尺寸取決於 pose graph 的涵蓋範圍，
+        # 實測建圖端自己就會在 402x401 / 402x402 之間跳。1 格 = 5 公分，
+        # 功能上沒有差別。真正要驗的「地圖不漂」是「尺寸會不會持續變動」。
+        MAP_SIZE_TOL = 5            # 格，1 格 = 5 cm
+        TF_TRANS_TOL = 0.5          # m
+        MAP_STABLE_SEC = 20.0
+        hdr('L4  確認 map -> odom TF 平移 < %.1f m、/map 有發布、'
+            '尺寸 %.0f 秒內不變且與存檔時差異 <= %d 格'
+            % (TF_TRANS_TOL, MAP_STABLE_SEC, MAP_SIZE_TOL))
         trans, tf_out = tf_echo('map', 'odom', dur=8)
         if trans is None:
             sub('tf2_echo map -> odom 查不到，原始輸出:')
             print(('     ' + tf_out.strip()[-800:]).replace('\n', '\n     '))
+            tf_norm = float('nan')
         else:
-            sub('map -> odom 平移 = (%.3f, %.3f, %.3f)' % trans)
+            tf_norm = math.sqrt(sum(v * v for v in trans))
+            sub('map -> odom 平移 = (%.3f, %.3f, %.3f)，模長 %.4f m  (門檻 < %.1f)'
+                % (trans + (tf_norm, TF_TRANS_TOL)))
+        tf_ok = (trans is not None) and tf_norm < TF_TRANS_TOL
 
         rig2 = LocRig()
         m2 = rig2.wait_map(25.0)
+        stable = False
         if m2 is None:
             sub('/map 在定位模式下 25 秒內沒有收到')
             loc_w = loc_h = None
@@ -2081,16 +2150,19 @@ def phase_l():
             sub('定位模式 /map 尺寸 = %d x %d cells，解析度 %.3f m'
                 % (loc_w, loc_h, loc_res))
             # 階段 3 的目的就是「地圖不要再漂」，所以再等一段時間看尺寸會不會變。
-            # 這是附帶觀察，不列入 L4 的判定。
+            # 這是 L4 的判定項之一。
             del rig2.maps[:]
-            rig2.spin(20.0)
+            rig2.spin(MAP_STABLE_SEC)
             if rig2.maps:
-                sizes = sorted({(mm[0], mm[1]) for mm in rig2.maps})
-                sub('再監聽 20 秒收到 %d 張 /map，尺寸集合 = %s  -> %s'
-                    % (len(rig2.maps), ['%dx%d' % z for z in sizes],
-                       '固定不變' if len(sizes) == 1 else '仍然會變動'))
+                seen = sorted({(mm[0], mm[1]) for mm in rig2.maps} | {(loc_w, loc_h)})
+                stable = len(seen) == 1
+                sub('再監聽 %.0f 秒收到 %d 張 /map，尺寸集合 = %s  -> %s'
+                    % (MAP_STABLE_SEC, len(rig2.maps), ['%dx%d' % z for z in seen],
+                       '固定不變' if stable else '仍然會變動'))
             else:
-                sub('再監聽 20 秒沒有收到新的 /map (latched 之後就不再更新)')
+                stable = True
+                sub('再監聽 %.0f 秒沒有收到新的 /map (latched 之後就不再更新) -> 視為不變'
+                    % MAP_STABLE_SEC)
         rig2.close()
 
         print('')
@@ -2099,14 +2171,26 @@ def phase_l():
             % ('%d x %d' % pgm_size if pgm_size else '(讀不到)'))
         sub('定位模式 /map        = %s'
             % ('%d x %d' % (loc_w, loc_h) if loc_w else '(沒收到)'))
-        same = (loc_w is not None and (loc_w, loc_h) == (map_w, map_h))
-        sub('尺寸是否一致          = %s' % same)
-        l4_ok = (trans is not None) and same
-        record('L', 'L4', 'map -> odom TF 查得到，且 /map 尺寸與存檔時一致',
+        if loc_w is None:
+            dw = dh = None
+            close_enough = False
+        else:
+            dw, dh = abs(loc_w - map_w), abs(loc_h - map_h)
+            close_enough = dw <= MAP_SIZE_TOL and dh <= MAP_SIZE_TOL
+        sub('與存檔時的尺寸差      = %s 格  (門檻 <= %d 格 = %.2f m)'
+            % ('%d x %d' % (dw, dh) if dw is not None else '(沒收到)',
+               MAP_SIZE_TOL, MAP_SIZE_TOL * 0.05))
+        sub('尺寸 %.0f 秒內不變     = %s' % (MAP_STABLE_SEC, stable))
+        l4_ok = tf_ok and (loc_w is not None) and stable and close_enough
+        record('L', 'L4',
+               'map->odom TF 平移 < %.1f m、/map 有發布、尺寸 %.0f 秒不變且與存檔差 <= %d 格'
+               % (TF_TRANS_TOL, MAP_STABLE_SEC, MAP_SIZE_TOL),
                'PASS' if l4_ok else 'FAIL',
-               'TF=%s, 存檔時=%sx%s, 定位模式=%s'
-               % ('有' if trans is not None else '無', map_w, map_h,
-                  '%dx%d' % (loc_w, loc_h) if loc_w else '沒收到'))
+               'TF=%s(%.4fm), 存檔時=%sx%s, 定位模式=%s, 差=%s格, %.0f秒內不變=%s'
+               % ('有' if trans is not None else '無', tf_norm, map_w, map_h,
+                  '%dx%d' % (loc_w, loc_h) if loc_w else '沒收到',
+                  '%dx%d' % (dw, dh) if dw is not None else '-',
+                  MAP_STABLE_SEC, stable))
     finally:
         try:
             rig.close()
@@ -2165,8 +2249,8 @@ def main():
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
             phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDLN'
-        elif arg.startswith('--lead-in'):
-            pass          # 已在模組載入時解析成 LEAD_IN
+        elif arg.startswith(('--lead-in', '--overlap', '--world')):
+            pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
             print(__doc__)
             return 0
@@ -2179,6 +2263,11 @@ def main():
     print('跑道長度 L    : %s'
           % ('%.2f m (覆寫)' % LEAD_IN if LEAD_IN is not None
              else '(用 launch 預設值)'))
+    print('重疊率        : %s  -> 割草線間距 %.3f m (刀盤寬 %.2f m)'
+          % ('%.2f (覆寫)' % OVERLAP if OVERLAP is not None
+             else '%.2f (launch 預設值)' % DEFAULT_OVERLAP,
+             SWATH_SPACING, BLADE_WIDTH))
+    print('模擬世界      : %s' % (WORLD or 'mow_field.world (launch 預設值)'))
 
     try:
         if 'A' in phases:

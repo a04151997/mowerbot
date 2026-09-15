@@ -104,6 +104,8 @@ def generate_launch_description():
             'use_sim_time': use_sim_time,
             # 跑道 (lead-in) 長度，讓實測可以掃不同數值而不用重建
             'lead_in_length': LaunchConfiguration('lead_in_length'),
+            # 割草線重疊率，讓實測可以掃不同數值而不用重建
+            'overlap_ratio': LaunchConfiguration('overlap_ratio'),
         }]
     )
 
@@ -123,6 +125,15 @@ def generate_launch_description():
             default_value='0.5',
             description='Lead-in (headland run-up) length in metres prepended to '
                         'each mowing swath. 0 disables it.'
+        ),
+
+        # 割草線重疊率：割草線間距 = blade_width x (1 - overlap_ratio)。
+        # 0 代表零重疊 (間距 = 刀盤寬)。
+        DeclareLaunchArgument(
+            'overlap_ratio',
+            default_value='0.4',
+            description='Swath overlap ratio. Swath spacing = blade_width * '
+                        '(1 - overlap_ratio). 0 means no overlap.'
         ),
 
         # F2C 地頭 (headland) 寬度，單位公尺，0 代表停用地頭。

@@ -61,6 +61,27 @@ class MowerManager(Node):
             self.get_parameter('lead_in_length').value)
         self.get_logger().info(
             f'🛬 跑道 (lead-in) 長度 = {self.lead_in_length:.2f} m')
+
+        # 割草線重疊：刀盤寬 0.5 m 時，如果割草線間距也取 0.5 m 就是零重疊設計，
+        # 任何循跡誤差都會直接在兩條線之間留下沒割到的帶狀區。
+        # 真實農機的標準作法是把間距縮小一點，用重疊去吸收循跡誤差。
+        #   割草線間距 = 刀盤寬 x (1 - 重疊率)
+        # 注意：覆蓋落差的判定基準仍然是「實際刀盤寬的一半」= blade_width / 2，
+        # 不會因為間距變小就跟著變鬆。
+        # 預設 0.4 是實測掃描 0 / 0.1 / 0.2 / 0.3 / 0.4 之後選的 (每個值各跑 3 次，
+        # 數據見 docs/simulation_results.md 4.6 節)。0.4 在「超標航點比例」與
+        # 「實際未割面積比例」兩個指標上都是最低的 (7.82% / 10.70%)，
+        # 代價是任務耗時比零重疊多 45% (107.9 s -> 156.8 s)。
+        # 注意曲線到 0.4 還沒有平掉，0.5 可能更好，只是沒有測。
+        self.declare_parameter('blade_width', 0.5)
+        self.declare_parameter('overlap_ratio', 0.4)
+        self.blade_width = float(self.get_parameter('blade_width').value)
+        self.overlap_ratio = float(self.get_parameter('overlap_ratio').value)
+        self.swath_spacing = self.blade_width * (1.0 - self.overlap_ratio)
+        self.get_logger().info(
+            f'🔪 實際刀盤寬 = {self.blade_width:.3f} m，'
+            f'重疊率 = {self.overlap_ratio:.2f}，'
+            f'割草線間距 = {self.swath_spacing:.3f} m')
         # 模式標籤說明現況：
         # mode 1 與 mode 3 在 nav_vel_cb 裡的行為完全相同(兩者都轉發 /cmd_vel_nav)，
         # 唯一差別是切到 mode 1 會觸發 call_f2c_planner() 去規劃並執行覆蓋任務。
@@ -148,7 +169,9 @@ class MowerManager(Node):
         # 建立請求
         req = GenerateCoveragePath.Request()
         req.boundary = self.latest_boundary
-        req.tool_width = 0.5    # 74kg 割草機的刀盤寬度
+        # 傳給 F2C 的是「割草線間距」而不是刀盤寬：F2C 的 tool_width 決定的是
+        # 相鄰兩條 swath 的距離，縮小它就等於讓相鄰兩刀互相重疊。
+        req.tool_width = self.swath_spacing
         req.turning_radius = 1.0 # 迴轉半徑
 
         self.get_logger().info('🚀 正在將邊界發送給 F2C 伺服器進行運算...')

@@ -3,7 +3,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 
 def generate_launch_description():
@@ -12,8 +12,11 @@ def generate_launch_description():
     pkg_bringup = get_package_share_directory('mowerbot_bringup')
     pkg_gazebo_ros = get_package_share_directory('gazebo_ros')
 
-    # world 檔放在 mowerbot_bringup/worlds 底下
-    world_file = os.path.join(pkg_bringup, 'worlds', 'mow_field.world')
+    # world 檔放在 mowerbot_bringup/worlds 底下，用 world:=<檔名> 切換。
+    # 預設維持 mow_field.world，自動化測試不受影響；
+    # 示範時用 world:=demo_lawn.world 換成沒有內部障礙物的乾淨草坪。
+    world_file = PathJoinSubstitution(
+        [pkg_bringup, 'worlds', LaunchConfiguration('world')])
 
     # 2. 定義參數：是否啟動模擬時間 (在 Gazebo 裡必須為 True)
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
@@ -50,6 +53,12 @@ def generate_launch_description():
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
+        DeclareLaunchArgument(
+            'world',
+            default_value='mow_field.world',
+            description='World file name under mowerbot_bringup/worlds. '
+                        'Use demo_lawn.world for the obstacle-free demo lawn.'
+        ),
         DeclareLaunchArgument(
             'gui',
             default_value='true',
