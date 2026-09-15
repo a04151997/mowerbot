@@ -49,11 +49,32 @@ if ! ros2 service call /slam_toolbox/serialize_map \
 fi
 echo ""
 
+# /slam_toolbox/save_map 這個服務本身會間歇性回傳 result=255
+# (RESULT_UNDEFINED_FAILURE)，而且與前面有沒有呼叫 serialize_map 無關。
+# 實測：連續呼叫 15 次有 3 次失敗 (約 20%)，
+# 其中「單獨呼叫 save_map」5 次就失敗了 2 次。
+# 服務回傳失敗時不會產生 .pgm/.yaml，所以這裡重試最多 3 次，
+# 每次都把結果印出來，讓這個不穩定性留在 log 裡看得見，而不是被默默吞掉。
 echo "[2/2] save_map -> ${NAME}.pgm + ${NAME}.yaml"
-if ! ros2 service call /slam_toolbox/save_map \
-        slam_toolbox/srv/SaveMap \
-        "{name: {data: '${TARGET}'}}"; then
-    echo "  !! save_map 呼叫失敗，確認建圖模式是否正在跑" >&2
+saved=0
+for attempt in 1 2 3; do
+    echo "  第 ${attempt} 次嘗試..."
+    out="$(ros2 service call /slam_toolbox/save_map \
+            slam_toolbox/srv/SaveMap \
+            "{name: {data: '${TARGET}'}}" 2>&1)"
+    echo "${out}"
+    if echo "${out}" | grep -q "result=0"; then
+        saved=1
+        if [ "${attempt}" -gt 1 ]; then
+            echo "  (注意：save_map 第 ${attempt} 次才成功，這個服務本身不穩定)"
+        fi
+        break
+    fi
+    echo "  !! save_map 回傳失敗 (常見為 result=255)，重試中..." >&2
+    sleep 2
+done
+if [ "${saved}" -ne 1 ]; then
+    echo "  !! save_map 連續 3 次都失敗，確認建圖模式是否正在跑" >&2
     rc=1
 fi
 echo ""
