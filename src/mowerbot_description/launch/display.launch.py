@@ -21,6 +21,9 @@ def generate_launch_description():
     xacro_file = os.path.join(get_package_share_directory(pkg_name), 'urdf', 'car.xacro')
     robot_description_config = xacro.process_file(xacro_file).toxml()
 
+    # RViz 設定檔 (Fixed Frame = map，含覆蓋路徑/邊界/costmap 等 display)
+    rviz_config = os.path.join(get_package_share_directory(pkg_name), 'rviz', 'mowerbot.rviz')
+
     # 3. 定義節點
     return LaunchDescription([
         declare_use_sim_time,
@@ -45,12 +48,13 @@ def generate_launch_description():
             }]
         ),
 
-        # 3. RViz2
+        # 3. RViz2 (載入 mowerbot.rviz)
         Node(
             package='rviz2',
             executable='rviz2',
             name='rviz2',
             output='screen',
+            arguments=['-d', rviz_config],
             parameters=[{'use_sim_time': use_sim_time}]
         )
     ])

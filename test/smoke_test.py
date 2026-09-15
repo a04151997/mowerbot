@@ -306,8 +306,11 @@ LAUNCH_FILES = [
     ('mowerbot_bringup', 'gazebo.launch.py'),
     ('mowerbot_bringup', 'mapping.launch.py'),
     ('mowerbot_bringup', 'mower_control.launch.py'),
+    ('mowerbot_bringup', 'navigation.launch.py'),
+    ('mowerbot_bringup', 'localization.launch.py'),
     ('mowerbot_description', 'robot_state_publisher.launch.py'),
     ('mowerbot_description', 'display.launch.py'),
+    ('mowerbot_description', 'rviz.launch.py'),
 ]
 
 
