@@ -1329,6 +1329,34 @@ RE_APPROACH_DONE = re.compile(r'approach 完成，開始割草')
 RE_DONE_ONE = re.compile(r'✅ 割草線 (\d+)/(\d+) 完成')
 RE_FAIL_ONE = re.compile(r'❌ \[([^\]]+)\] 失敗 \(status=(\S+?)\)')
 RE_MISSION_DONE = re.compile(r'覆蓋任務完成！共完成 (\d+) 條割草線')
+# f2c_server 的地頭 (headland) 資訊，由 mower_control.launch.py 一起帶起來，
+# 所以會出現在 N_mower_control.log 裡。
+RE_HEADLAND = re.compile(
+    r'地頭寬度 ([\d.]+) m：原始面積 ([\d.]+) m\^2 -> 內縮後作業面積 ([\d.]+) m\^2')
+RE_SWATH_COUNT = re.compile(r'割草線計算成功！割草線 (\d+) 條')
+
+
+def read_headland_state(bg):
+    """從 f2c_server 的 log 讀出地頭寬度、面積與割草線數。
+
+    割草線數一律從 log 動態取得，不要寫死：加了地頭之後可作業面積縮小，
+    割草線數量本來就會跟著變 (5x5 邊界扣掉兩側地頭)。
+    """
+    try:
+        with open(bg.logpath, 'r', encoding='utf-8', errors='replace') as fh:
+            txt = fh.read()
+    except Exception:
+        return None
+    hl = RE_HEADLAND.findall(txt)
+    sw = RE_SWATH_COUNT.findall(txt)
+    if not hl:
+        return None
+    return {
+        'width': float(hl[-1][0]),
+        'field_area': float(hl[-1][1]),
+        'mainland_area': float(hl[-1][2]),
+        'swaths': int(sw[-1]) if sw else 0,
+    }
 
 
 def read_mission_state(bg):
@@ -1509,6 +1537,18 @@ def phase_n():
         obs_clear = min(min(math.hypot(px - ox, py - oy) for px, py in pts)
                         for ox, oy in obstacles)
         sub('路徑離最近障礙物中心 = %.2f m  (world 座標的箱子在 (3.5, 2.0))' % obs_clear)
+        hl = read_headland_state(ctl)
+        print('')
+        if hl is None:
+            sub('地頭 (headland)   = f2c_server log 裡沒有地頭資訊 (可能是舊版節點)')
+        else:
+            sub('地頭寬度         = %.2f m  (0 代表停用)' % hl['width'])
+            sub('原始邊界面積     = %.2f m^2' % hl['field_area'])
+            sub('內縮後作業面積   = %.2f m^2  (佔原始 %.1f%%)'
+                % (hl['mainland_area'],
+                   100.0 * hl['mainland_area'] / hl['field_area']
+                   if hl['field_area'] else 0.0))
+            sub('割草線數         = %d 條  (動態取得，不寫死)' % hl['swaths'])
         n2_ok = bool(resp.success) and avg_gap < 0.15 and not too_close
         record('N', 'N2', '真實 F2C 路徑、平均間距 < 0.15 m、邊界離障礙物 >= 1.5 m',
                'PASS' if n2_ok else 'FAIL',
@@ -1619,6 +1659,7 @@ def phase_n():
             with open(os.path.join(LOGDIR, 'n3_metrics.json'), 'w') as fh:
                 json.dump({
                     'lead_in': LEAD_IN,
+                    'headland': read_headland_state(ctl),
                     'swaths': st['total'],
                     'completed': st['completed'],
                     'failures': len(st['failures']),

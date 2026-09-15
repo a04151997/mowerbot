@@ -87,7 +87,11 @@ def generate_launch_description():
         executable='f2c_server',
         name='f2c_server',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            # 地頭寬度，預設與跑道長度 L 相同，讓跑道剛好落在地頭裡
+            'headland_width': LaunchConfiguration('headland_width'),
+        }]
     )
 
     # 模式管理與 Watchdog
@@ -119,6 +123,15 @@ def generate_launch_description():
             default_value='0.5',
             description='Lead-in (headland run-up) length in metres prepended to '
                         'each mowing swath. 0 disables it.'
+        ),
+
+        # F2C 地頭 (headland) 寬度，單位公尺，0 代表停用地頭。
+        # 預設值與 lead_in_length 相同，跑道才不會延伸到邊界外。
+        DeclareLaunchArgument(
+            'headland_width',
+            default_value='0.5',
+            description='Headland width in metres. Swaths are generated on the '
+                        'field shrunk by this margin. 0 disables the headland.'
         ),
 
         # 【核心修正】全域設定模擬時間參數
