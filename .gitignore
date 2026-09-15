@@ -5,3 +5,9 @@ log/
 __pycache__/
 *.pyc
 test/logs/
+
+# 建圖產物：每次建圖都會重新產生，且是二進位檔，不進版控
+src/mowerbot_bringup/maps/*.pgm
+src/mowerbot_bringup/maps/*.yaml
+src/mowerbot_bringup/maps/*.posegraph
+src/mowerbot_bringup/maps/*.data

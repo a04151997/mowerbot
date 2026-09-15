@@ -4,7 +4,7 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/N
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/L/N
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
 
 特性:
@@ -109,6 +109,7 @@ PHASES = [
     ('B', '單元功能'),
     ('C', '模擬整合'),
     ('D', '安全機制'),
+    ('L', '存圖與定位'),
     ('N', 'Nav2 路徑跟隨'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
@@ -1818,6 +1819,299 @@ def phase_n():
 
 
 # --------------------------------------------------------------------------
+# 6.5 Phase L：存圖與定位模式
+# --------------------------------------------------------------------------
+class LocRig(object):
+    """Phase L 用的測試夾具：偽造手把速度指令、讀 /map 與 /odom、切模式"""
+
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+        from nav_msgs.msg import OccupancyGrid, Odometry
+        from geometry_msgs.msg import Twist
+        from mowerbot_interfaces.srv import SetDriveMode
+
+        rclpy.init()
+        self.node = Node('smoke_l')
+        self.odom = []
+        self.maps = []            # (width, height, resolution, origin_x, origin_y)
+        # /map 是 latched (TRANSIENT_LOCAL)，用預設 QoS 會收不到已經發布過的那一張
+        map_qos = QoSProfile(depth=1,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             reliability=ReliabilityPolicy.RELIABLE)
+        self.node.create_subscription(OccupancyGrid, '/map', self._map_cb, map_qos)
+        self.node.create_subscription(
+            Odometry, '/odom',
+            lambda m: self.odom.append((m.pose.pose.position.x,
+                                        m.pose.pose.position.y)), 20)
+        self.joy_vel_pub = self.node.create_publisher(Twist, '/cmd_vel_joy', 10)
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        self.Twist = Twist
+        self.SetDriveMode = SetDriveMode
+        self.closed = False
+
+    def _map_cb(self, msg):
+        self.maps.append((msg.info.width, msg.info.height, msg.info.resolution,
+                          msg.info.origin.position.x, msg.info.origin.position.y))
+
+    def spin(self, seconds):
+        import rclpy
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def set_mode(self, mode):
+        import rclpy
+        if not self.mode_cli.wait_for_service(timeout_sec=15.0):
+            return None
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def drive(self, lin, ang, seconds, rate=20.0):
+        """持續對 /cmd_vel_joy 送速度指令。
+
+        必須持續送：mower_manager 的 watchdog 超過 watchdog_timeout
+        收不到指令就會自己停車，送一次是開不動的。
+        """
+        msg = self.Twist()
+        msg.linear.x = float(lin)
+        msg.angular.z = float(ang)
+        t0 = time.time()
+        period = 1.0 / rate
+        nxt = t0
+        while time.time() - t0 < seconds:
+            now = time.time()
+            if now >= nxt:
+                self.joy_vel_pub.publish(msg)
+                nxt = now + period
+            self.spin(0.01)
+
+    def wait_map(self, timeout=20.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.maps:
+            self.spin(0.3)
+        return self.maps[-1] if self.maps else None
+
+    def close(self):
+        import rclpy
+        if self.closed:
+            return
+        self.closed = True
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+
+def _pgm_size(path):
+    """讀 PGM 檔頭拿 width/height，用來與 /map 對照。
+
+    PGM 檔頭是純文字：magic (P5) / 可選註解行 / width height / maxval，
+    之後才是二進位像素資料。
+    """
+    try:
+        with open(path, 'rb') as fh:
+            tokens = []
+            while len(tokens) < 4:
+                line = fh.readline()
+                if not line:
+                    return None
+                line = line.split(b'#', 1)[0]
+                tokens.extend(line.split())
+            return int(tokens[1]), int(tokens[2])
+    except Exception:
+        return None
+
+
+def phase_l():
+    hdr('Phase L  存圖與定位模式 (建圖 -> 存檔 -> 切定位模式)')
+    sub('現況全程都用 async_slam_toolbox_node 的建圖模式，等於一邊割草一邊改地圖，')
+    sub('Nav2 的 costmap 會跟著漂。這個 Phase 驗證「建圖 -> 存檔 -> 切定位模式」走得通。')
+
+    map_name = 'smoke_l_map'
+    map_dir = os.path.join(WS, 'src', 'mowerbot_bringup', 'maps')
+    target = os.path.join(map_dir, map_name)
+    exts = ('posegraph', 'data', 'pgm', 'yaml')
+
+    # 每次重跑都從乾淨狀態開始，否則會拿到上一輪的舊檔案而誤判成功
+    for ext in exts:
+        try:
+            os.remove('%s.%s' % (target, ext))
+        except OSError:
+            pass
+
+    def skip_rest(reason, start_at):
+        allc = [('L1', '建圖模式開車建出地圖'), ('L2', 'serialize_map 與 save_map 存檔'),
+                ('L3', '切換到定位模式'), ('L4', 'map -> odom TF 與 /map 一致性')]
+        for cid, name in allc:
+            if cid >= start_at:
+                record('L', cid, name, 'SKIP', reason)
+
+    gz = bg_start('L_gazebo',
+                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py', 'gui:=false'])
+    sub('等待 Gazebo 起來 (18 秒)...')
+    time.sleep(18)
+    ctl = bg_start('L_mower_control', mower_control_cmd())
+    sub('等待 mower_control (含建圖模式 slam_toolbox) 穩定 (20 秒)...')
+    time.sleep(20)
+
+    rig = LocRig()
+    try:
+        # ---- L1 建圖 ----
+        hdr('L1  建圖模式下開車走一個小方形，讓 SLAM 建出有內容的地圖')
+        ok_mode = rig.set_mode(2)
+        sub('change_mower_mode(mode=2 手動) 回傳 success = %s' % ok_mode)
+        if ok_mode is None:
+            record('L', 'L1', '建圖模式開車建出地圖', 'FAIL',
+                   'change_mower_mode 服務沒上線')
+            skip_rest('沒辦法切到手動模式，開不了車', 'L2')
+            return
+
+        start = rig.odom[-1] if rig.odom else None
+        sub('開始開車 (mode 2 下對 /cmd_vel_joy 送指令，共約 30 秒)')
+        # 走一個方形：直線 5 秒 + 原地轉 90 度，重複 4 次
+        for leg in range(4):
+            rig.drive(0.4, 0.0, 5.0)
+            rig.drive(0.0, 0.8, 2.0)       # 0.8 rad/s x 2 s = 1.6 rad，約 92 度
+            sub('  第 %d 邊走完' % (leg + 1))
+        rig.drive(0.0, 0.0, 1.0)
+        rig.spin(2.0)
+
+        end = rig.odom[-1] if rig.odom else None
+        moved = math.dist(start, end) if (start and end) else float('nan')
+        travelled = 0.0
+        if len(rig.odom) > 1:
+            travelled = sum(math.dist(rig.odom[i], rig.odom[i + 1])
+                            for i in range(len(rig.odom) - 1))
+        sub('起點 = %s' % ('(%.2f, %.2f)' % start if start else '(沒收到 odom)'))
+        sub('終點 = %s' % ('(%.2f, %.2f)' % end if end else '(沒收到 odom)'))
+        sub('軌跡總長 = %.2f m，起終點直線距離 = %.2f m' % (travelled, moved))
+
+        m = rig.wait_map(20.0)
+        if m is None:
+            record('L', 'L1', '建圖模式開車建出地圖', 'FAIL', '20 秒內收不到 /map')
+            skip_rest('沒有地圖可存', 'L2')
+            return
+        map_w, map_h, map_res = m[0], m[1], m[2]
+        sub('/map 尺寸 = %d x %d cells，解析度 %.3f m (%.1f x %.1f m)'
+            % (map_w, map_h, map_res, map_w * map_res, map_h * map_res))
+        sub('/map 收到 %d 次更新' % len(rig.maps))
+        l1_ok = travelled > 2.0 and map_w > 0 and map_h > 0
+        record('L', 'L1', '建圖模式開車 30 秒建出有內容的地圖',
+               'PASS' if l1_ok else 'FAIL',
+               '軌跡 %.2f m, /map %d x %d cells' % (travelled, map_w, map_h))
+
+        # ---- L2 存檔 ----
+        hdr('L2  呼叫 serialize_map 與 save_map 存檔')
+        sub('用一鍵存圖腳本: ros2 run mowerbot_bringup save_map.sh %s' % map_name)
+        rc, out = run(['ros2', 'run', 'mowerbot_bringup', 'save_map.sh', map_name],
+                      timeout=120)
+        print(('     ' + out.strip()).replace('\n', '\n     '))
+        sizes = {}
+        for ext in exts:
+            path = '%s.%s' % (target, ext)
+            sizes[ext] = os.path.getsize(path) if os.path.isfile(path) else None
+        print('')
+        sub('存檔結果 (目錄 %s):' % map_dir)
+        for ext in exts:
+            if sizes[ext] is None:
+                print('        %-10s (沒有產生)' % ('.' + ext))
+            else:
+                print('        %-10s %10d bytes' % ('.' + ext, sizes[ext]))
+        pgm_size = _pgm_size('%s.pgm' % target)
+        sub('.pgm 檔頭的 width x height = %s'
+            % ('%d x %d' % pgm_size if pgm_size else '(讀不到)'))
+        missing = [e for e in exts if not sizes[e]]
+        l2_ok = not missing
+        record('L', 'L2', 'serialize_map 與 save_map 四個檔案都產生且非空',
+               'PASS' if l2_ok else 'FAIL',
+               '腳本 rc=%d, 缺少或空檔=%s' % (rc, missing or '無'))
+        if not l2_ok:
+            skip_rest('地圖沒存成功，定位模式起不來', 'L3')
+            return
+
+        # ---- L3 切定位模式 ----
+        hdr('L3  關掉建圖模式的節點，改用 localization.launch.py 啟動')
+        sub('(Gazebo 留著不關：它提供 /scan 與 odom -> base_footprint，')
+        sub(' 這兩個在真實流程裡是車子本身提供的，不屬於建圖模式)')
+        rig.close()
+        ctl.stop()
+        sub('等建圖模式的節點完全退出 (5 秒)...')
+        time.sleep(5.0)
+
+        loc = bg_start('L_localization',
+                       ['ros2', 'launch', 'mowerbot_bringup', 'localization.launch.py',
+                        'map_file_name:=%s' % target])
+        sub('等定位模式載入序列化地圖 (20 秒)...')
+        time.sleep(20)
+        alive = loc.alive()
+        sub('localization.launch.py 還活著 = %s' % alive)
+        if not alive:
+            print('')
+            print('--- localization.launch.py 完整 log ---')
+            print(loc.log_tail(120))
+        record('L', 'L3', 'localization_slam_toolbox_node 啟動且沒有掛掉',
+               'PASS' if alive else 'FAIL',
+               'launch 行程 alive=%s' % alive)
+        if not alive:
+            skip_rest('定位模式沒起來', 'L4')
+            return
+
+        # ---- L4 TF 與 /map ----
+        hdr('L4  確認 map -> odom 的 TF 存在、/map 有發布且尺寸與存檔時一致')
+        trans, tf_out = tf_echo('map', 'odom', dur=8)
+        if trans is None:
+            sub('tf2_echo map -> odom 查不到，原始輸出:')
+            print(('     ' + tf_out.strip()[-800:]).replace('\n', '\n     '))
+        else:
+            sub('map -> odom 平移 = (%.3f, %.3f, %.3f)' % trans)
+
+        rig2 = LocRig()
+        m2 = rig2.wait_map(25.0)
+        if m2 is None:
+            sub('/map 在定位模式下 25 秒內沒有收到')
+            loc_w = loc_h = None
+        else:
+            loc_w, loc_h, loc_res = m2[0], m2[1], m2[2]
+            sub('定位模式 /map 尺寸 = %d x %d cells，解析度 %.3f m'
+                % (loc_w, loc_h, loc_res))
+            # 階段 3 的目的就是「地圖不要再漂」，所以再等一段時間看尺寸會不會變。
+            # 這是附帶觀察，不列入 L4 的判定。
+            del rig2.maps[:]
+            rig2.spin(20.0)
+            if rig2.maps:
+                sizes = sorted({(mm[0], mm[1]) for mm in rig2.maps})
+                sub('再監聽 20 秒收到 %d 張 /map，尺寸集合 = %s  -> %s'
+                    % (len(rig2.maps), ['%dx%d' % z for z in sizes],
+                       '固定不變' if len(sizes) == 1 else '仍然會變動'))
+            else:
+                sub('再監聽 20 秒沒有收到新的 /map (latched 之後就不再更新)')
+        rig2.close()
+
+        print('')
+        sub('存檔時 /map          = %d x %d cells' % (map_w, map_h))
+        sub('.pgm 檔頭            = %s'
+            % ('%d x %d' % pgm_size if pgm_size else '(讀不到)'))
+        sub('定位模式 /map        = %s'
+            % ('%d x %d' % (loc_w, loc_h) if loc_w else '(沒收到)'))
+        same = (loc_w is not None and (loc_w, loc_h) == (map_w, map_h))
+        sub('尺寸是否一致          = %s' % same)
+        l4_ok = (trans is not None) and same
+        record('L', 'L4', 'map -> odom TF 查得到，且 /map 尺寸與存檔時一致',
+               'PASS' if l4_ok else 'FAIL',
+               'TF=%s, 存檔時=%sx%s, 定位模式=%s'
+               % ('有' if trans is not None else '無', map_w, map_h,
+                  '%dx%d' % (loc_w, loc_h) if loc_w else '沒收到'))
+    finally:
+        try:
+            rig.close()
+        except Exception:
+            pass
+
+
+# --------------------------------------------------------------------------
 # 7. 總結
 # --------------------------------------------------------------------------
 def summary():
@@ -1864,10 +2158,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDN'
+    phases = 'ABCDLN'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDN'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDLN'
         elif arg.startswith('--lead-in'):
             pass          # 已在模組載入時解析成 LEAD_IN
         elif arg in ('-h', '--help'):
@@ -1915,6 +2209,13 @@ def main():
                 phase_d()
             finally:
                 bg_stop_all()
+
+        if 'L' in phases:
+            try:
+                phase_l()
+            finally:
+                bg_stop_all()
+                sweep(['gzserver', 'gzclient', 'spawn_entity.py'])
 
         if 'N' in phases:
             try:
