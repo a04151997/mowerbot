@@ -1309,18 +1309,90 @@ class NavRig(object):
 STATUS_NAME = {0: 'UNKNOWN', 1: 'ACCEPTED', 2: 'EXECUTING', 3: 'CANCELING',
                4: 'SUCCEEDED', 5: 'CANCELED', 6: 'ABORTED'}
 
-# mow_field.world 裡的障礙物 (名稱, 中心, 尺寸/半徑, yaw)。
-# Phase N 用來驗證測試邊界離每個障礙物都夠遠。
-WORLD_OBSTACLES = [
-    ('obstacle_box_a',      'box',      (3.5, 2.0),   (1.0, 1.2),   0.35),
-    ('obstacle_cylinder_a', 'cylinder', (-4.2, 5.5),  (0.6,),       0.0),
-    ('obstacle_box_b',      'box',      (6.0, -5.0),  (1.5, 0.8),  -0.6),
-    ('obstacle_cylinder_b', 'cylinder', (-6.5, -3.0), (0.45,),      0.0),
-    ('wall_north',          'box',      (0.0, 10.1),  (20.4, 0.2),  0.0),
-    ('wall_south',          'box',      (0.0, -10.1), (20.4, 0.2),  0.0),
-    ('wall_east',           'box',      (10.1, 0.0),  (0.2, 20.4),  0.0),
-    ('wall_west',           'box',      (-10.1, 0.0), (0.2, 20.4),  0.0),
-]
+# 世界檔裡的物體 (名稱, 形狀, 中心, 尺寸/半徑, yaw)。
+# 以前這份清單是寫死的 mow_field.world 內容，用 --world 換世界時會去檢查
+# 根本不存在的障礙物，印出來的淨空數字是假的。改成直接解析實際載入的 .world。
+
+
+def parse_world_models(world_name):
+    """從 mowerbot_bringup/worlds/<world_name> 解析出所有靜態物體。
+
+    回傳 [(名稱, 'box'|'cylinder', (cx, cy), 尺寸, yaw)]，
+    尺寸對 box 是 (sx, sy)、對 cylinder 是 (radius,)。
+    <include> 進來的 sun / ground_plane 沒有 <model> 標籤，自然不會被收進來。
+    """
+    import xml.etree.ElementTree as ET
+    share = run(['ros2', 'pkg', 'prefix', 'mowerbot_bringup'], timeout=30)[1].strip()
+    path = os.path.join(share, 'share', 'mowerbot_bringup', 'worlds', world_name)
+    if not os.path.isfile(path):
+        return None, path
+    out = []
+    for model in ET.parse(path).getroot().iter('model'):
+        name = model.get('name') or '(無名)'
+        pose = (model.findtext('pose') or '0 0 0 0 0 0').split()
+        cx, cy = float(pose[0]), float(pose[1])
+        yaw = float(pose[5]) if len(pose) >= 6 else 0.0
+        geom = None
+        for link in model.iter('link'):
+            for coll in link.iter('collision'):
+                box = coll.find('.//box/size')
+                cyl = coll.find('.//cylinder/radius')
+                if box is not None:
+                    v = box.text.split()
+                    geom = ('box', (float(v[0]), float(v[1])))
+                elif cyl is not None:
+                    geom = ('cylinder', (float(cyl.text),))
+                if geom:
+                    break
+            if geom:
+                break
+        if geom:
+            out.append((name, geom[0], (cx, cy), geom[1], yaw))
+    return out, path
+
+
+def _model_footprint(kind, center, dims, yaw):
+    """物體在地面上的多邊形輪廓；圓柱用外接正方形近似，只拿來判斷相鄰關係。"""
+    if kind == 'cylinder':
+        r = dims[0]
+        return _rot_box_corners(center[0], center[1], 2 * r, 2 * r, 0.0)
+    return _rot_box_corners(center[0], center[1], dims[0], dims[1], yaw)
+
+
+def classify_world_models(models, touch_tol=0.05):
+    """把物體分成「邊界圍牆」與「作業區內部的障礙物」。
+
+    規則：先把碰到整體外緣的物體當成圍牆 (種子)，
+    再把任何與已知圍牆相接的物體也算成圍牆 (角落的短翼、方柱、凹角側板)，
+    重複到收斂為止。剩下的就是內部障礙物。
+    這樣才不會把 demo_lawn.world 貼在牆上的角落特徵誤判成內部障礙物。
+    """
+    if not models:
+        return [], []
+    foots = [_model_footprint(k, c, d, y) for _, k, c, d, y in models]
+    xs = [p[0] for f in foots for p in f]
+    ys = [p[1] for f in foots for p in f]
+    X0, X1, Y0, Y1 = min(xs), max(xs), min(ys), max(ys)
+
+    wall = set()
+    for i, f in enumerate(foots):
+        fx0 = min(p[0] for p in f); fx1 = max(p[0] for p in f)
+        fy0 = min(p[1] for p in f); fy1 = max(p[1] for p in f)
+        if (abs(fx0 - X0) <= touch_tol or abs(fx1 - X1) <= touch_tol
+                or abs(fy0 - Y0) <= touch_tol or abs(fy1 - Y1) <= touch_tol):
+            wall.add(i)
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(foots)):
+            if i in wall:
+                continue
+            if any(_poly_poly_dist(foots[i], foots[j]) <= touch_tol for j in wall):
+                wall.add(i)
+                changed = True
+    walls = [models[i] for i in sorted(wall)]
+    inner = [models[i] for i in range(len(models)) if i not in wall]
+    return inner, walls
 
 # N2 的測試邊界：5m x 5m，中心 (-1.5, -1.5)。
 # 這是掃過 mow_field.world 之後挑的——它包含車子起始位置 (0, 0)，
@@ -1351,10 +1423,10 @@ def _poly_poly_dist(a, b):
     return best
 
 
-def boundary_clearances(corners):
+def boundary_clearances(corners, models):
     """回傳 [(障礙物名稱, 中心, 與邊界最近邊的距離)]"""
     out = []
-    for name, kind, center, dims, yaw in WORLD_OBSTACLES:
+    for name, kind, center, dims, yaw in models:
         if kind == 'cylinder':
             d = min(_point_seg_dist(center[0], center[1],
                                     corners[i][0], corners[i][1],
@@ -1555,16 +1627,42 @@ def phase_n():
         sub('(與 mower_manager 的 blade_width x (1 - overlap_ratio) 一致，'
             '否則量到的是別條路徑的落差)')
         print('')
-        sub('障礙物淨空檢查 (要求全部 >= %.1f m):' % MIN_OBSTACLE_CLEARANCE)
-        clearances = boundary_clearances(corners)
-        for name, center, dist in clearances:
-            flag = 'OK' if dist >= MIN_OBSTACLE_CLEARANCE else '太近'
-            print('        %-22s 位置 (%6.2f, %6.2f)   與邊界最近邊距離 %6.2f m   %s'
-                  % (name, center[0], center[1], dist, flag))
-        min_clear = min(d for _, _, d in clearances)
-        too_close = [n for n, _, d in clearances if d < MIN_OBSTACLE_CLEARANCE]
-        sub('最小淨空 = %.2f m  (%s)'
-            % (min_clear, '全部達標' if not too_close else '未達標: %s' % too_close))
+        world_name = WORLD or 'mow_field.world'
+        models, world_path = parse_world_models(world_name)
+        if models is None:
+            sub('障礙物淨空檢查：找不到世界檔 %s，無法解析' % world_path)
+            inner, walls, clearances = [], [], []
+            min_clear, too_close = float('nan'), []
+            clearance_ok = False
+        else:
+            inner, walls = classify_world_models(models)
+            sub('障礙物淨空檢查 (依實際載入的 %s 解析，不再寫死):' % world_name)
+            sub('  解析到 %d 個靜態物體：邊界圍牆 %d 個、作業區內部障礙物 %d 個'
+                % (len(models), len(walls), len(inner)))
+            clearances = boundary_clearances(corners, inner)
+            if not inner:
+                sub('  此世界無內部障礙物，淨空檢查不適用')
+                if walls:
+                    wall_min = min(d for _, _, d in boundary_clearances(corners, walls))
+                    sub('  (參考用：測試邊界離最近的圍牆 %.2f m)' % wall_min)
+                min_clear, too_close = float('nan'), []
+                clearance_ok = True
+            else:
+                sub('  內部障礙物與測試邊界的距離 (要求全部 >= %.1f m):'
+                    % MIN_OBSTACLE_CLEARANCE)
+                for name, center, dist in clearances:
+                    flag = 'OK' if dist >= MIN_OBSTACLE_CLEARANCE else '太近'
+                    print('        %-22s 位置 (%6.2f, %6.2f)   與邊界最近邊距離 %6.2f m   %s'
+                          % (name, center[0], center[1], dist, flag))
+                min_clear = min(d for _, _, d in clearances)
+                too_close = [n for n, _, d in clearances if d < MIN_OBSTACLE_CLEARANCE]
+                sub('  最小淨空 = %.2f m  (%s)'
+                    % (min_clear, '全部達標' if not too_close
+                       else '未達標: %s' % too_close))
+                clearance_ok = not too_close
+            if walls:
+                sub('  邊界圍牆 (參考用，不列入判定): %s'
+                    % ', '.join(n for n, _, _, _, _ in walls))
         fut = f2c_cli.call_async(req)
         rclpy.spin_until_future_complete(rig.node, fut, timeout_sec=60.0)
         if not fut.done() or fut.result() is None:
@@ -1601,11 +1699,12 @@ def phase_n():
                    100.0 * hl['mainland_area'] / hl['field_area']
                    if hl['field_area'] else 0.0))
             sub('割草線數         = %d 條  (動態取得，不寫死)' % hl['swaths'])
-        n2_ok = bool(resp.success) and avg_gap < 0.15 and not too_close
-        record('N', 'N2', '真實 F2C 路徑、平均間距 < 0.15 m、邊界離障礙物 >= 1.5 m',
+        n2_ok = bool(resp.success) and avg_gap < 0.15 and clearance_ok
+        record('N', 'N2', '真實 F2C 路徑、平均間距 < 0.15 m、邊界離內部障礙物 >= 1.5 m',
                'PASS' if n2_ok else 'FAIL',
-               'success=%s, 航點=%d, 平均間距=%.4fm, 最大間距=%.4fm, 總長=%.2fm, 最小淨空=%.2fm'
-               % (resp.success, len(pts), avg_gap, max_gap, total_len, min_clear))
+               'success=%s, 航點=%d, 平均間距=%.4fm, 最大間距=%.4fm, 總長=%.2fm, 最小淨空=%s'
+               % (resp.success, len(pts), avg_gap, max_gap, total_len,
+                  '%.2fm' % min_clear if inner else '不適用 (無內部障礙物)'))
 
         # ---- N3 端到端覆蓋任務 ----
         hdr('N3  端到端覆蓋任務 (manager 逐條割草線循序執行)')
@@ -1621,11 +1720,19 @@ def phase_n():
         ok_mode = rig.set_mode(1)
         sub('change_mower_mode(mode=1 F2C) 回傳 success = %s' % ok_mode)
 
-        sub('監聽最多 180 秒...')
+        # 【量測修正，不是放寬判定】監聽窗口原本寫死 180 秒。
+        # 重疊率掃到 0.5 時路徑從 35.5 m 變成 67.8 m，任務還在正常割草、
+        # 一條都沒有 ABORTED，窗口就先到了，於是被記成 done=False、完成 15/16。
+        # 那是「看得不夠久」而不是「機器做不到」。窗口改成跟著路徑長度伸縮。
+        # 判定標準完全沒有動：仍然是「所有割草線 SUCCEEDED 且完成數 == 總數」。
+        # 係數 4.0 s/m 來自實測 (55.6 m 的路徑跑 157 s，約 2.8 s/m) 再加四成餘裕。
+        mission_timeout = max(180.0, 4.0 * total_len)
+        sub('監聽最多 %.0f 秒  (= max(180, 4.0 s/m x 路徑總長 %.1f m))'
+            % (mission_timeout, total_len))
         t0 = time.time()
         last_report = 0.0
         st = before
-        while time.time() - t0 < 180.0:
+        while time.time() - t0 < mission_timeout:
             rclpy.spin_once(rig.node, timeout_sec=0.05)
             st = read_mission_state(ctl)
             if st['done'] or st['failures']:
