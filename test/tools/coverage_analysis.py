@@ -45,9 +45,28 @@ def load_xy(path, skip_cols=0):
     return [(float(r[-2]), float(r[-1])) for r in rows]
 
 
+def strip_perimeter(pts):
+    """拿掉 F2C 路徑最前面的周邊環繞那一圈 (階段 10 新增)。
+
+    環繞的最後一個航點座標與第 0 個完全相同 (回到起點)，
+    mower_manager 與 smoke_test 都是用這個特徵辨識的，這裡照做，
+    否則環繞的四條邊會被當成割草線，主方向 (swath_frame) 可能取錯。
+    覆蓋面積本身是用軌跡算的，不受影響。
+    """
+    if len(pts) < 4:
+        return list(pts)
+    x0, y0 = pts[0]
+    for k in range(3, len(pts)):
+        if math.hypot(pts[k][0] - x0, pts[k][1] - y0) <= 1e-3:
+            return list(pts[k + 1:])
+    return list(pts)
+
+
 def split_swaths(pts):
     """與 mower_manager.split_path_into_swaths 相同的切法：
-    相鄰段方向反轉 (夾角 >= 90 度) 就切開，只有 2 點的橫向連接段丟掉。"""
+    先拿掉周邊環繞那一圈，再把剩下的依方向反轉 (夾角 >= 90 度) 切開，
+    只有 2 點的橫向連接段丟掉。"""
+    pts = strip_perimeter(pts)
     cuts, prev = [], None
     for i in range(len(pts) - 1):
         dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]

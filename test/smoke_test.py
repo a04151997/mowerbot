@@ -1078,9 +1078,30 @@ def _quat_from_yaw(yaw):
     return (0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0))
 
 
+def strip_perimeter(pts):
+    """把 F2C 路徑最前面的「周邊環繞」那一圈拿掉，回傳 (環繞點數, 其餘航點)。
+
+    【量測修正，不是放寬判定】階段 10 之後 f2c_server 會在弓字形割草線前面
+    加一圈沿作業區邊緣的環繞，而且把環繞的最後一個航點設成與第 0 個完全相同
+    (回到起點) —— mower_manager 就是用這個特徵把環繞切下來的。
+    測試這邊若不照做，環繞的四條邊會被當成割草線，
+    逐割草線的橫向偏差就不是在量同一個東西了。
+    判定標準沒有動：N3 仍然是「所有割草線 SUCCEEDED 且完成數 == 總數」。
+    """
+    if len(pts) < 4:
+        return 0, list(pts)
+    x0, y0 = pts[0]
+    for k in range(3, len(pts)):
+        if math.hypot(pts[k][0] - x0, pts[k][1] - y0) <= 1e-3:
+            return k + 1, list(pts[k + 1:])
+    return 0, list(pts)
+
+
 def split_swaths_like_manager(pts):
     """用與 mower_manager.split_path_into_swaths 相同的規則切割：
-    相鄰段方向變化達 90 度就切開，只有 2 個點的橫向連接段丟掉。"""
+    先把周邊環繞那一圈拿掉，再把剩下的依方向變化達 90 度切開，
+    只有 2 個點的橫向連接段丟掉。"""
+    _n_perim, pts = strip_perimeter(pts)
     cuts = []
     prev = None
     for i in range(len(pts) - 1):
@@ -1517,6 +1538,20 @@ RE_MISSION_DONE = re.compile(r'覆蓋任務完成！共完成 (\d+) 條割草線
 RE_HEADLAND = re.compile(
     r'地頭寬度 ([\d.]+) m：原始面積 ([\d.]+) m\^2 -> 內縮後作業面積 ([\d.]+) m\^2')
 RE_SWATH_COUNT = re.compile(r'割草線計算成功！割草線 (\d+) 條')
+# 第 1 條割草線被送出去的時刻 (log 的時間戳是系統時鐘，與軌跡取樣的
+# time.time() 同一個基準)，用來把周邊環繞那一段軌跡排除在逐割草線的偏差之外。
+RE_SEND_FIRST_SWATH = re.compile(
+    r'\[(\d+\.\d+)\] \[mower_manager\].*送出任務 \[割草線 1/')
+
+
+def read_first_swath_time(bg):
+    """回傳「第 1 條割草線被送出去」的系統時間戳，找不到就回傳 None。"""
+    try:
+        with open(bg.logpath, 'r', encoding='utf-8', errors='replace') as fh:
+            hits = RE_SEND_FIRST_SWATH.findall(fh.read())
+    except Exception:
+        return None
+    return float(hits[0]) if hits else None
 
 
 def read_headland_state(bg):
@@ -1743,6 +1778,13 @@ def phase_n():
         print('')
         sub('success        = %s' % resp.success)
         sub('航點總數       = %d' % len(pts))
+        n_perim, _swath_pts = strip_perimeter(pts)
+        if n_perim:
+            perim_len = sum(math.dist(pts[i], pts[i + 1]) for i in range(n_perim - 1))
+            sub('  其中周邊環繞   = %d 個航點，全長 %.2f m (階段 10 新增，排在割草線前面)'
+                % (n_perim, perim_len))
+        else:
+            sub('  其中周邊環繞   = 0 (未產生，或 perimeter_pass 已關閉)')
         sub('平均間距       = %.4f m  (判定門檻 < 0.15)' % avg_gap)
         sub('最大間距       = %.4f m  (= 割草線間距，那是兩條割草線之間的橫向連接段)' % max_gap)
         sub('路徑總長       = %.2f m' % total_len)
@@ -1827,9 +1869,24 @@ def phase_n():
             sub('(軌跡存檔失敗: %s)' % exc)
 
         swath_lines = split_swaths_like_manager(pts)
+        # 【量測修正，不是放寬判定】階段 10 之後任務前面多了一圈周邊環繞。
+        # 環繞的第一個轉角離第 1 條割草線起點只有 0.15 m，trim_radius (0.35 m)
+        # 會誤判「approach 已經結束」，於是整圈環繞的軌跡都被當成割草軌跡，
+        # 對面那條邊距離最遠的割草線 3.7 m，就被記成某條割草線的橫向偏差。
+        # 改成從 manager log 讀「第 1 條割草線送出去」的時刻，
+        # 只用那之後的軌跡算逐割草線偏差。覆蓋落差 (coverage_gap) 仍然用
+        # 完整軌跡，因為環繞時刀盤本來就在割，那段覆蓋是真的。
+        # N3 的判定標準沒有動：仍是「所有割草線 SUCCEEDED 且完成數 == 總數」。
+        t_first_swath = read_first_swath_time(ctl)
+        if t_first_swath is None:
+            traj_for_dev = traj
+            n_drop_perim = 0
+        else:
+            traj_for_dev = [item for item in traj if item[0] >= t_first_swath]
+            n_drop_perim = len(traj) - len(traj_for_dev)
         # 0.35 m = goal checker 的 xy_goal_tolerance 0.25 m 再加一點餘裕
         max_dev, mean_dev, n_used, per_swath, n_drop_sw = lateral_deviation_per_swath(
-            traj, swath_lines, trim_radius=0.35)
+            traj_for_dev, swath_lines, trim_radius=0.35)
         # 對照用：舊的累積弧長指標 (扣掉 approach 移動段)
         arc_dev, arc_mean, n_drop, _n = lateral_deviation_by_arclength(
             traj, pts, trim_radius=0.35)
@@ -1869,6 +1926,9 @@ def phase_n():
         sub('最大橫向偏差         = %.3f m   (逐割草線指派，與上面的覆蓋落差互相印證)'
             % max_dev)
         sub('平均橫向偏差         = %.3f m' % mean_dev)
+        if t_first_swath is not None:
+            sub('  (已先丟棄第 1 條割草線送出之前的 %d 筆取樣 = approach + 周邊環繞 + 銜接段)'
+                % n_drop_perim)
         sub('  (逐割草線指派，已丟棄 approach 的 %d 筆取樣，'
             % n_drop_sw)
         sub('   只採計投影落在割草線範圍內的 %d 筆；迴轉段不列入)' % n_used)

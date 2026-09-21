@@ -278,8 +278,11 @@ class MowerManager(Node):
             return None
         return (tf.transform.translation.x, tf.transform.translation.y)
 
-    def build_approach_path(self, robot_xy, first_swath):
-        """產生「從車子當下位置前往第 1 條割草線起點」的 approach 路徑。
+    def build_approach_path(self, robot_xy, first_swath, label='approach'):
+        """產生「從某個位置前往下一段路徑起點」的移動路徑。
+
+        label 只影響 log 的字樣：起點是車子當下位置時叫 approach，
+        用在「周邊環繞結束 -> 第 1 條割草線起點」時叫銜接段。
 
         為什麼 approach 要當成獨立的一個 FollowPath goal，而不是接在第 1 條割草線前面：
         (a) 接上去的話「割草線 1」會變成 L 形路徑，中間有一個大轉折，等於把我們
@@ -297,7 +300,7 @@ class MowerManager(Node):
 
         if distance < self.APPROACH_SKIP_DISTANCE:
             self.get_logger().info(
-                f'🚗 跳過 approach：車子距離第 1 條割草線起點只有 {distance:.2f} m '
+                f'🚗 跳過 {label}：車子距離第 1 條割草線起點只有 {distance:.2f} m '
                 f'(< {self.APPROACH_SKIP_DISTANCE} m)，直接開始割草')
             return None
 
@@ -327,7 +330,7 @@ class MowerManager(Node):
         final_q.z, final_q.w = target_q.z, target_q.w
 
         self.get_logger().info(
-            f'🚗 產生 approach 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
+            f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
         return approach
 
     # 跑道的航點間距，與割草線、approach 一致
@@ -395,21 +398,35 @@ class MowerManager(Node):
             f'航點 0..{n_lead - 1} 為跑道段，{n_lead}..{len(out.poses) - 1} 為割草段')
         return out
 
-    def split_path_into_swaths(self, path_msg):
-        """把整條覆蓋路徑依「行進方向反轉」切成一條一條的割草線。
+    PERIMETER_CLOSE_TOL = 1e-3
 
-        DWB 的 PathDist / GoalDist 都是 MapGridCritic，在 local costmap 上用網格
-        距離場評分，沒有路徑順序或弧長的概念。割草線間距只有 0.5 公尺時，距離場在
-        兩線之間幾乎是平的，沒有梯度推車子沿線前進；GoalDist 的梯度又直指終點，
-        等於鼓勵車子斜切穿過所有割草線。所以這裡先把路徑拆開，讓控制器的視野裡
-        永遠只有一條直線。
+    def split_off_perimeter(self, path_msg):
+        """把 F2C 路徑最前面的「周邊環繞」那一圈切下來。
 
-        F2C 送來的路徑形狀是 [割草線1 ... 割草線1, 割草線2 ... 割草線2, ...]，
-        兩條割草線之間夾著一段垂直的橫向連接段 (長度等於刀盤寬度)。相鄰航點的方向
-        變化達到 90 度就切開，因此連接段會自成一個「只有 2 個航點」的片段；那不是
-        割草線 (內插過的割草線至少有 3 個航點)，直接丟掉不送。
+        f2c_server 把環繞放在整條路徑的最前面，而且把環繞最後一個航點的座標
+        設成與第 0 個航點完全相同 (回到起點)。弓字形割草線不會回到起點，
+        所以用這個特徵就能把兩者分開，不必為了傳一個旗標去動 srv 介面。
+
+        回傳 (環繞航點 list, 其餘航點 list)。沒有環繞時回傳 ([], 全部航點)，
+        舊版 f2c_server 的路徑因此完全照原本的流程走。
         """
         poses = path_msg.poses
+        if len(poses) < 4:
+            return [], list(poses)
+        p0 = poses[0].pose.position
+        for k in range(3, len(poses)):
+            pk = poses[k].pose.position
+            if math.hypot(pk.x - p0.x, pk.y - p0.y) <= self.PERIMETER_CLOSE_TOL:
+                return list(poses[:k + 1]), list(poses[k + 1:])
+        return [], list(poses)
+
+    def cut_on_direction_change(self, poses):
+        """依「相鄰航點方向變化達到 90 度」把一串航點切成多段，只保留 >= 3 點的段。
+
+        割草線與周邊環繞共用同一條規則：割草線之間夾的是垂直的橫向連接段，
+        環繞的轉角同樣是接近 90 度的轉折，兩者都要在轉折處切開，
+        才能讓控制器的視野裡一次只有一條直線 (理由見 split_path_into_swaths)。
+        """
         if len(poses) < 2:
             return []
 
@@ -430,17 +447,66 @@ class MowerManager(Node):
                     cut_indices.append(i)
             prev_dir = cur_dir
 
-        swaths = []
+        segments = []
         start = 0
         for cut in cut_indices + [len(poses) - 1]:
             segment = poses[start:cut + 1]
             if len(segment) >= 3:      # 2 個航點的是橫向連接段，不是割草線
-                sub = Path()
-                sub.header.frame_id = path_msg.header.frame_id
-                sub.header.stamp = path_msg.header.stamp
-                sub.poses = list(segment)
-                swaths.append(sub)
+                segments.append(list(segment))
             start = cut
+        return segments
+
+    def split_perimeter_into_edges(self, poses, header):
+        """把周邊環繞那一圈依轉角切成一段一段的直邊。
+
+        整圈當成單一個 FollowPath goal 送出去是行不通的：轉角處方向劇變，
+        DWB 的距離場評分會在轉角前就把車子拉向下一條邊。切成直邊之後，
+        每一段的處理方式就跟割草線一樣。
+
+        環繞段不加跑道 (lead-in)。跑道是沿著行進方向「往後」延伸 0.5 m，
+        對環繞的邊來說那個位置在轉角外側，已經超出作業區、落進
+        costmap 的膨脹層，車子根本到不了那裡。
+        """
+        edges = []
+        for seg in self.cut_on_direction_change(poses):
+            sub = Path()
+            sub.header.frame_id = header.frame_id
+            sub.header.stamp = header.stamp
+            sub.poses = seg
+            edges.append(sub)
+        if edges:
+            total_len = 0.0
+            for e in edges:
+                for k in range(len(e.poses) - 1):
+                    total_len += math.hypot(
+                        e.poses[k + 1].pose.position.x - e.poses[k].pose.position.x,
+                        e.poses[k + 1].pose.position.y - e.poses[k].pose.position.y)
+            self.get_logger().info(
+                f'🔄 周邊環繞切出 {len(edges)} 段直邊，全長 {total_len:.2f} m '
+                f'(環繞段不加跑道)')
+        return edges
+
+    def split_path_into_swaths(self, path_msg):
+        """把整條覆蓋路徑依「行進方向反轉」切成一條一條的割草線。
+
+        DWB 的 PathDist / GoalDist 都是 MapGridCritic，在 local costmap 上用網格
+        距離場評分，沒有路徑順序或弧長的概念。割草線間距只有 0.5 公尺時，距離場在
+        兩線之間幾乎是平的，沒有梯度推車子沿線前進；GoalDist 的梯度又直指終點，
+        等於鼓勵車子斜切穿過所有割草線。所以這裡先把路徑拆開，讓控制器的視野裡
+        永遠只有一條直線。
+
+        F2C 送來的路徑形狀是 [割草線1 ... 割草線1, 割草線2 ... 割草線2, ...]，
+        兩條割草線之間夾著一段垂直的橫向連接段 (長度等於刀盤寬度)。相鄰航點的方向
+        變化達到 90 度就切開，因此連接段會自成一個「只有 2 個航點」的片段；那不是
+        割草線 (內插過的割草線至少有 3 個航點)，直接丟掉不送。
+        """
+        swaths = []
+        for segment in self.cut_on_direction_change(path_msg.poses):
+            sub = Path()
+            sub.header.frame_id = path_msg.header.frame_id
+            sub.header.stamp = path_msg.header.stamp
+            sub.poses = segment
+            swaths.append(sub)
 
         self.get_logger().info(f'✂️ 覆蓋路徑切出 {len(swaths)} 條割草線')
         for idx, sw in enumerate(swaths):
@@ -545,8 +611,17 @@ class MowerManager(Node):
                 self.get_logger().info(f'🎉 成功拿到 F2C 路徑！總航點數: {len(response.coverage_path.poses)}')
                 # 【關鍵】：把路徑廣播出去給 RViz2 畫圖
                 self.path_pub.publish(response.coverage_path)
+                # 先把最前面的周邊環繞那一圈切下來 (沒有環繞時就是空的)，
+                # 剩下的才是弓字形割草線。
+                perimeter_poses, swath_poses = self.split_off_perimeter(
+                    response.coverage_path)
+                rest = Path()
+                rest.header = response.coverage_path.header
+                rest.poses = swath_poses
+                perimeter_edges = self.split_perimeter_into_edges(
+                    perimeter_poses, response.coverage_path.header)
                 # 切成一條一條割草線後循序執行，一次只給 Nav2 一條直線
-                swaths = self.split_path_into_swaths(response.coverage_path)
+                swaths = self.split_path_into_swaths(rest)
                 if not swaths:
                     self.get_logger().error('⚠️ 這條覆蓋路徑切不出任何割草線，任務中止。')
                     self.clear_swath_queue()
@@ -565,10 +640,26 @@ class MowerManager(Node):
                 # 進入真正的割草段時已經貼在線上。
                 swaths = [self.build_lead_in(sw, i + 1, total)
                           for i, sw in enumerate(swaths)]
-                queue = [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
+                # 周邊環繞排在割草線前面：先把作業區邊緣繞一圈再開始弓字形。
+                # _swath_total 仍然只算割草線，「共完成 N 條割草線」的意義不變。
+                n_edges = len(perimeter_edges)
+                queue = [(e, f'周邊環繞 {i + 1}/{n_edges}')
+                         for i, e in enumerate(perimeter_edges)]
+                # 環繞是一個封閉的圈，走完會回到它的起點，那裡離第 1 條割草線的
+                # 跑道起點可能有好幾公尺。不補一段銜接就直接送割草線的話，
+                # 車子要自己從幾公尺外切進路徑，實測 DWB 會在 23 秒後
+                # 以 Failed to make progress 中止整個任務。
+                if perimeter_edges:
+                    end = perimeter_edges[-1].poses[-1].pose.position
+                    link = self.build_approach_path(
+                        (end.x, end.y), swaths[0], label='銜接段')
+                    if link is not None:
+                        queue.append((link, '銜接段'))
+                queue += [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
                 # swaths[0] 已經是「跑道 + 第 1 條割草線」，所以 approach 的終點
                 # 自然就是跑道起點而不是 A，所有割草線的處理方式一致。
-                approach = self.build_approach_path(robot_xy, swaths[0])
+                # 有環繞時 approach 的終點改成環繞的第一段起點。
+                approach = self.build_approach_path(robot_xy, queue[0][0])
                 if approach is not None:
                     queue.insert(0, (approach, 'approach'))
 
