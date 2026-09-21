@@ -4,7 +4,8 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/L/N
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N
+    python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
     python3 test/smoke_test.py --overlap=0.3           # 覆寫割草線重疊率
     python3 test/smoke_test.py --world=demo_lawn.world # 換模擬世界
@@ -150,6 +151,7 @@ PHASES = [
     ('B', '單元功能'),
     ('C', '模擬整合'),
     ('D', '安全機制'),
+    ('H', '底盤橋接'),
     ('L', '存圖與定位'),
     ('N', 'Nav2 路徑跟隨'),
 ]
@@ -2419,6 +2421,247 @@ def phase_n():
 
 
 # --------------------------------------------------------------------------
+# 6.4 Phase H：bridge_node（實車用的底盤橋，用 loopback 假驅動測）
+#
+# 這個 Phase 不依賴 Gazebo：bridge_node 配上 loopback 驅動就是一個
+# 完整的閉環（速度指令 -> 假編碼器 -> 里程計 -> /odom + TF），
+# 所以可以單獨跑 --phases=H，幾十秒就有結果。
+#
+# 它證明的是「資料流與數學是通的」，不是「車子會這樣動」：
+# loopback 沒有打滑、沒有延遲、沒有雜訊。實車的數字一定比較差，
+# 差多少要靠 test/tools/calibrate_odometry.py 實測。
+# --------------------------------------------------------------------------
+H_TICKS_PER_REV = 4096      # 測試用的假值（真值要查驅動板文件）
+H_WHEEL_RADIUS = 0.17
+H_WHEEL_SEPARATION = 0.58
+
+
+class BridgeRig(object):
+    """Phase H 的測試夾具：發 /cmd_vel，收 /odom、/tf、/motor_status"""
+
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from geometry_msgs.msg import Twist
+        from nav_msgs.msg import Odometry
+        from tf2_msgs.msg import TFMessage
+        from mowerbot_interfaces.msg import MotorStatus
+
+        rclpy.init()
+        self.rclpy = rclpy
+        self.node = Node('smoke_h')
+        self.odom = []          # (t, x, y, theta, v, w)
+        self.tf_pairs = set()
+        self.motor = []
+        self.cmd_pub = self.node.create_publisher(Twist, '/cmd_vel', 10)
+        self.Twist = Twist
+
+        def on_odom(m):
+            q = m.pose.pose.orientation
+            theta = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
+            self.odom.append((time.time(), m.pose.pose.position.x,
+                              m.pose.pose.position.y, theta,
+                              m.twist.twist.linear.x, m.twist.twist.angular.z))
+
+        def on_tf(m):
+            for t in m.transforms:
+                self.tf_pairs.add((t.header.frame_id, t.child_frame_id))
+
+        self.node.create_subscription(Odometry, '/odom', on_odom, 10)
+        self.node.create_subscription(TFMessage, '/tf', on_tf, 10)
+        self.node.create_subscription(MotorStatus, '/motor_status',
+                                      lambda m: self.motor.append(m), 10)
+
+    def spin(self, seconds):
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def drive(self, v, w, seconds, rate=20.0, stop_after=True):
+        """持續發布速度指令 seconds 秒。
+
+        stop_after=True 時結束前補送一筆零速度。這一步是量測需要的：
+        loopback 會把最後一筆指令一直積分到「收到下一筆指令」為止，
+        不補零的話，從停止發布到 watchdog 觸發那 0.5 秒也會被算進位移，
+        量出來的距離會比指令窗口多出約 10%。
+        測 watchdog 的 H4 要的正是「不補零」，所以那裡用 stop_after=False。
+        """
+        msg = self.Twist()
+        msg.linear.x = float(v)
+        msg.angular.z = float(w)
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.cmd_pub.publish(msg)
+            self.rclpy.spin_once(self.node, timeout_sec=1.0 / rate)
+        if stop_after:
+            zero = self.Twist()
+            self.cmd_pub.publish(zero)
+            self.rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def close(self):
+        self.node.destroy_node()
+        self.rclpy.shutdown()
+
+
+def phase_h():
+    hdr('Phase H  bridge_node + loopback 假驅動 (不需要 Gazebo)')
+    sub('bridge_node 是實車上唯一會產生 /odom 與 odom->base_footprint TF 的節點。')
+    sub('模擬時這兩樣是 Gazebo 的 diff_drive plugin 免費給的，實車上沒有人會發，')
+    sub('而 slam_toolbox 硬性要求它 —— 所以這個 Phase 測的是實車鏈路的地基。')
+
+    bridge = bg_start('H_bridge_node',
+                      ['ros2', 'run', 'mowerbot_bridge', 'bridge_node',
+                       '--ros-args',
+                       '-p', 'use_sim_time:=false',
+                       '-p', 'driver_type:=loopback',
+                       '-p', 'encoder_ticks_per_rev:=%d' % H_TICKS_PER_REV,
+                       '-p', 'odom_rate:=30.0',
+                       '-p', 'cmd_vel_timeout:=0.5'])
+    sub('啟動參數: driver_type=loopback, encoder_ticks_per_rev=%d, '
+        'odom_rate=30, cmd_vel_timeout=0.5' % H_TICKS_PER_REV)
+
+    rig = None
+    try:
+        rig = BridgeRig()
+
+        # ---- H1 節點上線 ----
+        hdr('H1  bridge_node 上線並開始發布 /odom')
+        t0 = time.time()
+        while time.time() - t0 < 20.0 and not rig.odom:
+            rig.spin(0.2)
+        alive = bridge.alive()
+        got_odom = len(rig.odom)
+        sub('行程存活 = %s' % alive)
+        sub('20 秒內收到 /odom 筆數 = %d' % got_odom)
+        if not got_odom:
+            print(bridge.log_tail(30))
+        record('H', 'H1', 'bridge_node 上線且 /odom 有發布',
+               'PASS' if (alive and got_odom > 0) else 'FAIL',
+               '行程存活=%s, /odom 筆數=%d' % (alive, got_odom))
+        if not got_odom:
+            for cid, name in [('H2', '前進里程計'), ('H3', '旋轉里程計'),
+                              ('H4', 'watchdog'), ('H5', 'MotorStatus')]:
+                record('H', cid, name, 'SKIP', 'bridge_node 沒有發布 /odom，無法測試')
+            return
+
+        # ---- H2 前進 ----
+        hdr('H2  前進指令 -> /odom 的 x 要增加、TF 要有 odom -> base_footprint')
+        V, T = 0.3, 3.0
+        expect = V * T
+        # 先送 0.6 秒零速度靜置：上一段的指令會被 loopback 積分到「下一次收到
+        # 新指令」為止，不靜置的話那一小段殘留位移會被算進這一段的量測。
+        rig.drive(0.0, 0.0, 0.6)
+        rig.spin(0.2)
+        start = rig.odom[-1]
+        rig.drive(V, 0.0, T)
+        rig.spin(0.3)
+        end = rig.odom[-1]
+        dx = end[1] - start[1]
+        dy = end[2] - start[2]
+        dtheta = abs(end[3] - start[3])
+        # 容許值：loopback 是完美積分，誤差只來自「指令開始/結束的時間點」與
+        # 30 Hz 取樣，抓 15% + 5 cm 已經很寬鬆，但仍然能抓出尺度錯誤
+        # (例如 ticks_per_rev 或輪半徑填錯會差好幾倍)。
+        tol = 0.15 * expect + 0.05
+        has_tf = ('odom', 'base_footprint') in rig.tf_pairs
+        sub('指令 linear.x = %.2f m/s，持續 %.1f s，預期位移 %.3f m' % (V, T, expect))
+        sub('實際 x 位移 = %.3f m   (容許 %.3f ± %.3f)' % (dx, expect, tol))
+        sub('側向漂移 y = %.4f m，朝向變化 = %.4f rad (直線行駛應該接近 0)'
+            % (dy, dtheta))
+        sub('TF 收到的 frame 組合 = %s' % sorted(rig.tf_pairs))
+        sub('odom -> base_footprint 有發布 = %s' % has_tf)
+        h2_ok = (abs(dx - expect) <= tol and abs(dy) < 0.05
+                 and dtheta < 0.05 and has_tf)
+        record('H', 'H2', '前進 %.1f s：x 位移 %.2f±%.2f m 且 TF 有發布'
+               % (T, expect, tol),
+               'PASS' if h2_ok else 'FAIL',
+               'dx=%.3fm (預期%.3f±%.3f), dy=%.4fm, dtheta=%.4frad, TF=%s'
+               % (dx, expect, tol, dy, dtheta, has_tf))
+
+        # ---- H3 旋轉 ----
+        hdr('H3  旋轉指令 -> /odom 的 theta 要正確變化')
+        W, T3 = 0.5, 3.0
+        expect_t = W * T3
+        rig.drive(0.0, 0.0, 0.6)      # 同 H2：先靜置，把上一段的殘留位移排除
+        rig.spin(0.2)
+        start = rig.odom[-1]
+        rig.drive(0.0, W, T3)
+        rig.spin(0.3)
+        end = rig.odom[-1]
+        dth = end[3] - start[3]
+        dpos = math.hypot(end[1] - start[1], end[2] - start[2])
+        tol_t = 0.15 * expect_t + 0.05
+        sub('指令 angular.z = %.2f rad/s，持續 %.1f s，預期轉 %.3f rad (%.1f 度)'
+            % (W, T3, expect_t, math.degrees(expect_t)))
+        sub('實際轉了 = %.3f rad (%.1f 度)   (容許 %.3f ± %.3f)'
+            % (dth, math.degrees(dth), expect_t, tol_t))
+        sub('原地旋轉時的位置漂移 = %.4f m (應該接近 0)' % dpos)
+        h3_ok = abs(dth - expect_t) <= tol_t and dpos < 0.05
+        record('H', 'H3', '原地旋轉 %.1f s：theta 變化 %.2f±%.2f rad'
+               % (T3, expect_t, tol_t),
+               'PASS' if h3_ok else 'FAIL',
+               'dtheta=%.3frad (預期%.3f±%.3f), 位置漂移=%.4fm'
+               % (dth, expect_t, tol_t, dpos))
+
+        # ---- H4 watchdog ----
+        hdr('H4  停止發布 /cmd_vel 後，watchdog 要在 cmd_vel_timeout 內把速度歸零')
+        # bridge_node 在還沒收到任何 /cmd_vel 之前就會先觸發一次 watchdog
+        # （那是正確行為：沒有人下令時就該是停的），所以要比對「這一段之後
+        # 有沒有新增」，不能只看 log 裡有沒有出現過。
+        wd_before = len(bridge.log_grep(r'沒收到 /cmd_vel', 1000))
+        # stop_after=False：這一項要測的就是「沒有人補零速度時 watchdog 會不會動」
+        rig.drive(0.3, 0.0, 1.0, stop_after=False)
+        stop_time = time.time()
+        rig.spin(1.5)                    # 停止發布，只收資料
+        after = [o for o in rig.odom if o[0] > stop_time + 0.8]
+        moved_after = 0.0
+        if len(after) >= 2:
+            moved_after = math.hypot(after[-1][1] - after[0][1],
+                                     after[-1][2] - after[0][2])
+        last_v = rig.odom[-1][4] if rig.odom else float('nan')
+        wd_after = len(bridge.log_grep(r'沒收到 /cmd_vel', 1000))
+        log_hit = bridge.log_grep(r'沒收到 /cmd_vel', 1)
+        wd_new = wd_after - wd_before
+        sub('停止發布後 0.8 ~ 1.5 秒之間車子又移動了 %.4f m (應該接近 0)' % moved_after)
+        sub('最後一筆 /odom 的 linear.x = %.4f m/s' % last_v)
+        sub('這一段新增的 watchdog log = %d 則 (啟動時那一則不算)' % wd_new)
+        sub('最後一則 watchdog log = %s' % (log_hit[-1] if log_hit else '(沒有)'))
+        h4_ok = moved_after < 0.02 and abs(last_v) < 0.02 and wd_new > 0
+        record('H', 'H4', 'watchdog：停止發布後 %.1f 秒內速度歸零' % 0.5,
+               'PASS' if h4_ok else 'FAIL',
+               '停止後位移=%.4fm, 末速=%.4fm/s, 新增 watchdog log=%d 則'
+               % (moved_after, last_v, wd_new))
+
+        # ---- H5 MotorStatus ----
+        hdr('H5  MotorStatus 有發布且欄位合理')
+        n_motor = len(rig.motor)
+        ok_fields = False
+        if n_motor:
+            m = rig.motor[-1]
+            # 前進時兩側轉速應該同號同值；編碼器累計值應該是有在長的正數
+            enc_l = m.left_front_encoder
+            enc_r = m.right_front_encoder
+            sub('MotorStatus 筆數 = %d' % n_motor)
+            sub('最後一筆: 左前 %.2f rpm, 右前 %.2f rpm, 左後 %.2f rpm, 右後 %.2f rpm'
+                % (m.left_front_rpm, m.right_front_rpm,
+                   m.left_behind_rpm, m.right_behind_rpm))
+            sub('        編碼器累計 左 %d / 右 %d ticks' % (enc_l, enc_r))
+            sub('(同側前後輪目前填同一個值：四輪 skid-steer 同側是一起驅動的，'
+                '板子能分別回報之前沒有更誠實的填法)')
+            ok_fields = (enc_l > 0 and enc_r > 0
+                         and abs(m.left_front_rpm - m.left_behind_rpm) < 1e-6
+                         and abs(m.right_front_rpm - m.right_behind_rpm) < 1e-6)
+        else:
+            sub('沒有收到任何 MotorStatus')
+        record('H', 'H5', 'MotorStatus 有發布且編碼器累計值 > 0',
+               'PASS' if (n_motor > 0 and ok_fields) else 'FAIL',
+               '筆數=%d, 欄位合理=%s' % (n_motor, ok_fields))
+    finally:
+        if rig is not None:
+            rig.close()
+
+
+# --------------------------------------------------------------------------
 # 6.5 Phase L：存圖與定位模式
 # --------------------------------------------------------------------------
 class LocRig(object):
@@ -2787,10 +3030,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDLN'
+    phases = 'ABCDHLN'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDLN'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLN'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -2851,6 +3094,12 @@ def main():
         if 'D' in phases:
             try:
                 phase_d()
+            finally:
+                bg_stop_all()
+
+        if 'H' in phases:
+            try:
+                phase_h()
             finally:
                 bg_stop_all()
 

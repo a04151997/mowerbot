@@ -27,6 +27,9 @@ setup(
         'console_scripts': [
             # 修正 4: 對應你內層資料夾中的檔案名稱
             'teleop_node = mowerbot_bridge.teleop:main',
+            # 實車用：ROS 與馬達驅動板之間的橋（模擬時由 Gazebo 的
+            # diff_drive plugin 代勞，所以模擬的 launch 不會啟動它）
+            'bridge_node = mowerbot_bridge.bridge_node:main',
         ],
     },
 )
