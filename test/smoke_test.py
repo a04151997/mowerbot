@@ -274,35 +274,122 @@ def bg_stop_all():
     del BG[:]
 
 
-def pgrep(pattern):
-    """回傳符合 pattern 的 pid 清單，排除自己與自己的祖先行程"""
-    rc, out = run(['pgrep', '-f', pattern], timeout=10)
-    mine = {os.getpid(), os.getppid()}
-    pids = []
-    for tok in out.split():
-        if not tok.strip().isdigit():
-            continue
-        pid = int(tok)
-        if pid in mine:
-            continue
-        pids.append(pid)
-    return pids
+# --------------------------------------------------------------------------
+# 「這個行程是不是本 workspace 留下來的殘留」
+#
+# 舊版對每個節點名稱做 pgrep -f (比對整條命令列)，會誤殺無關的行程 ——
+# 命令列裡剛好含有 controller_server 字樣的 tail、編輯器、甚至執行測試的
+# shell 自己都會中獎 (實際發生過)。現在改成兩條規則:
+#   (1) 本專案的節點: 命令列有 --ros-args (ROS 節點的特徵)，
+#       而且命令列或環境變數含有這個 workspace 的 install 路徑。
+#       從這裡啟動的節點命令列會帶 <WS>/install/... 的參數檔或執行檔；
+#       robot_state_publisher / joint_state_publisher 的參數檔在 /tmp，
+#       但它們的 AMENT_PREFIX_PATH 一定含有這個 install 路徑。
+#       --ros-args 這個條件同時擋掉兩種誤殺:
+#       「只是 source 過這個 workspace 的互動式 shell」(環境變數會中)，
+#       以及 tail/編輯器之類「命令列剛好提到 install 目錄」的行程。
+#   (2) gzserver / gzclient: 名稱夠獨特，用執行檔名精確比對。
+# 兩條規則都排除自己與所有祖先行程。
+# --------------------------------------------------------------------------
+WS_INSTALL = os.path.join(WS, 'install')
+
+# 名稱精確比對的行程
+STALE_EXACT_NAMES = ('gzserver', 'gzclient')
+
+# 既不帶 install 路徑、也不是獨特執行檔名的例外，用命令列子字串比對。
+# spawn_entity.py 是 gazebo_ros 的一次性腳本 (跑完就結束)，
+# 這個子字串帶著目錄名，不可能誤中別的東西。
+STALE_CMDLINE_SUBSTRINGS = ('/gazebo_ros/spawn_entity.py',)
 
 
-def sweep(patterns):
+def ancestor_pids():
+    """自己與所有祖先行程的 pid，這些永遠不能殺"""
+    out = set()
+    pid = os.getpid()
+    while pid and pid > 1 and pid not in out:
+        out.add(pid)
+        try:
+            with open('/proc/%d/stat' % pid, 'r') as fh:
+                pid = int(fh.read().rsplit(') ', 1)[1].split()[1])
+        except (IOError, OSError, IndexError, ValueError):
+            break
+    return out
+
+
+def _proc_read(pid, what):
+    try:
+        with open('/proc/%d/%s' % (pid, what), 'rb') as fh:
+            return fh.read()
+    except (IOError, OSError):
+        return None
+
+
+def workspace_pids(contains=None):
+    """回傳屬於這個 workspace 的 ROS 節點行程 [(pid, cmdline)]。
+
+    contains 不是 None 時，再用它對命令列做子字串過濾 (診斷用)。
+    """
+    want = WS_INSTALL.encode()
+    excl = ancestor_pids()
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid in excl:
+            continue
+        cmd = _proc_read(pid, 'cmdline')
+        if not cmd:
+            continue
+        # 一律要求命令列有 --ros-args (ROS 節點的特徵)，
+        # 這樣 tail/編輯器之類「命令列剛好提到 install 目錄」的行程不會中獎。
+        is_ws = False
+        if b'--ros-args' in cmd:
+            if want in cmd:
+                is_ws = True
+            else:
+                env = _proc_read(pid, 'environ')
+                is_ws = bool(env) and want in env
+        if not is_ws:
+            is_ws = any(sub_.encode() in cmd for sub_ in STALE_CMDLINE_SUBSTRINGS)
+        if not is_ws:
+            continue
+        text = cmd.replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+        if contains is not None and contains not in text:
+            continue
+        found.append((pid, text))
+    return found
+
+
+def named_pids(name):
+    """執行檔名精確比對 (pgrep -x)，排除自己與所有祖先行程"""
+    _rc, out = run(['pgrep', '-x', name], timeout=10)
+    excl = ancestor_pids()
+    return [int(t) for t in out.split()
+            if t.strip().isdigit() and int(t) not in excl]
+
+
+def sweep():
     """清掃 killpg 之後仍殘留的行程 (Gazebo classic 常有)。
-    用 pid 逐一 kill，不用 pkill -f，因為 pattern 可能誤中執行本腳本的 shell。"""
-    for pat in patterns:
-        pids = pgrep(pat)
-        if not pids:
-            continue
-        sub('清掃殘留 %s: pid %s' % (pat, ','.join(str(p) for p in pids)))
-        for pid in pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except OSError:
-                pass
-        time.sleep(1.0)
+
+    用 pid 逐一 kill，不用 pkill -f：pattern 會誤中執行本腳本的 shell，
+    也會誤殺命令列剛好含有節點名稱的無關行程。
+    """
+    targets = {}
+    for pid, cmd in workspace_pids():
+        targets[pid] = cmd
+    for name in STALE_EXACT_NAMES:
+        for pid in named_pids(name):
+            targets.setdefault(pid, '(%s)' % name)
+    if not targets:
+        return
+    for pid, cmd in sorted(targets.items()):
+        sub('清掃殘留 pid=%-7d %s' % (pid, cmd[:100]))
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(1.0)
 
 
 def domain_processes():
@@ -311,7 +398,8 @@ def domain_processes():
     用 /proc/<pid>/environ 逐一比對 domain，而不是比對行程名稱：
     機器上可能同時有跑在別的 domain 的 ROS 節點，用名稱比對會誤殺它們。"""
     want = ('ROS_DOMAIN_ID=' + ENV['ROS_DOMAIN_ID']).encode()
-    mine = {os.getpid(), os.getppid()}
+    # 排除自己與所有祖先行程 (不只 PID/PPID)：這支腳本自己就跑在同一個 domain 上
+    mine = ancestor_pids()
     found = []
     for name in os.listdir('/proc'):
         if not name.isdigit():
@@ -980,7 +1068,7 @@ def phase_c():
         sub('缺少節點的行程狀態診斷 (區分「行程掛掉」與「discovery 漏抓」):')
         for n in missing:
             pat = NODE_PROC_PATTERN.get(n, n)
-            pids = pgrep(pat)
+            pids = [pid for pid, _cmd in workspace_pids(contains=pat)]
             print('        %-24s 行程 pattern=%-28s pid=%s'
                   % (n, pat, pids if pids else '(找不到行程 -> 節點確實沒起來)'))
     ok = (not missing) and rsp_count == 1
@@ -2758,7 +2846,7 @@ def main():
                 phase_c()
             finally:
                 bg_stop_all()
-                sweep(['gzserver', 'gzclient', 'spawn_entity.py'])
+                sweep()
 
         if 'D' in phases:
             try:
@@ -2771,19 +2859,19 @@ def main():
                 phase_l()
             finally:
                 bg_stop_all()
-                sweep(['gzserver', 'gzclient', 'spawn_entity.py'])
+                sweep()
 
         if 'N' in phases:
             try:
                 phase_n()
             finally:
                 bg_stop_all()
-                sweep(['gzserver', 'gzclient', 'spawn_entity.py'])
+                sweep()
     except KeyboardInterrupt:
         print('\n[中斷] 使用者按下 Ctrl-C，正在收拾背景行程...')
     finally:
         bg_stop_all()
-        sweep(['gzserver', 'gzclient'])
+        sweep()
 
     return summary()
 

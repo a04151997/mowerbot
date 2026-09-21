@@ -26,36 +26,88 @@ WS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROS_SETUP=/opt/ros/humble/setup.bash
 WS_SETUP="${WS}/install/setup.bash"
 
-# 會被當成「殘留」清掉的行程。前段是模擬與 Nav2 的元件，
-# 後段是本專案自己的節點。
-STALE_PATTERNS=(
-    gzserver gzclient spawn_entity.py
-    rviz2 robot_state_publisher joint_state_publisher
-    async_slam_toolbox_node localization_slam_toolbox_node
-    controller_server lifecycle_manager
-    mower_manager map_to_boundary teleop_node f2c_server joy_node
-)
+# --------------------------------------------------------------------------
+# 怎麼認定一個行程是「這個 workspace 留下來的殘留」
+#
+# 舊版是對每個節點名稱做 pgrep -f (比對整條命令列)，那會誤殺無關的行程 ——
+# 命令列裡剛好出現 controller_server 字樣的編輯器、tail、甚至執行這支腳本的
+# shell 自己都會被殺掉 (實際發生過三次)。
+#
+# 現在改成兩條規則：
+#   (1) 本專案的節點：命令列有 --ros-args，而且命令列或環境變數裡出現
+#       這個 workspace 的 install 路徑。
+#       從這裡啟動的節點，命令列會帶 <WS>/install/... 的參數檔或執行檔路徑；
+#       少數 (robot_state_publisher / joint_state_publisher) 的參數檔在 /tmp，
+#       但它們的環境變數 AMENT_PREFIX_PATH 一定含有這個 install 路徑。
+#       為了不誤殺「只是 source 過這個 workspace 的互動式 shell」，
+#       走環境變數這條規則時額外要求命令列裡有 --ros-args (那是 ROS 節點的特徵)。
+#   (2) gzserver / gzclient：名稱夠獨特，維持名稱比對 (pgrep -x 比對執行檔名)。
+#
+# 兩條規則都排除自己、自己的父行程、以及所有祖先行程。
+# --------------------------------------------------------------------------
+WS_INSTALL="${WS}/install"
+
+# 名稱比對的行程 (執行檔名精確比對)
+STALE_EXACT_NAMES=(gzserver gzclient)
+
+# 自己與所有祖先的 PID，這些永遠不能殺
+ancestor_pids() {
+    local pid=$$ out=""
+    while [ -n "${pid}" ] && [ "${pid}" != "0" ] && [ "${pid}" != "1" ]; do
+        out="${out} ${pid}"
+        pid="$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null)"
+    done
+    echo "${out}"
+}
+
+# 屬於這個 workspace 的 ROS 節點行程
+ws_pids() {
+    local excl="$1" pid d
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        case " ${excl} " in *" ${pid} "*) continue ;; esac
+        # 一律要求命令列有 --ros-args (ROS 節點的特徵)，
+        # 這樣 tail/編輯器之類「命令列剛好提到 install 目錄」的行程不會中獎
+        grep -qa -- "--ros-args" "${d}/cmdline" 2>/dev/null || continue
+        # 命令列直接帶 install 路徑，或環境變數指向這個 workspace
+        if grep -qa -- "${WS_INSTALL}" "${d}/cmdline" 2>/dev/null ||
+                grep -qa -- "${WS_INSTALL}" "${d}/environ" 2>/dev/null; then
+            echo "${pid}"
+        fi
+    done
+}
+
+# 名稱精確比對的行程
+named_pids() {
+    local excl="$1" name pid
+    for name in "${STALE_EXACT_NAMES[@]}"; do
+        for pid in $(pgrep -x -- "${name}" 2>/dev/null || true); do
+            case " ${excl} " in *" ${pid} "*) continue ;; esac
+            echo "${pid}"
+        done
+    done
+}
+
+stale_pids() {
+    local excl
+    excl="$(ancestor_pids)"
+    { ws_pids "${excl}"; named_pids "${excl}"; } | sort -un
+}
 
 # --------------------------------------------------------------------------
 # 清掉殘留行程。不靜默地殺：每一個都印出 PID 與完整指令列。
 # --------------------------------------------------------------------------
 kill_stale() {
-    local found=0 pid pids
+    local found=0 pid
 
-    for pat in "${STALE_PATTERNS[@]}"; do
-        pids="$(pgrep -f -- "${pat}" 2>/dev/null)" || true
-        for pid in ${pids}; do
-            # 排除自己與自己的父行程，免得把這支腳本殺掉
-            [ "${pid}" = "$$" ] && continue
-            [ "${pid}" = "${PPID}" ] && continue
-            kill -0 "${pid}" 2>/dev/null || continue      # 剛剛已經被前一個 pattern 殺掉了
-            if [ "${found}" = 0 ]; then
-                echo "--- 清掉上次留下的殘留行程 ---"
-                found=1
-            fi
-            printf '  kill %-7s %s\n' "${pid}" "$(ps -o cmd= -p "${pid}" 2>/dev/null | cut -c1-100)"
-            kill -TERM "${pid}" 2>/dev/null
-        done
+    for pid in $(stale_pids); do
+        kill -0 "${pid}" 2>/dev/null || continue
+        if [ "${found}" = 0 ]; then
+            echo "--- 清掉上次留下的殘留行程 ---"
+            found=1
+        fi
+        printf '  kill %-7s %s\n' "${pid}" "$(ps -o cmd= -p "${pid}" 2>/dev/null | cut -c1-100)"
+        kill -TERM "${pid}" 2>/dev/null
     done
 
     if [ "${found}" = 0 ]; then
@@ -65,15 +117,10 @@ kill_stale() {
 
     # 給 1 秒好好收，收不掉的直接 KILL
     sleep 1
-    for pat in "${STALE_PATTERNS[@]}"; do
-        pids="$(pgrep -f -- "${pat}" 2>/dev/null)" || true
-        for pid in ${pids}; do
-            [ "${pid}" = "$$" ] && continue
-            [ "${pid}" = "${PPID}" ] && continue
-            kill -0 "${pid}" 2>/dev/null || continue
-            printf '  kill -9 %-7s %s\n' "${pid}" "$(ps -o cmd= -p "${pid}" 2>/dev/null | cut -c1-100)"
-            kill -KILL "${pid}" 2>/dev/null
-        done
+    for pid in $(stale_pids); do
+        kill -0 "${pid}" 2>/dev/null || continue
+        printf '  kill -9 %-7s %s\n' "${pid}" "$(ps -o cmd= -p "${pid}" 2>/dev/null | cut -c1-100)"
+        kill -KILL "${pid}" 2>/dev/null
     done
 
     # gzserver 佔著的 port (11345) 要一點時間才釋放，太快重開會起不來
