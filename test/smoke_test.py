@@ -601,6 +601,120 @@ def b1_f2c():
         rclpy.shutdown()
 
 
+def _seg_crosses_polygon(p, q, poly):
+    """線段 p-q 是否與多邊形 poly 的任何一條邊相交"""
+    def ccw(a, b, c):
+        return (c[1] - a[1]) * (b[0] - a[0]) > (b[1] - a[1]) * (c[0] - a[0])
+    for i in range(len(poly)):
+        a, b = poly[i], poly[(i + 1) % len(poly)]
+        if ccw(p, a, b) != ccw(q, a, b) and ccw(p, q, a) != ccw(p, q, b):
+            return True
+    return False
+
+
+def _point_in_polygon(pt, poly):
+    x, y = pt
+    inside = False
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi + 1e-18) + xi:
+            inside = not inside
+        j = i
+    return inside
+
+
+def b3_f2c_obstacle():
+    """階段 11 新增的檢查：作業區內部有障礙物時，F2C 要把它挖掉。
+
+    這是服務層級的幾何檢查，不開模擬器，所以很快而且結果是決定性的。
+    判定分兩段，兩段都要過：
+      (1) F2C 回傳的航點沒有任何一個落在障礙物裡面；
+      (2) 把路徑照 mower_manager 的規則切開之後，真正會送給 Nav2 的每一段
+          都沒有穿過障礙物 —— 這一段是必要的，因為被障礙物切成兩半的割草線
+          在 F2C 的輸出裡是「共線的前後兩段」，中間那條跳接線會橫越障礙物，
+          只看 (1) 會漏掉它。
+    """
+    hdr('B3  F2C 內部障礙物挖洞 (只啟動 f2c_server)')
+    import rclpy
+    from rclpy.node import Node
+    from geometry_msgs.msg import Point32, Polygon
+    from mowerbot_interfaces.srv import GenerateCoveragePath
+
+    corners = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)]
+    obstacle = [(4.0, 4.0), (6.0, 4.0), (6.0, 6.0), (4.0, 6.0)]   # 2m x 2m，正中央
+
+    srv = bg_start('B3_f2c_server',
+                   ['ros2', 'run', 'mowerbot_planner', 'f2c_server',
+                    '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b3')
+    cli = node.create_client(GenerateCoveragePath, 'generate_coverage_path')
+    try:
+        if not cli.wait_for_service(timeout_sec=20.0):
+            print(srv.log_tail(30))
+            record('B', 'B3', 'F2C 內部障礙物', 'FAIL',
+                   'generate_coverage_path 服務 20 秒內沒上線')
+            return
+
+        def call(with_obstacle):
+            req = GenerateCoveragePath.Request()
+            for x, y in corners:
+                req.boundary.points.append(Point32(x=x, y=y, z=0.0))
+            req.tool_width = 0.5
+            req.turning_radius = 1.0
+            if with_obstacle:
+                poly = Polygon()
+                for x, y in obstacle:
+                    poly.points.append(Point32(x=x, y=y, z=0.0))
+                req.obstacles.append(poly)
+            fut = cli.call_async(req)
+            rclpy.spin_until_future_complete(node, fut, timeout_sec=90.0)
+            return fut.result() if fut.done() else None
+
+        sub('邊界 = 10m x 10m，障礙物 = %s (2m x 2m，正中央)' % obstacle)
+        results = {}
+        for tag, with_obs in (('沒有障礙物 (對照組)', False), ('有障礙物', True)):
+            resp = call(with_obs)
+            if resp is None:
+                record('B', 'B3', 'F2C 內部障礙物', 'FAIL', '%s：服務呼叫逾時' % tag)
+                return
+            pts = [(q.pose.position.x, q.pose.position.y) for q in resp.coverage_path.poses]
+            inside = sum(1 for q in pts if _point_in_polygon(q, obstacle))
+            raw_cross = sum(1 for i in range(len(pts) - 1)
+                            if _seg_crosses_polygon(pts[i], pts[i + 1], obstacle))
+            segs = split_swaths_like_manager(pts)
+            n_perim, _rest = strip_perimeter(pts)
+            sent_cross = 0
+            for seg in segs:
+                for i in range(len(seg) - 1):
+                    if _seg_crosses_polygon(seg[i], seg[i + 1], obstacle):
+                        sent_cross += 1
+            print('')
+            sub('%s：' % tag)
+            sub('  success = %s，航點 %d 個 (其中環繞 %d 個)'
+                % (resp.success, len(pts), n_perim))
+            sub('  落在障礙物內部的航點     = %d' % inside)
+            sub('  原始路徑穿過障礙物的線段 = %d  (含割草線被切開後的跳接線)' % raw_cross)
+            sub('  切開後真正送出的線段中穿過障礙物的 = %d' % sent_cross)
+            sub('  切出的割草段數           = %d' % len(segs))
+            results[with_obs] = (resp.success, inside, sent_cross, len(segs))
+
+        ok_ctrl = results[False][1] > 0      # 對照組應該要穿過去，否則這個檢查沒有鑑別力
+        ok_obs = (results[True][0] and results[True][1] == 0 and results[True][2] == 0)
+        print('')
+        sub('對照組確實會穿過障礙物 (代表這個檢查有鑑別力) = %s' % ok_ctrl)
+        record('B', 'B3', '有內部障礙物時：航點不落在障礙物內、送出的路徑不穿越',
+               'PASS' if (ok_obs and ok_ctrl) else 'FAIL',
+               '對照組 落內=%d ; 有障礙物 success=%s 落內=%d 穿越=%d 割草段=%d'
+               % (results[False][1], results[True][0], results[True][1],
+                  results[True][2], results[True][3]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 def b2_boundary():
     hdr('B2  邊界提取 (只啟動 map_to_boundary，餵假地圖)')
     import rclpy
@@ -680,6 +794,105 @@ def b2_boundary():
         record('B', 'B2', '邊界提取 (收到 PolygonStamped 且頂點數>=4)',
                'PASS' if ok else 'FAIL',
                '頂點數=%d, 座標偏差=%.3fm' % (len(pts), dev))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+def b4_obstacle_extraction():
+    """階段 11 新增：map_to_boundary 要把佔據網格上的「洞」當成內部障礙物送出來。
+
+    餵一張假地圖：外圍佔據、中間一塊 free space，free space 正中央再挖一塊佔據，
+    那一塊就是作業區內部的障礙物。檢查 /f2c_obstacles 收到 1 個多邊形，
+    而且它的範圍與餵進去的那一塊吻合 (容許 2 個 cell 的誤差，
+    approxPolyDP 化簡與 padding 扣回來都會差到 1 個 cell)。
+    """
+    hdr('B4  內部障礙物提取 (只啟動 map_to_boundary，餵有洞的假地圖)')
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped
+    from mowerbot_interfaces.msg import ObstaclePolygons
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    OBS_LO, OBS_HI = 90, 109            # 20 x 20 cell = 1.0 m x 1.0 m
+    exp_obs_lo = OBS_LO * RES           # 4.50 m
+    exp_obs_hi = OBS_HI * RES           # 5.45 m
+    TOL = 2 * RES                       # 容許 2 個 cell
+
+    node_proc = bg_start('B4_map_to_boundary',
+                         ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+                          '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b4')
+    map_qos = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    pub = node.create_publisher(OccupancyGrid, '/map', map_qos)
+    got_b, got_o = [], []
+    node.create_subscription(PolygonStamped, '/f2c_boundary',
+                             lambda m: got_b.append(m), 10)
+    node.create_subscription(ObstaclePolygons, '/f2c_obstacles',
+                             lambda m: got_o.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        base = row * W
+        for col in range(FREE_LO, FREE_HI + 1):
+            data[base + col] = 0
+    for row in range(OBS_LO, OBS_HI + 1):          # 中央挖一塊障礙物
+        base = row * W
+        for col in range(OBS_LO, OBS_HI + 1):
+            data[base + col] = 100
+    grid.data = data
+
+    sub('假地圖: %dx%d, resolution=%.3f' % (W, H, RES))
+    sub('free space cell [%d..%d]^2；中央障礙物 cell [%d..%d]^2 -> 世界座標 %.2f ~ %.2f m'
+        % (FREE_LO, FREE_HI, OBS_LO, OBS_HI, exp_obs_lo, exp_obs_hi))
+
+    try:
+        deadline = time.time() + 25.0
+        while time.time() < deadline and not got_o:
+            grid.header.stamp = node.get_clock().now().to_msg()
+            pub.publish(grid)
+            rclpy.spin_once(node, timeout_sec=0.2)
+            time.sleep(0.8)
+        if not got_o:
+            print(node_proc.log_tail(30))
+            record('B', 'B4', '內部障礙物提取', 'FAIL',
+                   '25 秒內 /f2c_obstacles 沒有任何訊息')
+            return
+        msg = got_o[-1]
+        print('')
+        sub('收到 ObstaclePolygons, frame_id = %s，多邊形 %d 個'
+            % (msg.header.frame_id, len(msg.polygons)))
+        dev = float('nan')
+        for i, poly in enumerate(msg.polygons):
+            xs = [p.x for p in poly.points]
+            ys = [p.y for p in poly.points]
+            sub('  [%d] %d 個頂點，x %.3f ~ %.3f，y %.3f ~ %.3f'
+                % (i, len(poly.points), min(xs), max(xs), min(ys), max(ys)))
+            if i == 0:
+                dev = max(abs(min(xs) - exp_obs_lo), abs(max(xs) - exp_obs_hi),
+                          abs(min(ys) - exp_obs_lo), abs(max(ys) - exp_obs_hi))
+        sub('邊界 (/f2c_boundary) 也同時收到 = %s' % bool(got_b))
+        if msg.polygons:
+            sub('第 0 個障礙物與餵進去那一塊的最大偏差 = %.3f m (%.1f 個 cell，容許 %.0f 個)'
+                % (dev, dev / RES, TOL / RES))
+        ok = (len(msg.polygons) == 1 and dev <= TOL)
+        record('B', 'B4', '內部障礙物提取 (1 個多邊形且位置吻合)',
+               'PASS' if ok else 'FAIL',
+               '多邊形=%d 個, 位置偏差=%.3fm (容許 %.2fm)'
+               % (len(msg.polygons), dev, TOL))
     finally:
         node.destroy_node()
         rclpy.shutdown()
@@ -1097,12 +1310,19 @@ def strip_perimeter(pts):
     return 0, list(pts)
 
 
+# 與 mower_manager.GAP_CUT_DISTANCE 一致：相鄰航點超過這個距離視為跳接。
+GAP_CUT_DISTANCE = 0.3
+
+
 def split_swaths_like_manager(pts):
     """用與 mower_manager.split_path_into_swaths 相同的規則切割：
-    先把周邊環繞那一圈拿掉，再把剩下的依方向變化達 90 度切開，
-    只有 2 個點的橫向連接段丟掉。"""
+    先把周邊環繞那一圈拿掉，再把剩下的依「方向變化達 90 度」或
+    「相鄰航點距離超過 0.3 m 的跳接」切開，只有 2 個點的片段丟掉。
+
+    跳接那一條規則是階段 11 加的：挖掉內部障礙物之後，同一列的割草線會被
+    障礙物切成共線的前後兩段，只靠 90 度規則切不開。"""
     _n_perim, pts = strip_perimeter(pts)
-    cuts = []
+    cuts = set()
     prev = None
     for i in range(len(pts) - 1):
         dx = pts[i + 1][0] - pts[i][0]
@@ -1110,13 +1330,16 @@ def split_swaths_like_manager(pts):
         n = math.hypot(dx, dy)
         if n < 1e-9:
             continue
+        if n > GAP_CUT_DISTANCE:
+            cuts.add(i)
+            cuts.add(min(i + 1, len(pts) - 1))
         cur = (dx / n, dy / n)
         if prev is not None and prev[0] * cur[0] + prev[1] * cur[1] <= 1e-9:
-            cuts.append(i)
+            cuts.add(i)
         prev = cur
     out = []
     start = 0
-    for c in cuts + [len(pts) - 1]:
+    for c in sorted(cuts) + [len(pts) - 1]:
         seg = pts[start:c + 1]
         if len(seg) >= 3:
             out.append(seg)
@@ -2519,6 +2742,14 @@ def main():
                 bg_stop_all()
             try:
                 b2_boundary()
+            finally:
+                bg_stop_all()
+            try:
+                b3_f2c_obstacle()
+            finally:
+                bg_stop_all()
+            try:
+                b4_obstacle_extraction()
             finally:
                 bg_stop_all()
 

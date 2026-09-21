@@ -12,6 +12,11 @@ float32 tool_width
 # 車體的最小迴轉半徑 (公尺)。針對 74kg 的載具需要給予合理的轉彎半徑，避免打滑或轉向過度
 float32 turning_radius
 
+# 作業區內部的障礙物輪廓 (階段 11 新增)。
+# 每一個多邊形都是邊界內部的一個「洞」，f2c_server 會用 cell.addRing() 把它挖掉，
+# 割草線從規劃階段就不會穿過去。空陣列 = 沒有內部障礙物，行為與階段 10 相同。
+geometry_msgs/Polygon[] obstacles
+
 ---
 # ==========================================
 # 回應 (Response)：由 F2C 伺服器回傳給 Manager

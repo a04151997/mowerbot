@@ -87,6 +87,33 @@ private:
 
         f2c::types::Cell cell;
         cell.addRing(ring);
+
+        // ---- 作業區內部的障礙物：當成 Cell 的內環 (hole) 挖掉 ----
+        // 階段 11 之前這裡只有外環，落在外環內部的障礙物在規劃階段完全不存在，
+        // F2C 的割草線會直接穿過去，Nav2 跟到那一段撞上 costmap 的膨脹層，
+        // 該條割草線 ABORTED、整個任務中斷 (報告 7.10 節)。
+        // 加成內環之後 F2C 的 swath generator 與 headland 都會自動避開。
+        size_t n_holes = 0;
+        for (const auto& obs : request->obstacles) {
+            if (obs.points.size() < 3) {
+                RCLCPP_WARN(this->get_logger(),
+                    "⚠️ 略過一個只有 %zu 個頂點的障礙物輪廓 (至少要 3 個)。",
+                    obs.points.size());
+                continue;
+            }
+            f2c::types::LinearRing hole;
+            for (const auto& p : obs.points) {
+                hole.addPoint(p.x, p.y);
+            }
+            const auto& h0 = obs.points.front();
+            const auto& hN = obs.points.back();
+            if (h0.x != hN.x || h0.y != hN.y) {
+                hole.addPoint(h0.x, h0.y);
+            }
+            cell.addRing(hole);
+            ++n_holes;
+        }
+
         f2c::types::Cells field(cell);
 
         try {
@@ -114,6 +141,12 @@ private:
                 }
             }
             const double mainland_area = mainland.area();
+
+            if (n_holes > 0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "🕳️ 內部障礙物 %zu 個已挖成內環，作業面積扣掉障礙物後 %.2f m^2。",
+                    n_holes, field_area);
+            }
 
             RCLCPP_INFO(this->get_logger(),
                 "🌾 地頭寬度 %.2f m：原始面積 %.2f m^2 -> 內縮後作業面積 %.2f m^2 "
@@ -171,6 +204,7 @@ private:
             // 「最後一個航點的座標與第 0 個完全相同」就是 mower_manager
             // 用來辨識「這一段是環繞、不是割草線」的依據，不需要改 srv 介面。
             const double kPerimeterSpacing = 0.1;
+            size_t n_perimeter_clipped = 0;
             for (size_t i = 0; i + 1 < perimeter_pts.size(); ++i) {
                 const double x1 = perimeter_pts[i].first;
                 const double y1 = perimeter_pts[i].second;
@@ -187,10 +221,27 @@ private:
                     1, static_cast<int>(std::round(seg_len / kPerimeterSpacing)));
                 for (int k = 0; k < n_seg; ++k) {
                     const double ratio = static_cast<double>(k) / static_cast<double>(n_seg);
+                    const double px = x1 + dx * ratio;
+                    const double py = y1 + dy * ratio;
+                    // 這一圈是從 mainland 的「外環」算出來的，它不知道內部障礙物
+                    // 在哪裡。障礙物靠近作業區邊緣時，環繞會直接從它旁邊掃過去 ——
+                    // 實測車子中心離箱子只剩 0.23 m (車體半寬 0.34 m，已經擦到)。
+                    // 所以逐個航點檢查：只留下真的落在 mainland 裡面的點
+                    // (mainland 已經把障礙物挖成內環)，被擋住的那一段留一個缺口，
+                    // mower_manager 會在缺口處把環繞切成兩段分別執行。
+                    // 頂點層級的檢查不夠，環只有四個角點，長邊會整條漏掉。
+                    if (n_holes > 0) {
+                        const f2c::types::Point probe(px, py);
+                        if (!mainland.isPointIn(probe) &&
+                                !mainland.isPointInBorder(probe)) {
+                            ++n_perimeter_clipped;
+                            continue;
+                        }
+                    }
                     geometry_msgs::msg::PoseStamped pose;
                     pose.header = ros_path.header;
-                    pose.pose.position.x = x1 + dx * ratio;
-                    pose.pose.position.y = y1 + dy * ratio;
+                    pose.pose.position.x = px;
+                    pose.pose.position.y = py;
                     pose.pose.orientation.x = q.x();
                     pose.pose.orientation.y = q.y();
                     pose.pose.orientation.z = q.z();
@@ -206,12 +257,20 @@ private:
                 ros_path.poses.push_back(closing);
             }
             const size_t n_perimeter_poses = ros_path.poses.size();
+            if (n_perimeter_clipped > 0) {
+                RCLCPP_INFO(this->get_logger(),
+                    "🔄 周邊環繞有 %zu 個航點被內部障礙物擋掉，那一段留缺口 "
+                    "(環繞本身不會繞行障礙物，見報告 11.5 節)。",
+                    n_perimeter_clipped);
+            }
 
             // 確保有生成成功的割草線
-            if (swaths_by_cells.size() > 0) {
-                // 【關鍵修正】：我們只有一塊草地，所以剝開第一層，取出真正的 Swaths 群組
-                auto swaths = swaths_by_cells[0]; 
-                
+            // 階段 11 之前這裡寫死 swaths_by_cells[0] (「我們只有一塊草地」)。
+            // 挖掉內部障礙物之後，作業區有可能被切成不只一塊，
+            // 只取第 0 塊會整塊草地沒割到，所以改成每一塊都走一遍。
+            for (size_t c = 0; c < swaths_by_cells.size(); ++c) {
+                auto swaths = swaths_by_cells[c];
+
                 bool reverse = false;
                 for (size_t i = 0; i < swaths.size(); ++i) {
                     // 這裡拿出的才是真正單一條的 f2c::types::Swath
@@ -257,8 +316,10 @@ private:
             response->coverage_path = ros_path;
             response->success = true;
             
-            const size_t n_swaths =
-                (swaths_by_cells.size() > 0) ? swaths_by_cells[0].size() : 0;
+            size_t n_swaths = 0;
+            for (size_t c = 0; c < swaths_by_cells.size(); ++c) {
+                n_swaths += swaths_by_cells[c].size();
+            }
             if (n_perimeter_poses > 0) {
                 double perimeter_len = 0.0;
                 for (size_t i = 0; i + 1 < n_perimeter_poses; ++i) {

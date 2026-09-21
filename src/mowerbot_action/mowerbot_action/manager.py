@@ -7,6 +7,7 @@ from rclpy.time import Time
 from geometry_msgs.msg import PolygonStamped, PoseStamped
 from nav_msgs.msg import Path
 from mowerbot_interfaces.srv import GenerateCoveragePath
+from mowerbot_interfaces.msg import ObstaclePolygons
 from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from nav2_msgs.action import FollowPath
@@ -114,6 +115,13 @@ class MowerManager(Node):
         self.boundary_sub = self.create_subscription(
             PolygonStamped, '/f2c_boundary', self.boundary_cb, 10)
 
+        # 訂閱作業區內部的障礙物輪廓 (階段 11)。
+        # 沒有收到訊息時維持空 list，送給 F2C 的 obstacles 就是空的，
+        # 行為與階段 10 完全相同。
+        self.latest_obstacles = []
+        self.obstacles_sub = self.create_subscription(
+            ObstaclePolygons, '/f2c_obstacles', self.obstacles_cb, 10)
+
         # 建立呼叫 C++ F2C 伺服器的 Client
         self.f2c_client = self.create_client(GenerateCoveragePath, 'generate_coverage_path')
         self.get_logger().info('Mower Manager 啟動成功,目前模式：【手動模式】')
@@ -156,6 +164,10 @@ class MowerManager(Node):
         """隨時更新最新圈出的綠色邊界"""
         self.latest_boundary = msg.polygon
 
+    def obstacles_cb(self, msg):
+        """隨時更新作業區內部的障礙物輪廓"""
+        self.latest_obstacles = list(msg.polygons)
+
     def call_f2c_planner(self):
         """打包邊界並發送給 C++ 伺服器"""
         if self.latest_boundary is None:
@@ -173,8 +185,12 @@ class MowerManager(Node):
         # 相鄰兩條 swath 的距離，縮小它就等於讓相鄰兩刀互相重疊。
         req.tool_width = self.swath_spacing
         req.turning_radius = 1.0 # 迴轉半徑
+        # 內部障礙物：F2C 會把它們挖成內環，割草線不會穿過去
+        req.obstacles = list(self.latest_obstacles)
 
-        self.get_logger().info('🚀 正在將邊界發送給 F2C 伺服器進行運算...')
+        self.get_logger().info(
+            f'🚀 正在將邊界發送給 F2C 伺服器進行運算...'
+            f' (內部障礙物 {len(req.obstacles)} 個)')
         future = self.f2c_client.call_async(req)
         future.add_done_callback(self.f2c_response_callback)
 
@@ -336,6 +352,56 @@ class MowerManager(Node):
     # 跑道的航點間距，與割草線、approach 一致
     LEAD_IN_WAYPOINT_SPACING = 0.1
 
+    # 跑道起點與障礙物之間至少要留這麼多。0.45 m 是 local_costmap 的
+    # inflation_radius，路徑落在膨脹層裡控制器會走不動 (不是改 costmap 參數，
+    # 只是拿它當判斷依據)。
+    LEAD_IN_OBSTACLE_CLEARANCE = 0.45
+
+    @staticmethod
+    def _point_in_polygon(x, y, pts):
+        inside = False
+        j = len(pts) - 1
+        for i in range(len(pts)):
+            xi, yi = pts[i]
+            xj, yj = pts[j]
+            if (yi > y) != (yj > y) and \
+                    x < (xj - xi) * (y - yi) / (yj - yi + 1e-18) + xi:
+                inside = not inside
+            j = i
+        return inside
+
+    @staticmethod
+    def _point_polygon_distance(x, y, pts):
+        best = float('inf')
+        for i in range(len(pts)):
+            ax, ay = pts[i]
+            bx, by = pts[(i + 1) % len(pts)]
+            vx, vy = bx - ax, by - ay
+            norm2 = vx * vx + vy * vy
+            t = 0.0 if norm2 < 1e-18 else max(
+                0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / norm2))
+            best = min(best, math.hypot(x - (ax + t * vx), y - (ay + t * vy)))
+        return best
+
+    def lead_in_blocked(self, x, y):
+        """跑道起點是不是落在障礙物裡、或離障礙物太近。
+
+        作業區內部有障礙物時，被障礙物切成兩段的割草線，後半段的起點距離
+        障礙物剛好是 F2C 的地頭寬度 (0.5 m)，再往後延伸 0.5 m 的跑道起點
+        就正好壓在障礙物邊緣，整段跑道都在 costmap 的膨脹層裡，
+        控制器會走不動。這種情況下寧可不要跑道。
+        """
+        for poly in self.latest_obstacles:
+            pts = [(p.x, p.y) for p in poly.points]
+            if len(pts) < 3:
+                continue
+            if self._point_in_polygon(x, y, pts):
+                return True
+            if self._point_polygon_distance(x, y, pts) < \
+                    self.LEAD_IN_OBSTACLE_CLEARANCE:
+                return True
+        return False
+
     def build_lead_in(self, swath, index, total):
         """在割草線起點「往後」延伸一段共線的跑道，回傳 跑道 + 割草線 的完整路徑。
 
@@ -365,6 +431,13 @@ class MowerManager(Node):
         # 跑道起點 = A - L*d
         sx = a.x - self.lead_in_length * ux
         sy = a.y - self.lead_in_length * uy
+
+        if self.lead_in_blocked(sx, sy):
+            self.get_logger().info(
+                f'🛬 割草線 {index}/{total} 不加跑道：跑道起點 ({sx:.2f}, {sy:.2f}) '
+                f'落在內部障礙物裡或離它不到 '
+                f'{self.LEAD_IN_OBSTACLE_CLEARANCE} m')
+            return swath
 
         num_segments = max(
             1, int(round(self.lead_in_length / self.LEAD_IN_WAYPOINT_SPACING)))
@@ -420,8 +493,15 @@ class MowerManager(Node):
                 return list(poses[:k + 1]), list(poses[k + 1:])
         return [], list(poses)
 
+    # 相鄰兩個航點距離超過這個值就視為「跳接」而不是同一段路徑。
+    # 割草線與環繞的內插間距都是 0.1 m，所以 0.3 m 已經有 3 倍餘裕；
+    # 挖掉內部障礙物之後，同一列的割草線會被障礙物切成前後兩段，
+    # 這兩段是「共線」的，方向完全沒變，只靠 90 度規則切不開，
+    # 不切開的話送給 Nav2 的那條路徑會直接穿過障礙物 (報告 7.10 節)。
+    GAP_CUT_DISTANCE = 0.3
+
     def cut_on_direction_change(self, poses):
-        """依「相鄰航點方向變化達到 90 度」把一串航點切成多段，只保留 >= 3 點的段。
+        """依「方向變化達 90 度」或「相鄰航點距離過大」把航點切成多段，只留 >= 3 點的段。
 
         割草線與周邊環繞共用同一條規則：割草線之間夾的是垂直的橫向連接段，
         環繞的轉角同樣是接近 90 度的轉折，兩者都要在轉折處切開，
@@ -430,7 +510,7 @@ class MowerManager(Node):
         if len(poses) < 2:
             return []
 
-        cut_indices = []
+        cuts = set()
         prev_dir = None
         for i in range(len(poses) - 1):
             dx = poses[i + 1].pose.position.x - poses[i].pose.position.x
@@ -438,18 +518,22 @@ class MowerManager(Node):
             norm = math.hypot(dx, dy)
             if norm < 1e-9:
                 continue
+            if norm > self.GAP_CUT_DISTANCE:
+                # 跳接：兩端都切開，中間那兩個航點自成一段 (只有 2 點，會被丟掉)
+                cuts.add(i)
+                cuts.add(min(i + 1, len(poses) - 1))
             cur_dir = (dx / norm, dy / norm)
             if prev_dir is not None:
                 dot = prev_dir[0] * cur_dir[0] + prev_dir[1] * cur_dir[1]
                 # dot <= 0 代表方向變化達到 90 度 (含) 以上就切開。
                 # F2C 的橫向連接段剛好跟割草線垂直，用嚴格的「大於 90 度」會切不開。
                 if dot <= 1e-9:
-                    cut_indices.append(i)
+                    cuts.add(i)
             prev_dir = cur_dir
 
         segments = []
         start = 0
-        for cut in cut_indices + [len(poses) - 1]:
+        for cut in sorted(cuts) + [len(poses) - 1]:
             segment = poses[start:cut + 1]
             if len(segment) >= 3:      # 2 個航點的是橫向連接段，不是割草線
                 segments.append(list(segment))

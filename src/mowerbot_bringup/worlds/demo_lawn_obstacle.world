@@ -1,0 +1,295 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="demo_lawn">
+
+    <!-- 標準光源與地面 -->
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+
+    <!-- 物理設定 (與 mow_field.world 相同) -->
+    <physics name="default_physics" default="true" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+      <real_time_update_rate>1000</real_time_update_rate>
+    </physics>
+
+    <!--
+      示範用的乾淨草坪：12m x 12m 的封閉區域 (內側面位於 x/y = +-6)，
+      牆高 1.5m、厚 0.2m。
+      牆高必須高於雷達的安裝高度 (約 0.88m 離地)，
+      否則雷達掃不到牆面，SLAM 會建不出封閉地圖。
+
+      這個世界「內部完全沒有障礙物」，因為 map_to_boundary 取的是最大外輪廓、
+      而 F2C 目前沒有用到 Cell 的內環 (inner ring)，所以作業區內部的獨立障礙物
+      會被整個忽略，割草線會直接穿過去，Nav2 撞到膨脹層就會 ABORT。
+      示範時用這個世界跑，才不會被那個已知限制打斷。
+
+      但四面完全光滑的直牆會讓雷達的 scan matching 沒有特徵可鎖，
+      SLAM 沿著牆走時無法判斷自己前進了多少，定位會漂。
+      所以四個角落各做一點不規則變化：
+        - 東北角：北牆東段往南內縮 0.5 m，做出一個凹角
+        - 西北角：西牆北端多出一段往東伸的短翼
+        - 西南角：一根貼著角落的方柱把直角削掉
+        - 東南角：東牆南段往西內縮 0.5 m
+      這些都貼在邊界上、不侵入作業區中央，所以不影響覆蓋路徑。
+    -->
+
+    <!-- 北牆：分成兩段，東段內縮 0.5 m 做出東北角的凹角 -->
+    <model name="wall_north_west">
+      <static>true</static>
+      <pose>-3.1 6.1 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>6.4 0.2 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>6.4 0.2 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_north_east">
+      <static>true</static>
+      <pose>3.1 5.6 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>6.4 0.2 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>6.4 0.2 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 凹角的側板：把北牆兩段之間 0.5 m 的高低差補起來 -->
+    <model name="wall_north_step">
+      <static>true</static>
+      <pose>0.0 5.85 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 0.7 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 0.7 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0.0 -6.1 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>12.4 0.2 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>12.4 0.2 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 東牆：分成兩段，南段內縮 0.5 m 做出東南角的凹角 -->
+    <model name="wall_east_north">
+      <static>true</static>
+      <pose>6.1 3.1 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 6.4 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 6.4 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east_south">
+      <static>true</static>
+      <pose>5.6 -3.1 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 6.4 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 6.4 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 凹角的側板：把東牆兩段之間 0.5 m 的高低差補起來 -->
+    <model name="wall_east_step">
+      <static>true</static>
+      <pose>5.85 0.0 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.7 0.2 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.7 0.2 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-6.1 0.0 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.2 12.4 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.2 12.4 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.6 0.6 0.6 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      西北角的短翼：從西牆北端往東伸出 1.0 m，
+      給 scan matching 一個明確的角點特徵。
+    -->
+    <model name="corner_wing_nw">
+      <static>true</static>
+      <pose>-5.5 5.6 0.75 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>1.0 0.2 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>1.0 0.2 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.55 1</ambient>
+            <diffuse>0.6 0.6 0.65 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!--
+      西南角的方柱：貼著角落把 90 度直角削成兩個 45 度斜面，
+      同樣是給 scan matching 用的特徵。貼在角落、不進入作業區。
+    -->
+    <model name="corner_post_sw">
+      <static>true</static>
+      <pose>-5.6 -5.6 0.75 0 0 0.785</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>0.8 0.8 1.5</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>0.8 0.8 1.5</size></box>
+          </geometry>
+          <material>
+            <ambient>0.5 0.5 0.55 1</ambient>
+            <diffuse>0.6 0.6 0.65 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 作業區內部的障礙物 (階段 11 用)。
+         位置 (-2.5, -0.75) 落在 Phase N 那個 5m x 5m 測試邊界 (中心 -1.5,-1.5、
+         半徑 2.5) 的作業區裡，尺寸 1.0 x 1.0 x 1.0 m。
+         demo_lawn.world 本身是乾淨的草坪，這個世界是它加上這一塊，
+         用來驗證「規劃階段就把障礙物挖掉」。
+         刻意避開車子起點 (0,0) 與環繞起點 (-3.35,-3.35) 之間那條對角線：
+         approach 與銜接段都是直線，不會繞過障礙物 (見報告 11.5 節)，
+         擺在對角線上的話任務在 approach 就會被中止，測不到覆蓋路徑本身。 -->
+    <model name="obstacle_center">
+      <static>true</static>
+      <pose>-2.5 -0.75 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <box><size>1.0 1.0 1.0</size></box>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <box><size>1.0 1.0 1.0</size></box>
+          </geometry>
+          <material>
+            <ambient>0.8 0.2 0.1 1</ambient>
+            <diffuse>0.9 0.3 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+
+</sdf>

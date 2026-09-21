@@ -67,18 +67,23 @@ def split_swaths(pts):
     先拿掉周邊環繞那一圈，再把剩下的依方向反轉 (夾角 >= 90 度) 切開，
     只有 2 點的橫向連接段丟掉。"""
     pts = strip_perimeter(pts)
-    cuts, prev = [], None
+    cuts, prev = set(), None
     for i in range(len(pts) - 1):
         dx, dy = pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1]
         n = math.hypot(dx, dy)
         if n < 1e-9:
             continue
+        # 跳接 (階段 11)：被內部障礙物切開的兩段割草線是共線的，
+        # 只靠 90 度規則切不開。0.3 m 與 mower_manager.GAP_CUT_DISTANCE 一致。
+        if n > 0.3:
+            cuts.add(i)
+            cuts.add(min(i + 1, len(pts) - 1))
         cur = (dx / n, dy / n)
         if prev is not None and prev[0] * cur[0] + prev[1] * cur[1] <= 1e-9:
-            cuts.append(i)
+            cuts.add(i)
         prev = cur
     out, start = [], 0
-    for c in cuts + [len(pts) - 1]:
+    for c in sorted(cuts) + [len(pts) - 1]:
         seg = pts[start:c + 1]
         if len(seg) >= 3:
             out.append(seg)

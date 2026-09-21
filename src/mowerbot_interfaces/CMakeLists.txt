@@ -16,6 +16,7 @@ find_package(nav_msgs REQUIRED)  # <== 新增：為了支援 Path 格式
 set(msg_files
   "msg/MowerStatus.msg"
   "msg/MotorStatus.msg"
+  "msg/ObstaclePolygons.msg" # <== 階段 11：作業區內部障礙物的輪廓集合
 )
 
 # 宣告你要編譯哪些 Service 檔案
