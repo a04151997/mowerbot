@@ -1,5 +1,9 @@
 # 實車第一次接上時的步驟清單
 
+**相關文件**：模擬端的驗證數據在 [`simulation_results.md`](simulation_results.md)，
+系統架構與資料流圖在 [`architecture.md`](architecture.md)，
+驅動板要查的資訊清單在 [`../src/mowerbot_bridge/mowerbot_bridge/drivers/README.md`](../src/mowerbot_bridge/mowerbot_bridge/drivers/README.md)。
+
 這份文件是給「拿到驅動板、準備第一次讓 74 kg 的車子動起來」的自己看的。
 每一步都寫了**怎麼確認這一步成功了**，沒有確認方式的步驟不算做完。
 

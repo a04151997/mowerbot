@@ -1,5 +1,8 @@
 # mowerbot 模擬驗證結果
 
+**相關文件**：系統架構與資料流圖在 [`architecture.md`](architecture.md)，
+實車第一次接線的步驟清單在 [`hardware_bringup.md`](hardware_bringup.md)。
+
 本文件整理這一輪在 Gazebo 模擬環境上量到的客觀數據，供專題報告引用。
 所有數字都來自 `test/smoke_test.py` 的自動化測試，原始 log 與 CSV 在
 `test/logs/<timestamp>/` 底下（該目錄不進版控）。
