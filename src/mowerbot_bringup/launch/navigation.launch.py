@@ -36,20 +36,23 @@ def generate_launch_description():
 
     # 4. 生命週期管理器：負責把 controller_server 帶到 active 狀態
     #
-    # 延後 10 秒才啟動：autostart 會在 lifecycle_manager 一上線就立刻對
+    # 延後 5 秒才啟動：autostart 會在 lifecycle_manager 一上線就立刻對
     # controller_server 送出 change_state 請求。兩個節點同時啟動時，請求送得出去、
     # 轉換也會成功，但回應有機會在 DDS 尚未完成配對前就發出，於是出現
     #   failed to send response to /controller_server/change_state (timeout)
     # lifecycle_manager 永遠等不到回應，controller_server 就卡在 inactive。
     # 先讓 controller_server 把服務註冊好再啟動管理器可以避開這個競態。
     #
-    # 階段 8：原本是 5.0 秒，但實測仍有約 6% 的機率卡住 (31 次 Phase N 失敗 2 次)，
-    # 失敗時的 log 正是上面那條 change_state 逾時。延長到 10.0 秒給
-    # controller_server 更多時間把 local_costmap 設定完並完成 DDS 配對。
-    # 注意這只是把競態的窗口壓小，沒有根治：實車上開機自動啟動仍然需要
-    # 「啟動失敗要重試」的機制，不能假設 Nav2 一定會起來 (見報告的已知限制)。
+    # 階段 8：試過把 period 從 5.0 拉長到 10.0，連跑 10 次 Phase N，失敗率沒有降
+    # (5.0 秒是 31 次失敗 2 次，10.0 秒是 10 次失敗 2 次)，因此已還原成 5.0。
+    # 量測失敗當下的時間戳可知 configure 只花 140~153 ms，根本不是設定太慢，
+    # 競態發生在 lifecycle_manager 建立 client 的那一刻與 controller_server
+    # 的 response writer 還沒配對之間，跟管理器第幾秒啟動無關，延長治不到它。
+    # 這個延遲仍然保留，因為它擋掉的是「兩個節點同時啟動」那個更大的窗口。
+    # 實車上開機自動啟動仍然需要「啟動失敗要重試」的機制，
+    # 不能假設 Nav2 一定會起來 (見報告 7.12 節)。
     lifecycle_manager = TimerAction(
-        period=10.0,
+        period=5.0,
         actions=[
             Node(
                 package='nav2_lifecycle_manager',

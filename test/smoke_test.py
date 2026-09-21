@@ -305,6 +305,70 @@ def sweep(patterns):
         time.sleep(1.0)
 
 
+def domain_processes():
+    """回傳 ROS_DOMAIN_ID 與本次測試相同的行程 [(pid, cmdline)]，排除自己與自己的祖先。
+
+    用 /proc/<pid>/environ 逐一比對 domain，而不是比對行程名稱：
+    機器上可能同時有跑在別的 domain 的 ROS 節點，用名稱比對會誤殺它們。"""
+    want = ('ROS_DOMAIN_ID=' + ENV['ROS_DOMAIN_ID']).encode()
+    mine = {os.getpid(), os.getppid()}
+    found = []
+    for name in os.listdir('/proc'):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        if pid in mine:
+            continue
+        try:
+            with open('/proc/%d/environ' % pid, 'rb') as fh:
+                if want not in fh.read().split(b'\0'):
+                    continue
+            with open('/proc/%d/cmdline' % pid, 'rb') as fh:
+                cmd = fh.read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+        except (IOError, OSError):
+            continue          # 行程剛結束，或沒有權限讀 (不是我們啟動的)
+        if 'ros2cli.daemon' in cmd or 'ros2-daemon' in cmd:
+            continue          # ros2 cli 自己的快取 daemon，不是機器人節點，留著
+        found.append((pid, cmd or '(無 cmdline)'))
+    return found
+
+
+def preflight_domain_clean():
+    """開跑前的防呆：清掉 ROS_DOMAIN_ID 上前一次執行留下的節點。
+
+    測試若被 Ctrl-C 或其他方式中途打斷，gzserver / controller_server /
+    mower_manager 有機會活下來。下一次執行時這些殘留節點會跟新起的節點
+    搶同一組 topic 與 service，數據會被安靜地污染 (階段 8 就因此丟棄過
+    一整輪結果)。所以開跑前先看一眼，有殘留就清掉並記錄清掉了什麼。"""
+    sub('防呆檢查：ROS_DOMAIN_ID=%s 上有沒有前次留下的殘留節點'
+        % ENV['ROS_DOMAIN_ID'])
+    # 一律加 --no-daemon：ros2 cli 的 daemon 會快取圖形資訊，
+    # 可能報出已經消失的節點 (或漏報剛出現的)，殘留判斷要看當下的真實圖形。
+    _rc, out = run(['ros2', 'node', 'list', '--no-daemon'], timeout=30)
+    nodes = [l.strip() for l in out.splitlines() if l.strip().startswith('/')]
+    procs = domain_processes()
+    if not nodes and not procs:
+        sub('  乾淨，沒有殘留 (節點 0 個、行程 0 個)')
+        return
+    sub('  發現殘留，開跑前先清掉：')
+    for n in nodes:
+        sub('    節點 %s' % n)
+    for pid, cmd in procs:
+        sub('    行程 pid=%-7d %s' % (pid, cmd[:110]))
+    for pid, _cmd in procs:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(2.0)
+    _rc, out = run(['ros2', 'node', 'list', '--no-daemon'], timeout=30)
+    left = [l.strip() for l in out.splitlines() if l.strip().startswith('/')]
+    if left:
+        sub('  清完仍看得到節點 %s —— 這次的數據要當成可疑，請人工確認' % left)
+    else:
+        sub('  已清乾淨 (殺掉 %d 個行程)' % len(procs))
+
+
 # --------------------------------------------------------------------------
 # 3. Phase A：靜態檢查
 # --------------------------------------------------------------------------
@@ -2375,6 +2439,8 @@ def main():
              else '%.2f (launch 預設值)' % DEFAULT_OVERLAP,
              SWATH_SPACING, BLADE_WIDTH))
     print('模擬世界      : %s' % (WORLD or 'mow_field.world (launch 預設值)'))
+    print('')
+    preflight_domain_clean()
 
     try:
         if 'A' in phases:

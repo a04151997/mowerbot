@@ -600,6 +600,15 @@ A 組在完全沒有 `serialize_map` 的情況下失敗率最高，直接推翻�
 三種跑道長度改善不了（4.5 節），重疊率也只能把它縮小、無法消除，
 而且到 0.4 就已經平掉（4.6.5 節）。要真正解決必須換掉頭策略或換控制器。
 
+**後續工作：補一趟周邊環繞（perimeter pass），估 3~5 小時，這一輪沒有做。**
+
+未覆蓋面積 99.5% 集中於單一區塊
+（7.11 節那次 `mow_field.world` 的執行：作業區未覆蓋 9.09%、共 4 塊、
+最大一塊 1.454 m²），成因是最外側割草線的掉頭弓形沒有相鄰割草線覆蓋。
+標準解法是補一趟沿邊界的周邊環繞（perimeter pass），
+F2C 的 headland 物件可直接產生該路徑。
+預估可將作業區未覆蓋率從 9.09% 降至約 0.5%，工作量 3~5 小時。
+
 ### 7.2 邊界萃取有一格的內縮
 
 `map_to_boundary` 把佔據網格的 cell index 換算成世界座標時用的是
@@ -812,10 +821,18 @@ python3 test/smoke_test.py --phases=N --world=demo_lawn.world
 這個競態的窗口在「manager 建立 client 的那一刻」，
 與 manager 是第 5 秒還是第 10 秒啟動無關 —— 所以延長 `period` 治不到它。
 
-**處理：維持現狀，不在測試層加重試。**
-測試層的重試會把這個脆弱性蓋掉，而它在實車上一樣會發生，等於自欺。
-`period` 保留在 10.0（這是階段 8 指定要試的值，沒有證據支持但也沒有害處；
-要退回 5.0 隨時可以改一個數字）。
+**處理：`period` 已還原成 5.0，不在測試層加重試。**
+延長沒有證據支持（上表），而且時間戳已經說明它在原理上治不到這個競態，
+沒有理由把一個無效的值留在 launch 檔裡、看起來像「已經處理過」。
+階段 8 結束時已改回 5.0。
+
+**這次嘗試與它的結果刻意留在本節，不刪。**
+「拉長延遲試過、無效、已還原」本身就是有價值的紀錄 ——
+下次再看到同一條 `failed to send response` 的 log 時，
+不用再花一輪測試把同一條死路重走一次。
+
+測試層的重試則是另一回事：那會把這個脆弱性蓋掉，
+而它在實車上一樣會發生，等於自欺。
 
 **對實車的意涵：不能假設 Nav2 一定會起來。**
 開機自動啟動必須有「檢查 `controller_server` 是否真的到 `active`、
@@ -851,3 +868,109 @@ python3 test/smoke_test.py --phases=N --world=demo_lawn.world   # 換成乾淨�
 
 4.5 節的掉頭過衝診斷就是直接用 `n3_path.csv` + `n3_traj.csv` 算出來的，
 不需要重跑模擬。
+
+## 9. 一鍵啟動（示範用）
+
+示範時原本要開四個終端機分別跑 `gazebo` / `mower_control` / `navigation` / `rviz`
+四支 launch，任何一支掛掉（在這台 VMware 上最常見的是 gzclient 閃退）
+就得四個全部重開。階段 9 把它們收成一支 `demo.launch.py`，
+外面再包一支 `run_demo.sh` 負責環境準備與收尾。
+
+```bash
+cd ~/Desktop/mowerbot
+./run_demo.sh                          # 無頭 Gazebo + RViz（預設）
+./run_demo.sh gui:=true                # 要看 Gazebo 的 3D 畫面
+./run_demo.sh nav:=false               # 只跑建圖，不啟動 Nav2
+./run_demo.sh world:=mow_field.world   # 換回原本的測試場地
+```
+
+參數就是 `demo.launch.py` 的 launch argument（`use_sim_time` / `world` / `gui` /
+`rviz` / `nav` / `overlap_ratio`），可以疊加，由 `run_demo.sh` 原封不動透傳。
+
+### 9.1 啟動順序
+
+`demo.launch.py` 用 `TimerAction` 把四段錯開，每段都先印出正在啟動什麼，
+畫面卡住時一眼看得出卡在哪一段：
+
+| 時間 | 啟動內容 | 為什麼要等 |
+|------|----------|-----------|
+| t = 0 s | gazebo（模擬器 + robot_state_publisher + spawn_entity） | — |
+| t = 10 s | mower_control（SLAM / teleop / manager / F2C） | 要等機器人 spawn 完、`/clock` 開始發布才有 sim time |
+| t = 16 s | navigation（controller_server + lifecycle_manager） | 要等 TF 鏈完整（含 SLAM 的 map → odom），否則 local_costmap 抓不到轉換 |
+| t = 18 s | rviz | 最後開畫面，此時 `/map` 與 TF 都已經在了 |
+
+`navigation.launch.py` 內部自己還有一個 5 秒的 `TimerAction`（7.12 節），
+所以 Nav2 實際進入 active 大約在 t = 21 s。這裡不再往上疊：
+疊上去只是讓示範等更久，對 7.12 節那個競態一點幫助也沒有。
+
+預設 `gui:=false`（無頭）。理由是 gzclient 在這台虛擬機的軟體 OpenGL（mesa svga）
+底下不穩定，示範到一半會閃退；而自動化測試全部跑無頭，幾十次沒當過一次 ——
+問題在圖形介面，不在模擬本身。
+
+### 9.2 驗收時抓到的兩個錯誤（都已修正）
+
+這兩支檔案寫好之後一直沒有實際跑過，第一次執行時兩個都是「完全起不來」：
+
+**`set -u` 讓 `source /opt/ros/humble/setup.bash` 直接中止。**
+ROS 的 setup.bash 會讀 `AMENT_TRACE_SETUP_FILES` 這類沒有預先定義的變數，
+在 `set -u` 底下等於未定義變數錯誤，腳本印完 workaround 訊息就 exit 1。
+處理：source 那一段暫時 `set +u`，出來再 `set -u`。
+
+**Gazebo 的 launch 參數洩漏，害 Nav2 讀不到 `nav2_params.yaml`。**
+`IncludeLaunchDescription` 的 launch configuration 是所有被 include 的檔案共用的，
+而 `gazebo_ros` 的 `gzserver.launch.py` 會宣告一個 `params_file`（預設空字串）。
+t = 0 s 啟動 Gazebo 之後這個空字串就留在 context 裡，
+t = 16 s 才被 include 進來的 `navigation.launch.py` 認為 `params_file` 已經有人給了，
+於是它自己的預設值 `nav2_params.yaml` 不生效，路徑正規化後變成 `"."`：
+
+```
+[WARNING] [launch_ros.actions.node]: Parameter file path is not a file: .
+[lifecycle_manager-12] terminate called after throwing an instance of
+    'rclcpp::exceptions::ParameterUninitializedException'
+[lifecycle_manager-12]   what():  parameter 'node_names' is not initialized
+[ERROR] [lifecycle_manager-12]: process has died [pid 4172, exit code -6]
+```
+
+`lifecycle_manager` 直接 abort，`controller_server` 永遠停在 inactive。
+處理：在 `demo.launch.py` 裡把 Gazebo 那一段包進 `GroupAction`（`scoped=True`
+是預設值），Gazebo 宣告的參數關在自己的作用域裡，不會外流。
+
+值得記一筆的是：單獨跑 `navigation.launch.py` 不會踩到這個問題，
+自動化測試也是單獨起 launch，所以整個階段 1~8 完全沒有徵兆。
+一鍵啟動把四支合成一支之後才暴露出來。
+
+### 9.3 驗收結果
+
+在 `demo_lawn.world` 上跑過兩輪（`rviz:=false` 一輪、預設值一輪）：
+
+| 項目 | 結果 |
+|------|------|
+| 四段啟動訊息 | t=0 / t=10 / t=16 / t=18 都有按時印出 |
+| 節點 | `rviz:=false` 那輪 `ros2 node list` 共 18 個，controller_server / f2c_server / mower_teleop / mower_manager / map_to_boundary / slam_toolbox / joy_node 等全數上線；預設那輪另外確認 rviz2 行程有起來（載入 `mowerbot.rviz`） |
+| Nav2 生命週期 | `ros2 lifecycle get /controller_server` → `active [3]`，log 有 `Managed nodes are active` |
+| 建圖 | `/map` 有資料（241 x 241），`map_to_boundary` 持續成功萃取邊界 |
+| 話題 | `/cmd_vel`、`/cmd_vel_joy`、`/cmd_vel_nav`、`/f2c_boundary`、`/f2c_path`、`/scan` 都在 |
+| Ctrl+C 收尾 | 兩輪都印出「已關閉」，事後掃描 gzserver / rviz2 / controller_server / slam_toolbox 等全部為 0 個殘留 |
+
+RViz 啟動時會噴一行 GLSL 錯誤：
+
+```
+[rviz2] Vertex Program:rviz/glsl120/indexed_8bit_image.vert ... GLSL link result :
+active samplers with a different type refer to the same texture image unit
+```
+
+這是軟體 OpenGL 底下顯示 `/map` 的已知訊息，RViz 本身繼續正常執行，
+不影響功能，這裡記下來是為了下次看到時不用再查一次。
+
+### 9.4 已知限制：`run_demo.sh` 的殘留清理是比對整條命令列
+
+`kill_stale()` 用的是 `pgrep -f <pattern>`，比對的是整條命令列而不是執行檔本身。
+驗收過程中就親眼看到它誤殺了一個命令列剛好含有 `controller_server` 字樣的
+無關 shell。實際使用上，像 `tail -f controller_server.log`
+或編輯器開著 `navigation.launch.py` 都有機會被殺掉。
+
+`test/smoke_test.py` 的 `domain_processes()` 用的是另一套辦法：
+逐一讀 `/proc/<pid>/environ` 比對 `ROS_DOMAIN_ID`，只殺同一個 domain 的行程，
+不會誤傷。`run_demo.sh` 沒有設自己的 domain，所以不能直接照抄，
+要修的話得先決定示範環境要不要也吃一個獨立的 `ROS_DOMAIN_ID`。
+目前先維持現狀並記錄在這裡。
