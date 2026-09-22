@@ -598,11 +598,23 @@ class MowerManager(Node):
     # 只是拿它當判斷依據)。
     LEAD_IN_OBSTACLE_CLEARANCE = 0.45
 
-    # 跑道與「邊界」之間至少要留車體內切半徑。footprint 是 0.95 x 0.68，
-    # 半寬 0.34 m —— 比這個近，車體一定壓到邊界外面的東西。
-    # 用 0.34 而不是 0.45：邊界外側是牆，0.34 保證車體不重疊；
-    # 再往外推會把可割面積吃掉太多。
-    LEAD_IN_BOUNDARY_CLEARANCE = 0.34
+    # ---- 兩種淨空門檻：直線通過 vs 原地掉頭 ----
+    #
+    # 【直線通過】只要車體不重疊就好 = 內切半徑 0.34 m
+    #   (footprint 0.95 x 0.68，半寬 0.34)
+    #
+    # 【原地掉頭】車體四角會掃出一個圓 = 外接半徑
+    #   sqrt(0.475^2 + 0.34^2) = 0.5841 m
+    #   淨空小於這個值時，原地旋轉一定會掃到障礙物。
+    #
+    # 這個區分是階段 21 才補上的。之前所有檢查都用 0.34，
+    # 結果實車那次在 (-5.36, -4.57) 卡住：該點淨空 0.492 m，
+    # 大於 0.34 所以檢查放行，但小於 0.5841，車子掉不了頭。
+    # DWB 的 BaseObstacle critic 只看軌跡中心點的 cost (中心是自由的)，
+    # 所以它不會判軌跡無效，只會一直發指令直到 progress checker
+    # 15 秒後中止 —— 全程沒有任何一則錯誤訊息指出真正的原因。
+    LEAD_IN_BOUNDARY_CLEARANCE = 0.34          # 直線通過
+    ROTATION_CLEARANCE = 0.5841                # 原地掉頭 (外接半徑)
 
     # 跑道長度的退讓階梯。不可行時依序縮短，取第一個可行的；全部不行就不加跑道。
     # 不是「有或沒有」二選一：0.3 m 的跑道仍然能收斂一部分橫向誤差，
@@ -638,7 +650,30 @@ class MowerManager(Node):
             best = min(best, math.hypot(x - (ax + t * vx), y - (ay + t * vy)))
         return best
 
-    def lead_in_point_unsafe(self, x, y):
+    def boundary_clearance(self, x, y):
+        """這個點離邊界多遠。在邊界外面回傳負值，沒有邊界時回傳 None。"""
+        if self.latest_boundary is None:
+            return None
+        pts = [(p.x, p.y) for p in self.latest_boundary.points]
+        if len(pts) < 3:
+            return None
+        d = self._point_polygon_distance(x, y, pts)
+        return d if self._point_in_polygon(x, y, pts) else -d
+
+    def obstacle_clearance(self, x, y):
+        """這個點離最近的內部障礙物多遠。在障礙物裡回傳負值，沒有障礙物回傳 None。"""
+        best = None
+        for poly in self.latest_obstacles:
+            pts = [(p.x, p.y) for p in poly.points]
+            if len(pts) < 3:
+                continue
+            d = self._point_polygon_distance(x, y, pts)
+            if self._point_in_polygon(x, y, pts):
+                d = -d
+            best = d if best is None else min(best, d)
+        return best
+
+    def lead_in_point_unsafe(self, x, y, need_rotation=False):
         """這個點適不適合當跑道的一部分？不安全就回傳原因字串，安全回傳 None。
 
         檢查兩件事 —— **邊界與內部障礙物都要看**：
@@ -655,26 +690,28 @@ class MowerManager(Node):
         舊版的 lead_in_blocked() 只看障礙物、不看邊界，
         名字卻讓人以為它把「跑道能不能走」都檢查過了。
         """
-        for poly in self.latest_obstacles:
-            pts = [(p.x, p.y) for p in poly.points]
-            if len(pts) < 3:
-                continue
-            if self._point_in_polygon(x, y, pts):
-                return '落在內部障礙物裡'
-            if self._point_polygon_distance(x, y, pts) < \
-                    self.LEAD_IN_OBSTACLE_CLEARANCE:
-                return ('離內部障礙物只有 %.2f m'
-                        % self._point_polygon_distance(x, y, pts))
+        # 要在這個點掉頭的話，門檻是外接半徑；只是直線通過就用內切半徑。
+        # 不要一律用外接半徑 —— 那會把只是路過的點也擋掉，過度保守。
+        need_b = (self.ROTATION_CLEARANCE if need_rotation
+                  else self.LEAD_IN_BOUNDARY_CLEARANCE)
+        need_o = (max(self.ROTATION_CLEARANCE, self.LEAD_IN_OBSTACLE_CLEARANCE)
+                  if need_rotation else self.LEAD_IN_OBSTACLE_CLEARANCE)
+        what = '掉頭' if need_rotation else '通過'
 
-        if self.latest_boundary is not None:
-            bpts = [(p.x, p.y) for p in self.latest_boundary.points]
-            if len(bpts) >= 3:
-                if not self._point_in_polygon(x, y, bpts):
-                    return '落在邊界外面'
-                d = self._point_polygon_distance(x, y, bpts)
-                if d < self.LEAD_IN_BOUNDARY_CLEARANCE:
-                    return '離邊界只有 %.2f m (需要 %.2f m)' % (
-                        d, self.LEAD_IN_BOUNDARY_CLEARANCE)
+        od = self.obstacle_clearance(x, y)
+        if od is not None:
+            if od < 0:
+                return '落在內部障礙物裡'
+            if od < need_o:
+                return ('離內部障礙物只有 %.2f m (%s需要 %.2f m)'
+                        % (od, what, need_o))
+
+        bd = self.boundary_clearance(x, y)
+        if bd is not None:
+            if bd < 0:
+                return '落在邊界外面'
+            if bd < need_b:
+                return '離邊界只有 %.2f m (%s需要 %.2f m)' % (bd, what, need_b)
         return None
 
     def lead_in_first_feasible(self, ax, ay, ux, uy, index, total):
@@ -694,11 +731,24 @@ class MowerManager(Node):
             bad = None
             for k in range(n + 1):
                 d = length * k / n
-                why = self.lead_in_point_unsafe(ax - d * ux, ay - d * uy)
+                # k == n 就是跑道起點：車子會在那裡掉頭進入這條割草線，
+                # 所以那個點的門檻是外接半徑；中間的點只是直線通過。
+                why = self.lead_in_point_unsafe(
+                    ax - d * ux, ay - d * uy, need_rotation=(k == n))
                 if why is not None:
                     bad = '%s (距割草線起點 %.2f m 處)' % (why, d)
                     break
             if bad is None:
+                # 【不得降低淨空】跑道把起點往邊界推，延伸後如果比原本的
+                # 割草線起點更靠近邊界而且掉不了頭，那就是自己製造一個
+                # 轉不過去的點 —— 實車那次 0.610 m 被 0.20 m 的跑道推到
+                # 0.492 m，就這樣卡死。
+                sx, sy = ax - length * ux, ay - length * uy
+                new_c = self.boundary_clearance(sx, sy)
+                if new_c is not None and new_c < self.ROTATION_CLEARANCE:
+                    reason = ('延伸後淨空 %.2f m < 外接半徑 %.2f m'
+                              % (new_c, self.ROTATION_CLEARANCE))
+                    continue
                 return length, reason
             reason = bad
         return 0.0, reason
@@ -932,13 +982,66 @@ class MowerManager(Node):
             self.get_logger().warn(
                 '⚠️ 查不到車子位置，這一段直接送出，不補 approach')
             return False
-        approach = self.build_approach_path(robot_xy, path)
+        target = self.approach_target(path, label)
+        approach = self.build_approach_path(robot_xy, target)
         if approach is None:
             return False            # 夠近，不需要 approach
         self._swath_queue.insert(self._current_swath_idx, (approach, 'approach'))
         # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
         self._mission_total = len(self._swath_queue)
         return True
+
+    APPROACH_TARGET_SEARCH_M = 1.0     # 最多往後找這麼長
+
+    def approach_target(self, path, label=''):
+        """挑 approach 要開到哪個航點。
+
+        預設是這一段的第 0 個航點，但那個點如果掉不了頭
+        (淨空 < 外接半徑)，把車子開到那裡只是換個地方卡住 ——
+        實車那次就是這樣：approach 把車開到 (-5.36, -4.57)，
+        然後下一段要往反方向，車子在那裡轉不過來。
+
+        所以往後找第一個「掉得了頭」的航點當終點，最多找
+        APPROACH_TARGET_SEARCH_M 公尺；找不到就維持第 0 個
+        (至少行為與以前一樣，而且會留下一行 log 說明)。
+        """
+        if not path.poses:
+            return path
+        limit = self.APPROACH_TARGET_SEARCH_M
+        acc = 0.0
+        chosen = 0
+        for i, ps in enumerate(path.poses):
+            p = ps.pose.position
+            if i > 0:
+                q = path.poses[i - 1].pose.position
+                acc += math.hypot(p.x - q.x, p.y - q.y)
+                if acc > limit:
+                    break
+            if self.lead_in_point_unsafe(p.x, p.y, need_rotation=True) is None:
+                chosen = i
+                break
+        else:
+            chosen = 0
+        if chosen == 0:
+            first = path.poses[0].pose.position
+            why = self.lead_in_point_unsafe(first.x, first.y, need_rotation=True)
+            if why is not None:
+                self.get_logger().warn(
+                    f'⚠️ [{label}] 的起點掉不了頭（{why}），'
+                    f'往後 {limit:.1f} m 內也找不到可以掉頭的點，'
+                    f'仍然開到原起點 —— 這一段有可能卡住')
+            return path
+        sub = Path()
+        sub.header = path.header
+        sub.poses = list(path.poses[chosen:])
+        skipped = sum(
+            math.hypot(path.poses[i + 1].pose.position.x - path.poses[i].pose.position.x,
+                       path.poses[i + 1].pose.position.y - path.poses[i].pose.position.y)
+            for i in range(chosen))
+        self.get_logger().info(
+            f'🚗 [{label}] 的起點掉不了頭，approach 改開到第 {chosen} 個航點 '
+            f'(往後 {skipped:.2f} m)')
+        return sub
 
     def send_next_swath(self):
         """送出佇列裡的下一個任務 (approach 或割草線)"""
@@ -1201,6 +1304,22 @@ class MowerManager(Node):
                 # 佇列總段數 (含 approach / 環繞 / 銜接段)，任務結束後仍保留給畫面顯示
                 self._mission_total = len(queue)
                 self.set_mission_state(MissionStatus.STATE_EXECUTING)
+                # 把整個佇列印出來：Phase Q 靠這些行檢查「真正會送出去的段落」
+                # 是否可通行 (靜態的 F2C 輸出看不到跑道與執行時插入的 approach)。
+                for i, (pth, lbl) in enumerate(queue):
+                    if not pth.poses:
+                        continue
+                    a = pth.poses[0].pose.position
+                    b = pth.poses[-1].pose.position
+                    length = 0.0
+                    for k in range(len(pth.poses) - 1):
+                        p0 = pth.poses[k].pose.position
+                        p1 = pth.poses[k + 1].pose.position
+                        length += math.hypot(p1.x - p0.x, p1.y - p0.y)
+                    self.get_logger().info(
+                        '📋 佇列 %d/%d [%s] 起點 (%.2f, %.2f) 終點 (%.2f, %.2f) '
+                        '長度 %.2f m' % (i + 1, len(queue), lbl,
+                                        a.x, a.y, b.x, b.y, length))
                 self.send_next_swath()
             else:
                 self.get_logger().error('⚠️ F2C 伺服器回報路徑規劃失敗！')

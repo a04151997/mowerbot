@@ -137,10 +137,11 @@ def generate_launch_description():
         ),
 
         # F2C 地頭 (headland) 寬度，單位公尺，0 代表停用地頭。
-        # 預設值與 lead_in_length 相同，跑道才不會延伸到邊界外。
+        # 階段 21 從 0.5 改成 0.70：地頭要能容納車子原地掉頭，
+        # 而外接半徑就有 0.5841 m (見 f2c_server.cpp 的推導)。
         DeclareLaunchArgument(
             'headland_width',
-            default_value='0.5',
+            default_value='0.70',
             description='Headland width in metres. Swaths are generated on the '
                         'field shrunk by this margin. 0 disables the headland.'
         ),

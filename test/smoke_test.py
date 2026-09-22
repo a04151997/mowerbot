@@ -3315,6 +3315,10 @@ RE_Q_LEADIN = re.compile(
 RE_Q_LEADIN_SHORT = re.compile(r'割草線 (\d+)/(\d+) 跑道縮短為 ([\d.]+) m')
 RE_Q_LEADIN_NONE = re.compile(r'割草線 (\d+)/(\d+) 不加跑道')
 RE_Q_HIST = re.compile(r'跑道長度分布：(.+)')
+Q_CIRCUM = 0.5841          # 車體外接半徑 sqrt(0.475^2 + 0.34^2)，原地掉頭需要
+RE_Q_QUEUE = re.compile(
+    r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
+    r'終點 \(([-\d.]+), ([-\d.]+)\) 長度 ([\d.]+) m')
 RE_Q_BOUNDARY = re.compile(r'邊界提取成功！共化簡出 (\d+) 個多邊形頂點')
 
 
@@ -3436,6 +3440,66 @@ def phase_q():
                % (path_min, path_bad,
                   ('%.3f' % lead_min) if lead_min == lead_min else 'n/a',
                   lead_bad, len(bnd), polygon_area(bnd)))
+
+        # ---- Q2：量「真正排進佇列的段落」，不是靜態的 F2C 輸出 ----
+        hdr('Q2  佇列裡每一段的起點/終點淨空，以及需要掉頭的點夠不夠轉')
+        sub('靜態 F2C 路徑看不到跑道與執行時插入的 approach —— 而實車那次')
+        sub('出事的正是那些。這一項讀 manager 自己印出來的佇列內容。')
+        qtxt = '\n'.join(ctl.log_grep(r'📋 佇列', 400))
+        rows = RE_Q_QUEUE.findall(qtxt)
+        if not rows:
+            record('Q', 'Q2', '佇列每一段的起點/終點淨空與掉頭空間', 'FAIL',
+                   'manager 沒有印出佇列內容 (📋 佇列)，無法檢查')
+        else:
+            segs = [(lbl, (float(sx), float(sy)), (float(ex), float(ey)), float(ln))
+                    for _i, _n, lbl, sx, sy, ex, ey, ln in rows]
+            sub('佇列共 %d 段' % len(segs))
+            prev_dir = None
+            bad_rot, bad_pass, worst_rot = [], [], (9e9, None)
+            print('')
+            print('        %-16s %-20s %-9s %-9s %s'
+                  % ('段落', '起點', '起點淨空', '終點淨空', '需要掉頭?'))
+            for lbl, a, b, ln in segs:
+                d0 = rig.lookup(dist, grid, a[0], a[1])
+                d1 = rig.lookup(dist, grid, b[0], b[1])
+                cur = None
+                if ln > 1e-6:
+                    cur = ((b[0] - a[0]) / ln, (b[1] - a[1]) / ln)
+                need_rot = False
+                if prev_dir is not None and cur is not None:
+                    need_rot = (prev_dir[0] * cur[0] + prev_dir[1] * cur[1]) < 0.0
+                if cur is not None:
+                    prev_dir = cur
+                if d0 is None:
+                    continue
+                if need_rot:
+                    if d0 < worst_rot[0]:
+                        worst_rot = (d0, lbl)
+                    if d0 < Q_CIRCUM:
+                        bad_rot.append((lbl, a, d0))
+                elif d0 < Q_INSCRIBED:
+                    bad_pass.append((lbl, a, d0))
+                print('        %-16s (%6.2f,%6.2f)       %-9s %-9s %s'
+                      % (lbl[:16], a[0], a[1],
+                         '%.3f' % d0,
+                         '%.3f' % d1 if d1 is not None else 'n/a',
+                         '是' if need_rot else ''))
+            print('')
+            sub('需要掉頭的段落裡，起點最小淨空 = %s m (段落 %s，門檻 %.3f m)'
+                % (('%.3f' % worst_rot[0]) if worst_rot[1] else 'n/a',
+                   worst_rot[1] or '-', Q_CIRCUM))
+            sub('掉頭點淨空不足的段落 = %d；直線通過點淨空不足的段落 = %d'
+                % (len(bad_rot), len(bad_pass)))
+            for lbl, a, d in (bad_rot + bad_pass)[:5]:
+                print('        %-18s (%.2f, %.2f) 淨空 %.3f m' % (lbl, a[0], a[1], d))
+            q2_ok = (not bad_rot) and (not bad_pass)
+            record('Q', 'Q2',
+                   '佇列每一段：直線通過點 >= 0.34 m、需要掉頭的點 >= 0.5841 m',
+                   'PASS' if q2_ok else 'FAIL',
+                   '佇列 %d 段，掉頭點不足 %d 段，通過點不足 %d 段，'
+                   '掉頭點最小淨空 %s m'
+                   % (len(segs), len(bad_rot), len(bad_pass),
+                      ('%.3f' % worst_rot[0]) if worst_rot[1] else 'n/a'))
     finally:
         if rig is not None:
             rig.close()

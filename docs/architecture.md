@@ -205,14 +205,14 @@ graph LR
         N["Phase N Nav2 路徑跟隨<br/>6 項"]
         O["Phase O 障礙物容錯<br/>1 項"]
         P["Phase P 狀態發布 +<br/>模式仲裁 + 手把<br/>10 項"]
-        Q["Phase Q 真實地圖<br/>路徑可通行性<br/>1 項"]
+        Q["Phase Q 真實地圖<br/>路徑與佇列可通行性<br/>2 項"]
     end
     A --> C
     B --> C
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **46 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **47 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |
@@ -226,7 +226,7 @@ graph LR
 | N | Nav2 生命週期、F2C 路徑、端到端覆蓋任務、remap、RTF、急停清佇列 | ✓ |
 | O | 臨時障礙物擋住割草線時跳過該段並繼續（固定用 `demo_lawn_obstacle.world`） | ✓ |
 | P | 狀態發布（`/mower_status`、`/mission_status`、`/joy_status`）、邊界防呆、HMI 無頭啟動、五個模式的急停鍵與手把仲裁 | ✓ |
-| Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑可通行性（規劃出撞牆的路徑就擋下來） | ✓ |
+| Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑與**佇列**可通行性（含掉頭空間，規劃出轉不過去的點就擋下來） | ✓ |
 
 另有 17 項純 Python 的里程計單元測試（`mowerbot_bridge/test/test_odometry.py`），
 不需要 ROS，一秒內跑完：
@@ -254,7 +254,50 @@ graph LR
 
 ---
 
-## 8. 圖片索引
+## 8. 安全機制的邊界（它們保護什麼、不保護什麼）
+
+這一節寫的是**已知的保護缺口**，不是設計說明。實車上這些缺口會變成物理後果。
+
+### 8.1 `BaseObstacle` critic 只檢查軌跡中心點，不保護車體外框
+
+`nav2_params.yaml` 的 DWB critics 是
+`["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", ...]`。
+
+**`BaseObstacle` 對每個軌跡取樣點只查「該點所在那一格」的 cost。**
+車體是 0.95 x 0.68 m，中心點自由不代表四個角自由 ——
+原地旋轉時四角掃出的圓半徑是 **0.5841 m**（外接半徑），
+中心點的 cost 可以是 0，而角落已經在牆裡面。
+
+實測後果（階段 20 的那次執行）：車子在淨空 0.492 m 的地方被要求掉頭 180°，
+`BaseObstacle` 認為所有軌跡都合法（中心點 cost=0），控制器持續送速度指令，
+Gazebo 物理上擋住車子，**全程沒有任何一則訊息指出真正的原因**，
+直到 15 秒後 progress checker 才以 `Failed to make progress` 中止。
+
+目前的緩解是**規劃層**的幾何檢查（階段 21）：需要掉頭的點要求淨空
+≥ 0.5841 m，只直線通過的點要求 ≥ 0.34 m（內切半徑）。
+**這是預防，不是保護** —— 規劃層算錯或地圖過期時，控制層不會攔下來。
+
+`nav2` 有 `ObstacleFootprint` critic 會檢查完整外框，但它的隱含門檻更嚴
+（見 `simulation_results.md` 17.5 節的量測），要不要採用是未決的決定。
+
+### 8.2 progress checker 要 15 秒才中止 —— 那是 74 kg 的機器推 15 秒
+
+`progress_checker` 的設定是 `required_movement_radius: 0.5` /
+`movement_time_allowance: 15.0`：**15 秒內沒有移動 0.5 m 才判失敗**。
+
+模擬裡這只是「卡 15 秒然後跳過」。實車上這 15 秒是：
+74 kg 的載具、輪子持續轉、推著它撞到的東西（牆、樹、人）。
+馬達不會停、電流不會降，因為從控制器的角度看「命令正常發出中」。
+
+這個時間窗口目前沒有改（改它要權衡：太短會讓正常的掉頭被誤判成卡住）。
+實車上真正該補的是**電流或堵轉偵測**：`bridge_node` 從驅動板讀到
+電流異常時直接停車，不要等 15 秒。
+`mowerbot_bridge/drivers/README.md` 的 D 節已經把「板子能不能回報電流／
+堵轉」列為必查項目，就是為了這個。
+
+---
+
+## 9. 圖片索引
 
 | 檔案 | 內容 | 在報告裡的位置 |
 |------|------|--------------|
