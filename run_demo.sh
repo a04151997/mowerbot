@@ -17,6 +17,7 @@
 #   ./run_demo.sh nav:=false               只跑建圖，不啟動 Nav2
 #   ./run_demo.sh world:=mow_field.world   換世界
 #   ./run_demo.sh rviz:=false gui:=true    只看 Gazebo，不開 RViz
+#   ./run_demo.sh hmi:=false               不要開 HMI 控制介面視窗
 #
 # 參數就是 demo.launch.py 的 launch argument，可以疊加。
 # ==========================================================================

@@ -71,6 +71,22 @@ class MowerManager(Node):
         # 一條剛好起點就在旁邊的路徑。所以跑道是可靠度功能而不是覆蓋品質功能。
         # 既然覆蓋品質分不出高下，就取「能用的最小值」：L 同時是階段 2 的地頭寬度，
         # 而地頭會直接吃掉可作業面積 (5x5 m 的地上 L=1.5 只剩 2 m 寬可割)。
+        # 邊界的最小面積。小於這個值的邊界一律拒絕，不會更新 latest_boundary。
+        #
+        # 為什麼需要：map_to_boundary 在建圖還沒完成時輸出很不穩定
+        # (報告 11.4 節：同一次執行依序報出 0 -> 17 -> 19 -> 20 -> 4 -> 1 個障礙物，
+        # 邊界面積也一樣會從幾 m² 慢慢長到正常值)。使用者若在那個瞬間切自動割草，
+        # 任務就會拿著垃圾邊界啟動 —— 實測收過 2.93 m² 的邊界，
+        # 正常值是 25 m²。
+        #
+        # 預設 4.0 m² 的理由：地頭 (headland_width) 0.5 m 是從四周往內縮，
+        # 小於 2m x 2m 的邊界扣掉地頭之後作業區就是零，
+        # F2C 不可能規劃出任何割草線。也就是說低於這個值的邊界
+        # 不管怎麼樣都不會成功，早點擋掉比較誠實。
+        self.declare_parameter('min_boundary_area', 4.0)
+        self.min_boundary_area = float(
+            self.get_parameter('min_boundary_area').value)
+
         # 連續失敗幾次就判定為系統性問題、停止整個任務。
         # 單獨一段失敗多半是臨時障礙物 (椅子、樹枝、有人站在草坪上)，
         # 那種情況跳過那一段繼續割其餘的才合理；但如果連續好幾段都失敗，
@@ -134,6 +150,9 @@ class MowerManager(Node):
         self.timer = self.create_timer(0.05,self.safety_check)
         # 訂閱最新算出的綠色邊界
         self.latest_boundary = None
+        self.latest_boundary_area = 0.0
+        self._boundary_seen = 0        # 總共收到幾個邊界
+        self._boundary_rejected = 0    # 其中幾個沒通過檢查
         self.boundary_sub = self.create_subscription(
             PolygonStamped, '/f2c_boundary', self.boundary_cb, 10)
 
@@ -188,9 +207,61 @@ class MowerManager(Node):
             f'急停鎖定中！攔截到來自 {source_name} 的異常移動指令。', 
             throttle_duration_sec=2.0  # 每 2 秒最多印出一次，避免日誌崩潰
         )
+    @staticmethod
+    def polygon_area(points):
+        """shoelace 公式算多邊形面積。
+
+        不用 bounding box：L 形或凹形的草坪，bounding box 會高估面積，
+        那樣「看起來夠大、實際上割不了」的邊界就會通過檢查。
+        """
+        n = len(points)
+        if n < 3:
+            return 0.0
+        acc = 0.0
+        for i in range(n):
+            a = points[i]
+            b = points[(i + 1) % n]
+            acc += a.x * b.y - b.x * a.y
+        return abs(acc) * 0.5
+
     def boundary_cb(self, msg):
-        """隨時更新最新圈出的綠色邊界"""
+        """收到邊界時先做合理性檢查，通過才更新 latest_boundary。
+
+        以前是無條件接受。問題在於 /f2c_boundary 隨時可能收到
+        建圖還沒完成時算出來的小邊界 (報告 11.4 與 12.3 節)，
+        而 manager 用的是「最後收到的那一個」——
+        使用者剛好在那個瞬間切自動割草，任務就拿著垃圾邊界啟動了。
+
+        不通過的邊界會被丟掉，**保留上一個有效的邊界**，
+        並且把拒絕原因與實際數值印出來 (不要安靜地忽略，
+        那會變成「為什麼沒反應」這種最難查的問題)。
+        """
+        self._boundary_seen += 1
+        pts = msg.polygon.points
+        area = self.polygon_area(pts)
+
+        reason = None
+        if len(pts) < 4:
+            reason = '頂點數 %d < 4' % len(pts)
+        elif area < self.min_boundary_area:
+            reason = ('面積 %.2f m² < 門檻 %.2f m²'
+                      % (area, self.min_boundary_area))
+
+        if reason is not None:
+            self._boundary_rejected += 1
+            if self.latest_boundary is not None:
+                keep = ('保留上一個有效邊界（面積 %.1f m²，頂點 %d 個）'
+                        % (self.latest_boundary_area,
+                           len(self.latest_boundary.points)))
+            else:
+                keep = '目前還沒有任何有效邊界'
+            self.get_logger().warn(
+                f'⚠️ 拒絕邊界：{reason}，{keep}',
+                throttle_duration_sec=5.0)
+            return
+
         self.latest_boundary = msg.polygon
+        self.latest_boundary_area = area
 
     def obstacles_cb(self, msg):
         """隨時更新作業區內部的障礙物輪廓"""
@@ -199,7 +270,14 @@ class MowerManager(Node):
     def call_f2c_planner(self):
         """打包邊界並發送給 C++ 伺服器"""
         if self.latest_boundary is None:
-            self.get_logger().error('⚠️ 尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。')
+            if self._boundary_seen > 0:
+                self.get_logger().error(
+                    f'⚠️ 收過 {self._boundary_seen} 個邊界但都沒通過檢查'
+                    f'（面積至少要 {self.min_boundary_area:.2f} m²、頂點至少 4 個）。'
+                    f'請繼續在建圖模式下把場地繞完，地圖夠大之後邊界才會合理。')
+            else:
+                self.get_logger().error(
+                    '⚠️ 尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。')
             self.set_mission_state(MissionStatus.STATE_ABORTED)
             return
 
@@ -240,9 +318,15 @@ class MowerManager(Node):
             # 加入針對急停的專屬提示
             if self.current_mode == 4:
                 self.get_logger().error(f'🚨 系統強制鎖定：切換至 {mode_name}')
-                # 急停就是把「正在做的事」整個中止 —— 沒有任務在跑時也一樣標成
-                # ABORTED，因為對操作者而言「系統被強制停下」比「待命」更精確。
-                self.set_mission_state(MissionStatus.STATE_ABORTED)
+                # 只有「真的有任務在跑」時急停才算把任務中止。
+                #
+                # MissionStatus.state 描述的是「任務」，急停狀態是由
+                # MowerStatus 的 stop_active 與 mode 表達的 —— 兩者是不同的關注點。
+                # 分開之後「已完成 12/19」與「急停中」可以同時呈現；
+                # 混在一起的話，任務跑完之後按急停會把那份完成紀錄蓋掉
+                # (而 total_segments 不歸零正是為了保住那份紀錄)，
+                # 待命中按急停也會顯示「任務已中止」，但使用者根本沒啟動過任務。
+                self.abort_mission_if_running()
                 # 取消 Nav2 正在執行的 FollowPath，避免解除急停後車子被拉回原路徑
                 self.cancel_current_goal()
                 # 【安全關鍵】急停不能只取消「當前這一條」割草線。
@@ -259,7 +343,9 @@ class MowerManager(Node):
                 if previous_mode in (1, 3) and self.current_mode != previous_mode:
                     self.cancel_current_goal()
                     self.clear_swath_queue()
-                    self.set_mission_state(MissionStatus.STATE_ABORTED)
+                    # 同上：只有跑到一半被切走才算中止。
+                    # 任務已經跑完 (DONE) 之後離開自動模式，那份結果要留著。
+                    self.abort_mission_if_running()
 
                 # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖
                 if self.current_mode == 1:
@@ -336,6 +422,16 @@ class MowerManager(Node):
             _ = reason
         ms.skipped_labels = labels
         self.mission_status_pub.publish(ms)
+
+    def abort_mission_if_running(self):
+        """只有 PLANNING / EXECUTING 才轉成 ABORTED；IDLE 與 DONE 維持原狀。
+
+        呼叫時機是「外力把任務打斷」(急停、離開自動模式)。
+        沒有任務在跑的時候不要覆寫 state —— 理由見 change_mode_callback 的註解。
+        """
+        if self._mission_state in (MissionStatus.STATE_PLANNING,
+                                   MissionStatus.STATE_EXECUTING):
+            self.set_mission_state(MissionStatus.STATE_ABORTED)
 
     def set_mission_state(self, state, label=None):
         """集中改任務狀態，順便把「目前段落」一起更新，避免兩邊各改一半"""

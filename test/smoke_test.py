@@ -467,7 +467,7 @@ def preflight_domain_clean():
 # --------------------------------------------------------------------------
 EXPECTED_PKGS = ['joy_tester', 'mowerbot_action', 'mowerbot_bridge',
                  'mowerbot_bringup', 'mowerbot_description',
-                 'mowerbot_interfaces', 'mowerbot_planner']
+                 'mowerbot_hmi', 'mowerbot_interfaces', 'mowerbot_planner']
 
 
 def a1_build():
@@ -492,11 +492,16 @@ def a1_build():
     sub('finished=%d  failed=%d' % (n_fin, n_fail))
     sub('workspace 套件 (%d 個): %s' % (len(found), ', '.join(found)))
     missing = [p for p in EXPECTED_PKGS if p not in found]
-    ok = (rc == 0 and n_fail == 0 and n_fin == 7 and not missing)
-    detail = 'build rc=%d, finished=%d/7, failed=%d' % (rc, n_fin, n_fail)
+    # 「建好的數量 == colcon 實際列出的數量」而不是寫死 7：
+    # 加一個套件就要改一次數字的話，遲早會有人為了讓測試過而去改那個數字。
+    # 這樣寫反而更嚴格 —— 少建任何一個套件都會被抓到，
+    # 同時 EXPECTED_PKGS 仍然確保「該在的套件真的都在」。
+    ok = (rc == 0 and n_fail == 0 and n_fin == len(found) and not missing)
+    detail = ('build rc=%d, finished=%d/%d, failed=%d'
+              % (rc, n_fin, len(found), n_fail))
     if missing:
         detail += ', 缺少套件=%s' % missing
-    record('A', 'A1', 'colcon build 全部通過 (7 套件)',
+    record('A', 'A1', 'colcon build 全部通過 (workspace 裡的每一個套件)',
            'PASS' if ok else 'FAIL', detail)
 
 
@@ -2889,7 +2894,7 @@ class StatusRig(object):
 
 
 def phase_p():
-    hdr('Phase P  狀態發布 (/mower_status 與 /mission_status)')
+    hdr('Phase P  狀態發布與邊界防呆 (/mower_status、/mission_status)')
     sub('HMI 完全依賴這兩支話題。GUI 本身不好自動化測，但介面本身可以。')
 
     gz = bg_start('P_gazebo', gazebo_cmd())
@@ -2904,6 +2909,7 @@ def phase_p():
     rig = None
     try:
         rig = StatusRig()
+        ST = rig.MissionStatus
 
         # ---- P1 /mower_status ----
         hdr('P1  /mower_status 有發布、頻率約 5 Hz、mode 與實際切換一致')
@@ -2927,8 +2933,39 @@ def phase_p():
                'PASS' if p1_ok else 'FAIL',
                '%.2f Hz (%d 筆/4s), 三次模式切換一致=%s' % (rate, n, mode_ok))
 
-        # ---- P2 /mission_status ----
-        hdr('P2  /mission_status 在覆蓋任務執行時會正確更新')
+        # ---- P2 沒有任務在跑時急停 ----
+        hdr('P2  急停（沒有任務在跑）：stop_active 變 true，但 mission state 不被覆寫')
+        sub('MissionStatus.state 描述的是「任務」，急停狀態由 MowerStatus 的')
+        sub('mode 與 stop_active 表達 —— 兩者是不同的關注點。')
+        sub('待命中按急停不該顯示「任務已中止」，使用者根本沒啟動過任務。')
+        rig.set_mode(2)
+        rig.spin(1.0)
+        before_state = rig.mission[-1][1] if rig.mission else None
+        del rig.mower[:]
+        del rig.mission[:]
+        rig.set_mode(4)
+        rig.spin(2.0)
+        m_after = rig.mower[-1] if rig.mower else None
+        s_after = rig.mission[-1] if rig.mission else None
+        sub('急停前的 mission state = %s (%d=IDLE)' % (before_state, ST.STATE_IDLE))
+        sub('急停後 /mower_status: mode=%s, stop_active=%s'
+            % (m_after[1] if m_after else None, m_after[2] if m_after else None))
+        sub('急停後 mission state = %s (預期與急停前相同)'
+            % (s_after[1] if s_after else None))
+        p2_ok = (m_after is not None and m_after[1] == 4 and m_after[2] is True
+                 and s_after is not None and before_state is not None
+                 and s_after[1] == before_state)
+        record('P', 'P2',
+               '急停（無任務）：stop_active=true 且 mission state 維持原狀',
+               'PASS' if p2_ok else 'FAIL',
+               'mode=%s, stop_active=%s, state %s -> %s'
+               % (m_after[1] if m_after else None,
+                  m_after[2] if m_after else None,
+                  before_state, s_after[1] if s_after else None))
+        rig.set_mode(2)      # 解除急停
+        rig.spin(1.0)
+
+        # ---- 等 Nav2 ----
         state = None
         t0 = time.time()
         while time.time() - t0 < 40.0:
@@ -2940,22 +2977,22 @@ def phase_p():
             if 'active' in cur:
                 break
             time.sleep(2.0)
-        if not state or 'active' not in state:
-            record('P', 'P2', '/mission_status 隨任務更新', 'SKIP',
+        nav_ready = bool(state) and 'active' in state
+
+        # ---- P3 任務進度 ----
+        hdr('P3  /mission_status 在覆蓋任務執行時會正確更新')
+        if not nav_ready:
+            record('P', 'P3', '/mission_status 隨任務更新', 'SKIP',
                    'controller_server 沒進入 active，與狀態發布無關')
+            record('P', 'P4', '急停（有任務）：mission state 轉成 ABORTED', 'SKIP',
+                   'controller_server 沒進入 active，無法啟動任務')
         else:
-            rig.set_mode(2)
-            rig.spin(1.0)
-            idle = rig.mission[-1] if rig.mission else None
-            sub('任務開始前：state=%s, total=%s, completed=%s, label=%r'
-                % (idle[1], idle[2], idle[3], idle[5]) if idle else '(沒有收到)')
             rig.publish_boundary(-1.5, -1.5, 2.5, seconds=3.0)
             del rig.mission[:]
             rig.set_mode(1)
             sub('切到 mode 1，監聽最多 150 秒，等 completed >= 2 段...')
             t0 = time.time()
             labels_seen = []
-            best = None
             while time.time() - t0 < 150.0:
                 rig.spin(0.5)
                 if not rig.mission:
@@ -2966,7 +3003,6 @@ def phase_p():
                     sub('  t=%3.0fs  state=%d total=%d completed=%d label=%r'
                         % (time.time() - t0, cur[1], cur[2], cur[3], cur[5]))
                 if cur[3] >= 2:
-                    best = cur
                     break
             states = sorted(set(m[1] for m in rig.mission))
             totals = sorted(set(m[2] for m in rig.mission if m[2] > 0))
@@ -2976,36 +3012,100 @@ def phase_p():
             sub('觀察到的 total_segments = %s' % totals)
             sub('completed_segments 最大值 = %d' % completed_max)
             sub('看到的 current_label = %s' % labels_seen[:8])
-            p2_ok = (bool(totals) and completed_max >= 2 and len(labels_seen) >= 2
-                     and rig.MissionStatus.STATE_EXECUTING in states)
-            record('P', 'P2',
+            p3_ok = (bool(totals) and completed_max >= 2 and len(labels_seen) >= 2
+                     and ST.STATE_EXECUTING in states)
+            record('P', 'P3',
                    '/mission_status 的 state / total / completed / current_label 會更新',
-                   'PASS' if p2_ok else 'FAIL',
+                   'PASS' if p3_ok else 'FAIL',
                    'state值=%s, total=%s, completed最大=%d, 看到 %d 種 label'
                    % (states, totals, completed_max, len(labels_seen)))
 
-        # ---- P3 急停 ----
-        hdr('P3  急停時 stop_active 變 true、mission state 變 ABORTED')
-        del rig.mower[:]
-        del rig.mission[:]
-        ok = rig.set_mode(4)
-        rig.spin(2.0)
-        last_m = rig.mower[-1] if rig.mower else None
-        last_s = rig.mission[-1] if rig.mission else None
-        sub('切到 mode 4：服務回傳 %s' % ok)
-        sub('/mower_status: mode=%s, stop_active=%s'
-            % (last_m[1] if last_m else None, last_m[2] if last_m else None))
-        sub('/mission_status: state=%s (預期 %d = ABORTED)'
-            % (last_s[1] if last_s else None, rig.MissionStatus.STATE_ABORTED))
-        p3_ok = (last_m is not None and last_m[1] == 4 and last_m[2] is True
-                 and last_s is not None
-                 and last_s[1] == rig.MissionStatus.STATE_ABORTED)
-        record('P', 'P3', '急停時 stop_active=true 且 mission state=ABORTED',
-               'PASS' if p3_ok else 'FAIL',
-               'mode=%s, stop_active=%s, mission state=%s'
-               % (last_m[1] if last_m else None,
-                  last_m[2] if last_m else None,
-                  last_s[1] if last_s else None))
+            # ---- P4 任務執行中急停 ----
+            hdr('P4  急停（任務執行中）：mission state 要轉成 ABORTED')
+            running = rig.mission[-1] if rig.mission else None
+            sub('急停前 mission state = %s (預期 %d=EXECUTING)'
+                % (running[1] if running else None, ST.STATE_EXECUTING))
+            del rig.mower[:]
+            del rig.mission[:]
+            rig.set_mode(4)
+            rig.spin(2.5)
+            m_after = rig.mower[-1] if rig.mower else None
+            s_after = rig.mission[-1] if rig.mission else None
+            sub('急停後 /mower_status: mode=%s, stop_active=%s'
+                % (m_after[1] if m_after else None, m_after[2] if m_after else None))
+            sub('急停後 mission state = %s (預期 %d=ABORTED)'
+                % (s_after[1] if s_after else None, ST.STATE_ABORTED))
+            p4_ok = (running is not None and running[1] == ST.STATE_EXECUTING
+                     and m_after is not None and m_after[1] == 4 and m_after[2] is True
+                     and s_after is not None and s_after[1] == ST.STATE_ABORTED)
+            record('P', 'P4',
+                   '急停（任務執行中）：stop_active=true 且 mission state=ABORTED',
+                   'PASS' if p4_ok else 'FAIL',
+                   '急停前 state=%s, 急停後 mode=%s stop_active=%s state=%s'
+                   % (running[1] if running else None,
+                      m_after[1] if m_after else None,
+                      m_after[2] if m_after else None,
+                      s_after[1] if s_after else None))
+            rig.set_mode(2)
+            rig.spin(1.0)
+
+        # ---- P5 邊界合理性檢查 ----
+        hdr('P5  太小的邊界要被拒絕，而且不能覆蓋掉上一個有效邊界')
+        sub('背景：map_to_boundary 在建圖未完成時會送出很小的邊界 (報告 11.4)，')
+        sub('實測有 25% 的執行會在那個瞬間拿到 2~3 m² 的邊界而規劃失敗 (12.3)。')
+        rig.set_mode(2)
+        rig.publish_boundary(-1.5, -1.5, 2.5, seconds=2.0)      # 有效：5x5 = 25 m²
+        rig.spin(0.5)
+        rig.publish_boundary(-1.5, -1.5, 0.5, seconds=2.0)      # 太小：1x1 = 1 m²
+        rig.spin(1.0)
+        rejects = ctl.log_grep(r'拒絕邊界', 5)
+        sub('manager 的拒絕訊息 = %s' % (rejects[-1] if rejects else '(沒有)'))
+
+        # 拒絕訊息本身就帶著「被保留下來的那個邊界」的面積與頂點數，
+        # 那是「latest_boundary 沒有被小邊界覆蓋」最直接的證據。
+        #
+        # 【不要改用「切 mode 1 看 F2C 收到多大」來判定】：
+        # map_to_boundary 一直在從真實地圖算邊界並發布，到這個時候地圖已經
+        # 長得很大 (實測 184.95 m²)，那個邊界是合法的、而且比測試發的 25 m² 新，
+        # 本來就該贏。用它來判定會把「正常行為」判成失敗。
+        m_rej = re.search(
+            r'拒絕邊界：面積 ([\d.]+) m² < 門檻 ([\d.]+) m²，'
+            r'保留上一個有效邊界（面積 ([\d.]+) m²，頂點 (\d+) 個）',
+            rejects[-1] if rejects else '')
+        if m_rej:
+            sub('  被拒絕的面積 = %s m²，門檻 = %s m²' % (m_rej.group(1), m_rej.group(2)))
+            sub('  保留下來的邊界 = %s m²、%s 個頂點 (= 前一個有效邊界，沒有被覆蓋)'
+                % (m_rej.group(3), m_rej.group(4)))
+        kept_area = float(m_rej.group(3)) if m_rej else float('nan')
+        rejected_area = float(m_rej.group(1)) if m_rej else float('nan')
+        p5_ok = (m_rej is not None and rejected_area < 4.0
+                 and abs(kept_area - 25.0) < 0.5)
+        record('P', 'P5',
+               '太小的邊界被拒絕且 latest_boundary 沒有被覆蓋',
+               'PASS' if p5_ok else 'FAIL',
+               '拒絕 %.2f m²（門檻 %s）, 保留 %.2f m²/%s 頂點（預期 25.00）'
+               % (rejected_area, m_rej.group(2) if m_rej else '-',
+                  kept_area, m_rej.group(4) if m_rej else '-'))
+
+        # ---- P6 HMI 能不能正常起來 ----
+        hdr('P6  hmi_node 能在無頭環境啟動且不會 crash')
+        sub('GUI 的版面與互動沒辦法自動化測，但「一啟動就死」可以，')
+        sub('而且那是最常見的壞法 (import 錯、widget 用錯、Qt 版本不合)。')
+        sub('用 QT_QPA_PLATFORM=offscreen 在沒有畫面的環境跑 12 秒。')
+        # 用 env 前綴設 QT_QPA_PLATFORM，不必改 bg_start 的介面
+        hmi = bg_start('P_hmi', ['env', 'QT_QPA_PLATFORM=offscreen',
+                                 'ros2', 'run', 'mowerbot_hmi', 'hmi_node'])
+        time.sleep(12.0)
+        alive = hmi.alive()
+        tail = hmi.log_tail(25)
+        bad = [ln for ln in tail.splitlines()
+               if 'Traceback' in ln or 'ModuleNotFoundError' in ln]
+        sub('12 秒後行程還活著 = %s' % alive)
+        if bad:
+            print(tail)
+        record('P', 'P6', 'hmi_node 在無頭環境啟動 12 秒不會 crash',
+               'PASS' if (alive and not bad) else 'FAIL',
+               '存活=%s, log 裡有 Traceback=%s' % (alive, bool(bad)))
     finally:
         if rig is not None:
             rig.close()

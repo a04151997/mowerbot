@@ -6,6 +6,7 @@ from launch.actions import (DeclareLaunchArgument, GroupAction,
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import Node
 
 
 def generate_launch_description():
@@ -22,6 +23,7 @@ def generate_launch_description():
     world = LaunchConfiguration('world')
     gui = LaunchConfiguration('gui')
     rviz = LaunchConfiguration('rviz')
+    hmi = LaunchConfiguration('hmi')
     nav = LaunchConfiguration('nav')
     overlap_ratio = LaunchConfiguration('overlap_ratio')
 
@@ -59,6 +61,17 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(pkg_bringup, 'launch', 'navigation.launch.py')),
         launch_arguments={'use_sim_time': use_sim_time}.items()
+    )
+
+    # HMI：模式切換與狀態顯示的視窗。
+    # 它只依賴 /mower_status、/mission_status、/f2c_boundary 與
+    # change_mower_mode 服務，所以最後才起、起不來也不影響機器人本身。
+    hmi_node = Node(
+        package='mowerbot_hmi',
+        executable='hmi_node',
+        name='mower_hmi',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
     )
 
     rviz_launch = IncludeLaunchDescription(
@@ -115,6 +128,17 @@ def generate_launch_description():
         ]
     )
 
+    # HMI 最後起：這時 manager 已經在發 /mower_status，視窗一開就是有內容的。
+    # 早起也不會壞 (介面會顯示「與系統失去聯繫」)，只是看起來像出問題。
+    stage_hmi = TimerAction(
+        period=20.0,
+        condition=IfCondition(hmi),
+        actions=[
+            LogInfo(msg='[demo] t=20s 啟動 HMI 控制介面'),
+            hmi_node,
+        ]
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument(
             'use_sim_time',
@@ -150,6 +174,12 @@ def generate_launch_description():
             default_value='true',
             description='Start the Nav2 stack. Set false to run mapping only.'),
 
+        DeclareLaunchArgument(
+            'hmi',
+            default_value='true',
+            description='Start the HMI window (mode buttons + status). '
+                        'Set false for headless runs or when driving from the CLI.'),
+
         # 割草線重疊率，沿用 mower_control.launch.py 的預設值 0.4
         # (選定理由見 docs/simulation_results.md 4.6.5 節)。
         # 兩邊的預設值要一起改，不要只改一邊。
@@ -163,4 +193,5 @@ def generate_launch_description():
         stage_control,
         stage_nav,
         stage_rviz,
+        stage_hmi,
     ])

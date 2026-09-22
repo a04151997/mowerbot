@@ -41,6 +41,10 @@ graph TD
         P1["f2c_server（Fields2Cover 覆蓋路徑）"]
     end
 
+    subgraph 介面層["mowerbot_hmi"]
+        U1["hmi_node（PyQt5）<br/>模式切換 + 狀態顯示"]
+    end
+
     subgraph 底盤["mowerbot_bridge"]
         B1["teleop_node（搖桿 → 速度）"]
         B2["bridge_node（ROS ↔ 驅動板）"]
@@ -48,6 +52,8 @@ graph TD
         B4["odometry.py（里程計數學）"]
     end
 
+    U1 --> I1
+    U1 --> I3
     A1 --> I1
     A1 --> I2
     A2 --> I4
@@ -79,6 +85,8 @@ graph LR
     TEL -->|"/cmd_vel_joy"| MGR
     MGR -->|"/cmd_vel<br/>（唯一出口）"| CHASSIS["底盤<br/>模擬：diff_drive plugin<br/>實車：bridge_node"]
     CHASSIS --> ODO
+    MGR -->|"/mower_status<br/>/mission_status（5 Hz）"| HMI["hmi_node<br/>人機介面"]
+    HMI -->|"change_mower_mode"| MGR
 ```
 
 **這張圖最重要的一點：`/cmd_vel` 只有 `mower_manager` 一個發布者。**
@@ -195,13 +203,14 @@ graph LR
         L["Phase L 存圖與定位<br/>4 項"]
         N["Phase N Nav2 路徑跟隨<br/>6 項"]
         O["Phase O 障礙物容錯<br/>1 項"]
+        P["Phase P 狀態發布<br/>6 項"]
     end
     A --> C
     B --> C
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **34 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **40 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |
@@ -214,6 +223,7 @@ graph LR
 | L | 建圖、存圖、定位模式 | ✓ |
 | N | Nav2 生命週期、F2C 路徑、端到端覆蓋任務、remap、RTF、急停清佇列 | ✓ |
 | O | 臨時障礙物擋住割草線時跳過該段並繼續（固定用 `demo_lawn_obstacle.world`） | ✓ |
+| P | 狀態發布（`/mower_status`、`/mission_status`）、邊界防呆、HMI 無頭啟動 | ✓ |
 
 另有 17 項純 Python 的里程計單元測試（`mowerbot_bridge/test/test_odometry.py`），
 不需要 ROS，一秒內跑完：
