@@ -5,11 +5,12 @@ from action_msgs.msg import GoalStatus
 from rclpy.duration import Duration
 from rclpy.time import Time
 from geometry_msgs.msg import PolygonStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path
 from mowerbot_interfaces.srv import GenerateCoveragePath
 from mowerbot_interfaces.msg import ObstaclePolygons, MowerStatus, MissionStatus
 from rclpy.action import ActionClient
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav2_msgs.action import FollowPath
 import rclpy
 from rclpy.node import Node
@@ -48,6 +49,7 @@ class MowerManager(Node):
         # 只是以前沒有發出去，GUI 因此無從得知任務跑到哪裡。
         self._mission_state = MissionStatus.STATE_IDLE
         self._mission_total = 0        # 任務開始時的佇列總段數 (任務結束後仍保留，給畫面顯示)
+        self._lead_in_hist = {}        # 跑道長度 -> 幾條割草線用了這個長度
         self._current_label = ''
         self._result_future = None
 
@@ -160,6 +162,19 @@ class MowerManager(Node):
         # 沒有收到訊息時維持空 list，送給 F2C 的 obstacles 就是空的，
         # 行為與階段 10 完全相同。
         self.latest_obstacles = []
+        # 訂閱 local costmap，只為了在任務失敗時能報出「那個點的 cost 是多少」。
+        # 不拿它做任何判斷 —— 判斷是 controller_server 的事，
+        # 這裡只是把證據記下來，免得每次都要重跑一遍才知道發生什麼事。
+        # Nav2 的 costmap publisher 是 transient local 的，QoS 要對得上才收得到。
+        costmap_qos = QoSProfile(
+            depth=1,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=QoSReliabilityPolicy.RELIABLE)
+        self.local_costmap = None
+        self.costmap_sub = self.create_subscription(
+            OccupancyGrid, '/local_costmap/costmap',
+            self.costmap_cb, costmap_qos)
+
         self.obstacles_sub = self.create_subscription(
             ObstaclePolygons, '/f2c_obstacles', self.obstacles_cb, 10)
 
@@ -262,6 +277,41 @@ class MowerManager(Node):
 
         self.latest_boundary = msg.polygon
         self.latest_boundary_area = area
+
+    def costmap_cb(self, msg):
+        self.local_costmap = msg
+
+    def costmap_cost_at(self, x, y):
+        """回傳 (x, y) 在 local costmap 上的值，拿不到就回傳 None。
+
+        Nav2 發布的 OccupancyGrid 是換算過的：0~100，其中 99 對應 253
+        (INSCRIBED，車體一定碰到)、100 對應 254 (LETHAL)、-1 是未知。
+        """
+        cm = self.local_costmap
+        if cm is None:
+            return None
+        res = cm.info.resolution
+        if res <= 0.0:
+            return None
+        col = int((x - cm.info.origin.position.x) / res)
+        row = int((y - cm.info.origin.position.y) / res)
+        if not (0 <= col < cm.info.width and 0 <= row < cm.info.height):
+            return None
+        return int(cm.data[row * cm.info.width + col])
+
+    @staticmethod
+    def describe_cost(cost):
+        if cost is None:
+            return '(不在 local costmap 範圍內或還沒收到 costmap)'
+        if cost < 0:
+            return 'cost=%d (未知區域)' % cost
+        if cost >= 100:
+            return 'cost=%d (LETHAL，等同障礙物本體)' % cost
+        if cost >= 99:
+            return 'cost=%d (INSCRIBED，車體一定碰到)' % cost
+        if cost > 0:
+            return 'cost=%d (膨脹層內)' % cost
+        return 'cost=0 (自由)'
 
     def obstacles_cb(self, msg):
         """隨時更新作業區內部的障礙物輪廓"""
@@ -548,6 +598,20 @@ class MowerManager(Node):
     # 只是拿它當判斷依據)。
     LEAD_IN_OBSTACLE_CLEARANCE = 0.45
 
+    # 跑道與「邊界」之間至少要留車體內切半徑。footprint 是 0.95 x 0.68，
+    # 半寬 0.34 m —— 比這個近，車體一定壓到邊界外面的東西。
+    # 用 0.34 而不是 0.45：邊界外側是牆，0.34 保證車體不重疊；
+    # 再往外推會把可割面積吃掉太多。
+    LEAD_IN_BOUNDARY_CLEARANCE = 0.34
+
+    # 跑道長度的退讓階梯。不可行時依序縮短，取第一個可行的；全部不行就不加跑道。
+    # 不是「有或沒有」二選一：0.3 m 的跑道仍然能收斂一部分橫向誤差，
+    # 比完全沒有好。
+    LEAD_IN_FALLBACKS = (0.3, 0.2, 0.0)
+
+    # 檢查跑道時沿線取樣的間距
+    LEAD_IN_CHECK_SPACING = 0.1
+
     @staticmethod
     def _point_in_polygon(x, y, pts):
         inside = False
@@ -574,24 +638,70 @@ class MowerManager(Node):
             best = min(best, math.hypot(x - (ax + t * vx), y - (ay + t * vy)))
         return best
 
-    def lead_in_blocked(self, x, y):
-        """跑道起點是不是落在障礙物裡、或離障礙物太近。
+    def lead_in_point_unsafe(self, x, y):
+        """這個點適不適合當跑道的一部分？不安全就回傳原因字串，安全回傳 None。
 
-        作業區內部有障礙物時，被障礙物切成兩段的割草線，後半段的起點距離
-        障礙物剛好是 F2C 的地頭寬度 (0.5 m)，再往後延伸 0.5 m 的跑道起點
-        就正好壓在障礙物邊緣，整段跑道都在 costmap 的膨脹層裡，
-        控制器會走不動。這種情況下寧可不要跑道。
+        檢查兩件事 —— **邊界與內部障礙物都要看**：
+
+        1. 邊界：點必須落在邊界多邊形**裡面**，而且離邊界至少
+           LEAD_IN_BOUNDARY_CLEARANCE (車體內切半徑 0.34 m)。
+           跑道是沿著割草線往**反方向**延伸的，而 F2C 的地頭本來就貼著邊界，
+           所以延伸出去的起點很容易落到邊界外。實測 demo_lawn 上
+           割草線 2/36 的跑道起點 x=5.51 直接落在牆體 (5.50~5.70) 裡面，
+           controller_server 立刻回 ABORTED。
+        2. 內部障礙物：離障礙物至少 LEAD_IN_OBSTACLE_CLEARANCE (0.45 m，
+           = costmap 的 inflation_radius)。
+
+        舊版的 lead_in_blocked() 只看障礙物、不看邊界，
+        名字卻讓人以為它把「跑道能不能走」都檢查過了。
         """
         for poly in self.latest_obstacles:
             pts = [(p.x, p.y) for p in poly.points]
             if len(pts) < 3:
                 continue
             if self._point_in_polygon(x, y, pts):
-                return True
+                return '落在內部障礙物裡'
             if self._point_polygon_distance(x, y, pts) < \
                     self.LEAD_IN_OBSTACLE_CLEARANCE:
-                return True
-        return False
+                return ('離內部障礙物只有 %.2f m'
+                        % self._point_polygon_distance(x, y, pts))
+
+        if self.latest_boundary is not None:
+            bpts = [(p.x, p.y) for p in self.latest_boundary.points]
+            if len(bpts) >= 3:
+                if not self._point_in_polygon(x, y, bpts):
+                    return '落在邊界外面'
+                d = self._point_polygon_distance(x, y, bpts)
+                if d < self.LEAD_IN_BOUNDARY_CLEARANCE:
+                    return '離邊界只有 %.2f m (需要 %.2f m)' % (
+                        d, self.LEAD_IN_BOUNDARY_CLEARANCE)
+        return None
+
+    def lead_in_first_feasible(self, ax, ay, ux, uy, index, total):
+        """從設定的長度開始往下試，回傳第一個「整條都安全」的跑道長度。
+
+        回傳 (長度, 不可行的原因) —— 長度 0.0 代表不加跑道。
+        整條都要檢查，不能只看起點：起點安全但中段壓在牆上的情況是存在的
+        (邊界是凹多邊形時)。
+        """
+        candidates = [self.lead_in_length] + [
+            c for c in self.LEAD_IN_FALLBACKS if c < self.lead_in_length]
+        reason = None
+        for length in candidates:
+            if length <= 0.0:
+                return 0.0, reason
+            n = max(1, int(round(length / self.LEAD_IN_CHECK_SPACING)))
+            bad = None
+            for k in range(n + 1):
+                d = length * k / n
+                why = self.lead_in_point_unsafe(ax - d * ux, ay - d * uy)
+                if why is not None:
+                    bad = '%s (距割草線起點 %.2f m 處)' % (why, d)
+                    break
+            if bad is None:
+                return length, reason
+            reason = bad
+        return 0.0, reason
 
     def build_lead_in(self, swath, index, total):
         """在割草線起點「往後」延伸一段共線的跑道，回傳 跑道 + 割草線 的完整路徑。
@@ -623,15 +733,22 @@ class MowerManager(Node):
         sx = a.x - self.lead_in_length * ux
         sy = a.y - self.lead_in_length * uy
 
-        if self.lead_in_blocked(sx, sy):
+        length, why = self.lead_in_first_feasible(a.x, a.y, ux, uy, index, total)
+        self._lead_in_hist[length] = self._lead_in_hist.get(length, 0) + 1
+        if length <= 0.0:
             self.get_logger().info(
-                f'🛬 割草線 {index}/{total} 不加跑道：跑道起點 ({sx:.2f}, {sy:.2f}) '
-                f'落在內部障礙物裡或離它不到 '
-                f'{self.LEAD_IN_OBSTACLE_CLEARANCE} m')
+                f'🛬 割草線 {index}/{total} 不加跑道：'
+                f'{self.lead_in_length:.2f}/0.30/0.20 m 都不可行 —— {why}')
             return swath
+        if length < self.lead_in_length:
+            self.get_logger().info(
+                f'🛬 割草線 {index}/{total} 跑道縮短為 {length:.2f} m '
+                f'(原 {self.lead_in_length:.2f} m 不可行：{why})')
+            sx = a.x - length * ux
+            sy = a.y - length * uy
 
         num_segments = max(
-            1, int(round(self.lead_in_length / self.LEAD_IN_WAYPOINT_SPACING)))
+            1, int(round(length / self.LEAD_IN_WAYPOINT_SPACING)))
 
         out = Path()
         out.header.frame_id = swath.header.frame_id
@@ -657,7 +774,7 @@ class MowerManager(Node):
 
         # 這個分界之後接刀盤控制時會用到：跑道段刀盤要關，割草段才打開。
         self.get_logger().info(
-            f'🛬 割草線 {index}/{total} 加跑道：長度 {self.lead_in_length:.2f} m，'
+            f'🛬 割草線 {index}/{total} 加跑道：長度 {length:.2f} m，'
             f'起點 ({sx:.2f}, {sy:.2f}) -> A ({a.x:.2f}, {a.y:.2f})；'
             f'航點 0..{n_lead - 1} 為跑道段，{n_lead}..{len(out.poses) - 1} 為割草段')
         return out
@@ -794,8 +911,38 @@ class MowerManager(Node):
                 f'   割草線 {idx + 1}: {len(sw.poses)} 個航點, 長度 {length:.2f} m')
         return swaths
 
+    def maybe_insert_approach(self):
+        """送出目前這一段之前，先看車子離它的起點多遠；太遠就插一段 approach。
+
+        **任務開頭、環繞結束、跳過某一段之後，全部走這一條路徑。**
+        以前這件事分散在三個地方，而「跳過之後」那個地方根本沒有寫，
+        於是跳過一段之後送出的下一段起點常常落在 local costmap 之外，
+        controller_server 直接回 0 poses 再 ABORTED，
+        skip-and-continue 因此保證會連續失敗到門檻。
+
+        回傳 True 代表有插入。
+        """
+        if self._current_swath_idx >= len(self._swath_queue):
+            return False
+        path, label = self._swath_queue[self._current_swath_idx]
+        if label == 'approach':
+            return False            # 已經是 approach，不要再包一層
+        robot_xy = self.get_robot_pose_in_map()
+        if robot_xy is None:
+            self.get_logger().warn(
+                '⚠️ 查不到車子位置，這一段直接送出，不補 approach')
+            return False
+        approach = self.build_approach_path(robot_xy, path)
+        if approach is None:
+            return False            # 夠近，不需要 approach
+        self._swath_queue.insert(self._current_swath_idx, (approach, 'approach'))
+        # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
+        self._mission_total = len(self._swath_queue)
+        return True
+
     def send_next_swath(self):
         """送出佇列裡的下一個任務 (approach 或割草線)"""
+        self.maybe_insert_approach()
         total = len(self._swath_queue)
         if self._current_swath_idx >= total:
             self.log_mission_summary()
@@ -905,10 +1052,23 @@ class MowerManager(Node):
             f'連續失敗 {self._consecutive_failures}/{self.max_consecutive_failures} 次')
 
         if self._consecutive_failures >= self.max_consecutive_failures:
+            # 【只列事實，不要猜原因】
+            # 舊版印的是「(定位跑掉、Nav2 異常、或整片區域無法通行)」——
+            # 那是猜的，而且實測那次的真正原因 (跑道起點落在牆體裡、
+            # 下一段起點在 local costmap 之外) 三個都不在列舉裡，
+            # 只會把看 log 的人帶去查錯的方向。
             self.get_logger().error(
-                f'🛑 連續 {self._consecutive_failures} 段都失敗，'
-                f'判定為系統性問題（定位跑掉、Nav2 異常、或整片區域無法通行），'
-                f'停止整個覆蓋任務。單一障礙物不會造成連續失敗。')
+                f'🛑 連續 {self._consecutive_failures} 段失敗，'
+                f'達到 max_consecutive_failures={self.max_consecutive_failures}，'
+                f'停止整個覆蓋任務。這 {self._consecutive_failures} 段分別是：')
+            for label, start, reason in self._skipped[-self._consecutive_failures:]:
+                if start is None:
+                    self.get_logger().error(f'   {label}：起點未知，status={reason}')
+                    continue
+                cost = self.costmap_cost_at(start[0], start[1])
+                self.get_logger().error(
+                    f'   {label}：起點 ({start[0]:.2f}, {start[1]:.2f})，'
+                    f'status={reason}，起點 {self.describe_cost(cost)}')
             self.log_mission_summary(ended_early=True)
             self.set_mission_state(MissionStatus.STATE_ABORTED)
             self.clear_swath_queue()
@@ -1004,30 +1164,31 @@ class MowerManager(Node):
                 total = len(swaths)
                 # 每條割草線前面接上共線的跑道，讓車子掉完頭先收斂橫向誤差，
                 # 進入真正的割草段時已經貼在線上。
+                # 跑道不可行 (會壓到邊界或障礙物) 時會自動縮短，見 build_lead_in。
+                self._lead_in_hist = {}
                 swaths = [self.build_lead_in(sw, i + 1, total)
                           for i, sw in enumerate(swaths)]
+                hist = ', '.join(
+                    '%.2f m x %d 條' % (k, v)
+                    for k, v in sorted(self._lead_in_hist.items(), reverse=True))
+                self.get_logger().info(f'🛬 跑道長度分布：{hist}')
                 # 周邊環繞排在割草線前面：先把作業區邊緣繞一圈再開始弓字形。
                 # _swath_total 仍然只算割草線，「共完成 N 條割草線」的意義不變。
                 n_edges = len(perimeter_edges)
                 queue = [(e, f'周邊環繞 {i + 1}/{n_edges}')
                          for i, e in enumerate(perimeter_edges)]
-                # 環繞是一個封閉的圈，走完會回到它的起點，那裡離第 1 條割草線的
-                # 跑道起點可能有好幾公尺。不補一段銜接就直接送割草線的話，
-                # 車子要自己從幾公尺外切進路徑，實測 DWB 會在 23 秒後
-                # 以 Failed to make progress 中止整個任務。
-                if perimeter_edges:
-                    end = perimeter_edges[-1].poses[-1].pose.position
-                    link = self.build_approach_path(
-                        (end.x, end.y), swaths[0], label='銜接段')
-                    if link is not None:
-                        queue.append((link, '銜接段'))
                 queue += [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
-                # swaths[0] 已經是「跑道 + 第 1 條割草線」，所以 approach 的終點
-                # 自然就是跑道起點而不是 A，所有割草線的處理方式一致。
-                # 有環繞時 approach 的終點改成環繞的第一段起點。
-                approach = self.build_approach_path(robot_xy, queue[0][0])
-                if approach is not None:
-                    queue.insert(0, (approach, 'approach'))
+                # 【不在這裡插 approach】
+                # 「車子離下一段的起點太遠就先開過去」這件事，以前在三個地方
+                # 各寫一份 (任務開頭的 approach、環繞結束的銜接段、
+                # 以及跳過某一段之後 —— 最後這個根本忘了寫)。
+                # 忘了寫的後果是：跳過一段之後直接送下一段，而下一段的起點
+                # 常常在 5x5 m 的 local costmap 之外，controller_server 立刻
+                # 回「Resulting plan has 0 poses in it」再 ABORTED ——
+                # skip-and-continue 因此在結構上保證自己會撞到連續失敗門檻。
+                # 現在統一由 send_next_swath() 呼叫 maybe_insert_approach()，
+                # 正常推進、跳過之後、任務開頭全部走同一條路徑。
+                _ = robot_xy
 
                 self._swath_queue = queue
                 self._swath_total = total

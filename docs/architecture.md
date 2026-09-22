@@ -205,13 +205,14 @@ graph LR
         N["Phase N Nav2 路徑跟隨<br/>6 項"]
         O["Phase O 障礙物容錯<br/>1 項"]
         P["Phase P 狀態發布 +<br/>模式仲裁 + 手把<br/>10 項"]
+        Q["Phase Q 真實地圖<br/>路徑可通行性<br/>1 項"]
     end
     A --> C
     B --> C
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **44 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **46 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |
@@ -225,6 +226,7 @@ graph LR
 | N | Nav2 生命週期、F2C 路徑、端到端覆蓋任務、remap、RTF、急停清佇列 | ✓ |
 | O | 臨時障礙物擋住割草線時跳過該段並繼續（固定用 `demo_lawn_obstacle.world`） | ✓ |
 | P | 狀態發布（`/mower_status`、`/mission_status`、`/joy_status`）、邊界防呆、HMI 無頭啟動、五個模式的急停鍵與手把仲裁 | ✓ |
+| Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑可通行性（規劃出撞牆的路徑就擋下來） | ✓ |
 
 另有 17 項純 Python 的里程計單元測試（`mowerbot_bridge/test/test_odometry.py`），
 不需要 ROS，一秒內跑完：

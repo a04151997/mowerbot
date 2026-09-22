@@ -11,6 +11,27 @@ import cv2
 
 class MapToBoundaryNode(Node):
 
+    # ---- 邊界簡化的兩個參數 (階段 20，數字是量出來的不是喬出來的) ----
+    #
+    # 【為什麼不用 approxPolyDP(epsilon = 1% 弧長)】
+    # 那個寫法沒有方向性保證：它會把凸出來的角截彎取直，產生一個比真實自由
+    # 區域「更大」的多邊形，下游 (地頭、跑道、周邊環繞) 全部的餘裕計算因此
+    # 失真而且沒有人會發現。
+    # 用 demo_lawn 的真實 SLAM 地圖實測：原始輪廓 1589 個點簡化成 13 個點之後，
+    # 最大向外偏差 **1.250 m**，而且簡化後的多邊形直接壓在 wall_east_south
+    # 上面 (離真牆 0.000 m)。割草線 2/36 的跑道起點 x=5.51 落在牆體
+    # 5.50~5.70 之內，就是這樣來的。
+    #
+    # 【改法】先把外輪廓填實、往內腐蝕，再用一個小的絕對 epsilon 簡化。
+    # 腐蝕的方向性是數學保證的 (只會往內)，approxPolyDP 沒有這個保證。
+    #
+    # 絕對 epsilon = 0.05 m (1 個 costmap cell)：實測最大向外偏差 0.049 m，
+    # 也就是「恰好一個 cell」，與 Douglas-Peucker 的容差定義一致。
+    # 腐蝕 2 cell = 0.10 m：要蓋掉上面那 0.049 m 還留一個 cell 的餘裕。
+    # 實測腐蝕 1 cell 時偏差 0.005 m (還沒歸零)，2 cell 時 0.000 m。
+    BOUNDARY_EPSILON_M = 0.05
+    BOUNDARY_ERODE_CELLS = 2
+
     # 小於這個面積的洞不當成障礙物。理由：佔據網格上零星的未知格 (-1) 與
     # 雷射打出來的小雜訊都會變成洞，全部送給 F2C 只會讓割草線被切得很碎。
     # 0.09 m² = 0.3 m x 0.3 m，比車體 (0.95 x 0.68) 小得多，
@@ -80,10 +101,33 @@ class MapToBoundaryNode(Node):
             return
         largest_idx = max(outer_idx, key=lambda i: cv2.contourArea(contours[i]))
         largest_contour = contours[largest_idx]
-        
-        # 4. 多邊形近似 (簡化頂點數量)
-        epsilon = 0.01 * cv2.arcLength(largest_contour, True)
-        approx_polygon = cv2.approxPolyDP(largest_contour, epsilon, True)
+
+        # 4. 往內腐蝕再簡化，保證輸出的多邊形是真實自由區域的「內縮子集」
+        #
+        # 先把外輪廓填實再腐蝕，不要直接腐蝕自由區域的遮罩：
+        # 建圖中的地圖內部散布著未知格，直接腐蝕會把區域打碎，
+        # 最大連通塊會從 123.9 m² 掉到 84.3 m² (實測)。
+        # 內部的洞本來就由下面的 RETR_CCOMP 另外當成障礙物處理，
+        # 填實只影響「外圈邊界」怎麼畫。
+        solid = np.zeros_like(padded_img)
+        cv2.drawContours(solid, [largest_contour], -1, 255, cv2.FILLED)
+        if self.BOUNDARY_ERODE_CELLS > 0:
+            ksize = 2 * self.BOUNDARY_ERODE_CELLS + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            solid = cv2.erode(solid, kernel)
+        eroded, _hier = cv2.findContours(
+            solid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not eroded:
+            self.get_logger().warn(
+                '⚠️ 腐蝕 %.2f m 之後沒有剩下任何區域，地圖可能還太小，這次不發布邊界。'
+                % (self.BOUNDARY_ERODE_CELLS * resolution))
+            return
+        inner_contour = max(eroded, key=cv2.contourArea)
+
+        # 絕對 epsilon (公尺) 而不是弧長的百分比：
+        # 百分比會讓「場地越大、允許的偏差越大」，那正好與安全需求相反。
+        epsilon = self.BOUNDARY_EPSILON_M / resolution
+        approx_polygon = cv2.approxPolyDP(inner_contour, epsilon, True)
         
         # 5. 封裝成 ROS 訊息並轉換座標系
         poly_msg = PolygonStamped()
@@ -106,7 +150,11 @@ class MapToBoundaryNode(Node):
         self.polygon_pub.publish(poly_msg)
         
         # 終端機 Debug 訊號二：證明邊界順利算完並送出
-        self.get_logger().info(f'🎉 邊界提取成功！共化簡出 {len(approx_polygon)} 個多邊形頂點，已發布至 /f2c_boundary')
+        self.get_logger().info(
+            f'🎉 邊界提取成功！共化簡出 {len(approx_polygon)} 個多邊形頂點，'
+            f'已發布至 /f2c_boundary '
+            f'(往內腐蝕 {self.BOUNDARY_ERODE_CELLS * resolution:.2f} m、'
+            f'簡化容差 {self.BOUNDARY_EPSILON_M:.2f} m)')
 
         # 6. 內部障礙物：最大外輪廓底下的每一個洞 (階段 11)
         obs_msg = ObstaclePolygons()

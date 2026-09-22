@@ -157,6 +157,7 @@ PHASES = [
     ('N', 'Nav2 路徑跟隨'),
     ('O', '障礙物容錯'),
     ('P', '狀態發布'),
+    ('Q', '真實地圖規劃'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
 
@@ -372,6 +373,32 @@ def named_pids(name):
     excl = ancestor_pids()
     return [int(t) for t in out.split()
             if t.strip().isdigit() and int(t) not in excl]
+
+
+def stop_joy_node():
+    """停掉本 workspace 的 joy_node。
+
+    【為什麼測試要動它】
+    機器上接著實體手把時，joy_node 會以 autorepeat_rate (20 Hz) 持續發布
+    真實的 /joy，teleop 看到「沒按 deadman」就會持續往 /cmd_vel_joy 送零速度。
+    那是**正確的行為**，但它會與測試發出的合成 /joy 與合成速度指令互相競爭，
+    讓 Phase L / O / P / Q 這些靠合成手把訊息的項目變成擲骰子
+    (實測：手把插上之後 L4 與 P10 就開始隨機失敗，拔掉之前一直是綠的)。
+
+    停掉之後 /joy 上只剩測試自己一個發布者，被測的仲裁邏輯完全沒有被改動。
+    Phase C 要檢查 joy_node 在不在，所以那裡不呼叫這個函式。
+    """
+    pids = [pid for pid, _cmd in workspace_pids(contains='joy/joy_node')]
+    if not pids:
+        return
+    sub('停掉 joy_node pid=%s（實體手把會持續發 /joy，與測試的合成訊息互搶）'
+        % ','.join(str(p) for p in pids))
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    time.sleep(1.0)
 
 
 def sweep():
@@ -2713,6 +2740,7 @@ def phase_o():
     ctl = bg_start('O_mower_control', mower_control_cmd())
     sub('等待 mower_control 穩定 (20 秒)...')
     time.sleep(20)
+    stop_joy_node()
     nav = bg_start('O_navigation',
                    ['ros2', 'launch', 'mowerbot_bringup', 'navigation.launch.py'])
 
@@ -2809,6 +2837,30 @@ def phase_o():
             early_ok = int(systemic[-1]) >= int(failcounts[-1][1]) if failcounts else False
         else:
             early_ok = True
+        # ---- O2：跳過之後要重新產生 approach ----
+        # 以前跳過一段之後直接送下一段，而下一段的起點常落在 5x5 m 的
+        # local costmap 之外，controller_server 立刻回
+        # 「Resulting plan has 0 poses in it」再 ABORTED ——
+        # skip-and-continue 因此在結構上保證自己會撞到連續失敗門檻。
+        zero_poses = len(nav.log_grep(r'Resulting plan has 0 poses', 200))
+        mgr_lines = ctl.log_grep(r'跳過此段|送出任務 \[approach\]', 300)
+        first_skip = next((i for i, ln in enumerate(mgr_lines)
+                           if '跳過此段' in ln), None)
+        approach_after_skip = 0
+        if first_skip is not None:
+            approach_after_skip = sum(
+                1 for ln in mgr_lines[first_skip:] if '送出任務 [approach]' in ln)
+        print('')
+        sub('controller 的「Resulting plan has 0 poses」= %d 次 (預期 0)' % zero_poses)
+        sub('第一次跳過之後補送的 approach = %d 段' % approach_after_skip)
+        o2_ok = (zero_poses == 0
+                 and (n_skip == 0 or approach_after_skip >= 1))
+        record('O', 'O2',
+               '跳過某一段之後會重新產生 approach，不會因為 0 poses 而失敗',
+               'PASS' if o2_ok else 'FAIL',
+               '0 poses 次數=%d (預期 0), 跳過後補的 approach=%d 段, 跳過=%d 段'
+               % (zero_poses, approach_after_skip, n_skip))
+
         o_ok = ended and n_skip >= 1 and coords_ok and early_ok
         record('O', 'O1',
                '割草線被臨時障礙物擋住時：跳過該段、繼續執行、並在摘要列出座標',
@@ -2933,6 +2985,7 @@ def phase_p():
     ctl = bg_start('P_mower_control', mower_control_cmd())
     sub('等待 mower_control 穩定 (20 秒)...')
     time.sleep(20)
+    stop_joy_node()
     nav = bg_start('P_navigation',
                    ['ros2', 'launch', 'mowerbot_bringup', 'navigation.launch.py'])
 
@@ -3241,6 +3294,276 @@ def phase_p():
 
 
 # --------------------------------------------------------------------------
+# 6.47 Phase Q：真實地圖 -> 邊界 -> F2C -> 路徑可通行性
+#
+# 【為什麼需要這個 Phase】
+# 其餘所有 Phase 的邊界都是測試程式自己發布的理想多邊形，
+# 所以「map_to_boundary 產生的多邊形比真實自由區域大」這一類缺陷
+# 永遠測不到 —— 44/44 全綠、真跑一次卻在外圈結束後就掛掉，原因就在這裡。
+#
+# 這個 Phase 走完整條真實鏈路：
+#   開車繞場 -> SLAM 建圖 -> map_to_boundary 萃取邊界 -> F2C 規劃
+#   -> 檢查每一段的起點與整條路徑在 costmap 上的 cost
+# 不需要真的把路徑跑完：它要攔下的是「規劃出來就不可通行的路徑」，
+# 在車子動之前就攔下來，這是最便宜的一道檢查。
+# --------------------------------------------------------------------------
+Q_WORLD = 'demo_lawn.world'
+Q_INSCRIBED = 0.34        # 車體內切半徑 (footprint 0.95 x 0.68)
+Q_INFLATION = 0.45        # 與 nav2_params.yaml 的 inflation_radius 一致
+RE_Q_LEADIN = re.compile(
+    r'割草線 (\d+)/(\d+) 加跑道：長度 ([\d.]+) m，起點 \(([-\d.]+), ([-\d.]+)\)')
+RE_Q_LEADIN_SHORT = re.compile(r'割草線 (\d+)/(\d+) 跑道縮短為 ([\d.]+) m')
+RE_Q_LEADIN_NONE = re.compile(r'割草線 (\d+)/(\d+) 不加跑道')
+RE_Q_HIST = re.compile(r'跑道長度分布：(.+)')
+RE_Q_BOUNDARY = re.compile(r'邊界提取成功！共化簡出 (\d+) 個多邊形頂點')
+
+
+def phase_q():
+    hdr('Phase Q  真實地圖 -> 邊界 -> F2C -> 路徑可通行性')
+    sub('其餘 Phase 用的是測試自己發的理想邊界，這一項用真實 SLAM 地圖，')
+    sub('目的是攔下「規劃出來就撞牆」的路徑 —— 在車子動之前。')
+
+    gz = bg_start('Q_gazebo',
+                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py',
+                   'gui:=false', 'world:=%s' % Q_WORLD])
+    sub('等待 Gazebo 起來 (18 秒)...')
+    time.sleep(18)
+    ctl = bg_start('Q_mower_control', mower_control_cmd())
+    sub('等待 mower_control 穩定 (20 秒)...')
+    time.sleep(20)
+    stop_joy_node()
+
+    rig = None
+    try:
+        rig = MapRig()
+        if not rig.wait_service(20.0):
+            record('Q', 'Q1', '真實地圖規劃出的路徑可通行', 'SKIP',
+                   'change_mower_mode 沒上線')
+            return
+
+        # ---- 1. 開車繞一圈把地圖建起來 ----
+        sub('切 mode 2，開車繞一個 6 m 見方的方形把整片草坪掃進來...')
+        rig.set_mode(2)
+        rig.drive_square(side_seconds=12.0, turn_seconds=2.6)
+        rig.spin(3.0)
+
+        grid = rig.wait_map(20.0)
+        if grid is None:
+            record('Q', 'Q1', '真實地圖規劃出的路徑可通行', 'SKIP', '沒有收到 /map')
+            return
+        free_m2 = grid['free_cells'] * grid['res'] ** 2
+        sub('地圖 %dx%d，解析度 %.3f，自由格 %d (%.1f m²)'
+            % (grid['w'], grid['h'], grid['res'], grid['free_cells'], free_m2))
+
+        bnd = rig.wait_boundary(20.0)
+        if bnd is None:
+            record('Q', 'Q1', '真實地圖規劃出的路徑可通行', 'SKIP',
+                   '沒有收到 /f2c_boundary')
+            return
+        sub('map_to_boundary 萃取的邊界：%d 個頂點，面積 %.2f m²'
+            % (len(bnd), polygon_area(bnd)))
+
+        # ---- 2. 讓 manager 用這個邊界規劃 (mode 1) ----
+        sub('切 mode 1 讓 manager 規劃（沒有啟動 Nav2，所以只會規劃不會開走）')
+        rig.set_mode(1)
+        t0 = time.time()
+        path = None
+        while time.time() - t0 < 60.0:
+            rig.spin(0.5)
+            if rig.f2c_path:
+                path = rig.f2c_path[-1]
+                break
+        rig.set_mode(2)
+        if path is None:
+            print(ctl.log_tail(30))
+            record('Q', 'Q1', '真實地圖規劃出的路徑可通行', 'FAIL',
+                   '60 秒內沒有收到 /f2c_path，規劃失敗')
+            return
+        sub('F2C 路徑：%d 個航點' % len(path))
+
+        # ---- 3. 用同一張地圖重建 costmap 的 inflation ----
+        # Nav2 的 local costmap 是 5x5 m 的滾動視窗，沒辦法拿來檢查 40 m 的路徑，
+        # 所以這裡用同一張 /map 與同一組參數 (inscribed 0.34、inflation 0.45)
+        # 重建等效的距離場。這是重建不是 Nav2 的實際 costmap，但輸入與參數相同。
+        dist = rig.distance_field(grid)
+        sub('已重建距離場 (每一格離最近佔據格的距離)')
+
+        def check(points, what):
+            worst = (9e9, None)
+            bad = []
+            for (x, y) in points:
+                d = rig.lookup(dist, grid, x, y)
+                if d is None:
+                    continue
+                if d < worst[0]:
+                    worst = (d, (x, y))
+                if d < Q_INSCRIBED:
+                    bad.append(((x, y), d))
+            sub('%-22s 檢查 %d 點，最小淨空 %.3f m 於 (%.2f, %.2f)，'
+                'cost >= INSCRIBED 的有 %d 點'
+                % (what, len(points), worst[0],
+                   worst[1][0] if worst[1] else float('nan'),
+                   worst[1][1] if worst[1] else float('nan'), len(bad)))
+            for (pt, d) in bad[:5]:
+                print('        (%.2f, %.2f) 淨空 %.3f m < %.2f m'
+                      % (pt[0], pt[1], d, Q_INSCRIBED))
+            return worst[0], len(bad)
+
+        # ---- 4. 檢查整條 F2C 路徑 ----
+        path_min, path_bad = check(path, 'F2C 路徑全部航點')
+
+        # ---- 5. 檢查每一段的起點 (含跑道) ----
+        txt = '\n'.join(ctl.log_grep(r'加跑道|跑道縮短|不加跑道|跑道長度分布', 300))
+        leadins = [(float(m[3]), float(m[4]))
+                   for m in RE_Q_LEADIN.findall(txt)]
+        n_short = len(RE_Q_LEADIN_SHORT.findall(txt))
+        n_none = len(RE_Q_LEADIN_NONE.findall(txt))
+        hist = RE_Q_HIST.findall(txt)
+        sub('跑道：%d 條有跑道、%d 條被縮短、%d 條不加跑道'
+            % (len(leadins), n_short, n_none))
+        if hist:
+            sub('跑道長度分布：%s' % hist[-1])
+        lead_min, lead_bad = (float('nan'), 0)
+        if leadins:
+            lead_min, lead_bad = check(leadins, '每條割草線的跑道起點')
+
+        q_ok = (path_bad == 0 and lead_bad == 0)
+        record('Q', 'Q1',
+               '真實地圖規劃出的路徑：所有航點與跑道起點的 cost < INSCRIBED',
+               'PASS' if q_ok else 'FAIL',
+               '路徑最小淨空 %.3f m (不合格 %d 點)，跑道起點最小淨空 %s m (不合格 %d 點)，'
+               '邊界 %d 頂點/%.1f m²'
+               % (path_min, path_bad,
+                  ('%.3f' % lead_min) if lead_min == lead_min else 'n/a',
+                  lead_bad, len(bnd), polygon_area(bnd)))
+    finally:
+        if rig is not None:
+            rig.close()
+        _ = gz
+
+
+def polygon_area(pts):
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    acc = 0.0
+    for i in range(n):
+        a, b = pts[i], pts[(i + 1) % n]
+        acc += a[0] * b[1] - b[0] * a[1]
+    return abs(acc) * 0.5
+
+
+class MapRig(object):
+    """Phase Q 的夾具：開車、收 /map 與 /f2c_boundary、收 /f2c_path"""
+
+    def __init__(self):
+        import rclpy
+        import numpy as np
+        from rclpy.node import Node
+        from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+        from nav_msgs.msg import OccupancyGrid, Path
+        from geometry_msgs.msg import Twist, PolygonStamped
+        from mowerbot_interfaces.srv import SetDriveMode
+
+        rclpy.init()
+        self.rclpy = rclpy
+        self.np = np
+        self.node = Node('smoke_q')
+        self.maps = []
+        self.boundaries = []
+        self.f2c_path = []
+        map_qos = QoSProfile(depth=1,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             reliability=ReliabilityPolicy.RELIABLE)
+        self.node.create_subscription(OccupancyGrid, '/map',
+                                      lambda m: self.maps.append(m), map_qos)
+        self.node.create_subscription(
+            PolygonStamped, '/f2c_boundary',
+            lambda m: self.boundaries.append(
+                [(p.x, p.y) for p in m.polygon.points]), 10)
+        self.node.create_subscription(
+            Path, '/f2c_path',
+            lambda m: self.f2c_path.append(
+                [(q.pose.position.x, q.pose.position.y) for q in m.poses]), 10)
+        self.cmd_pub = self.node.create_publisher(Twist, '/cmd_vel_joy', 10)
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        self.Twist = Twist
+        self.SetDriveMode = SetDriveMode
+
+    def spin(self, seconds):
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def wait_service(self, timeout):
+        return self.mode_cli.wait_for_service(timeout_sec=timeout)
+
+    def set_mode(self, mode):
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() else None
+
+    def drive(self, v, w, seconds):
+        msg = self.Twist()
+        msg.linear.x = float(v)
+        msg.angular.z = float(w)
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.cmd_pub.publish(msg)
+            self.rclpy.spin_once(self.node, timeout_sec=0.05)
+
+    def drive_square(self, side_seconds, turn_seconds):
+        for _ in range(4):
+            self.drive(0.5, 0.0, side_seconds)
+            self.drive(0.0, 0.6, turn_seconds)
+            self.drive(0.0, 0.0, 0.8)
+        self.drive(0.0, 0.0, 1.0)
+
+    def wait_map(self, timeout):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.maps:
+            self.spin(0.3)
+        if not self.maps:
+            return None
+        m = self.maps[-1]
+        np = self.np
+        g = np.array(m.data, dtype=np.int8).reshape(
+            (m.info.height, m.info.width))
+        return {'grid': g, 'res': m.info.resolution,
+                'ox': m.info.origin.position.x, 'oy': m.info.origin.position.y,
+                'w': m.info.width, 'h': m.info.height,
+                'free_cells': int(((g >= 0) & (g <= 20)).sum())}
+
+    def wait_boundary(self, timeout):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.boundaries:
+            self.spin(0.3)
+        return self.boundaries[-1] if self.boundaries else None
+
+    def distance_field(self, grid):
+        """每一格離最近「佔據格」的距離 (公尺)。等效於 costmap 的膨脹層輸入。"""
+        import cv2
+        np = self.np
+        occ = (grid['grid'] > 65).astype(np.uint8)
+        free = np.where(occ > 0, 0, 255).astype(np.uint8)
+        return cv2.distanceTransform(free, cv2.DIST_L2,
+                                     cv2.DIST_MASK_PRECISE) * grid['res']
+
+    def lookup(self, dist, grid, x, y):
+        col = int((x - grid['ox']) / grid['res'])
+        row = int((y - grid['oy']) / grid['res'])
+        if not (0 <= col < grid['w'] and 0 <= row < grid['h']):
+            return None
+        return float(dist[row, col])
+
+    def close(self):
+        self.node.destroy_node()
+        self.rclpy.shutdown()
+
+
+# --------------------------------------------------------------------------
 # 6.5 Phase L：存圖與定位模式
 # --------------------------------------------------------------------------
 class LocRig(object):
@@ -3378,6 +3701,7 @@ def phase_l():
     ctl = bg_start('L_mower_control', mower_control_cmd())
     sub('等待 mower_control (含建圖模式 slam_toolbox) 穩定 (20 秒)...')
     time.sleep(20)
+    stop_joy_node()
 
     rig = LocRig()
     try:
@@ -3609,10 +3933,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDHLNOP'
+    phases = 'ABCDHLNOPQ'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNOP'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNOPQ'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -3706,6 +4030,13 @@ def main():
         if 'P' in phases:
             try:
                 phase_p()
+            finally:
+                bg_stop_all()
+                sweep()
+
+        if 'Q' in phases:
+            try:
+                phase_q()
             finally:
                 bg_stop_all()
                 sweep()
