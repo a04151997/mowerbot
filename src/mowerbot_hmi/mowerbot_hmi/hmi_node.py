@@ -45,7 +45,7 @@ from rclpy.node import Node
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from geometry_msgs.msg import PolygonStamped
-from mowerbot_interfaces.msg import MowerStatus, MissionStatus
+from mowerbot_interfaces.msg import MowerStatus, MissionStatus, JoyStatus
 from mowerbot_interfaces.srv import SetDriveMode
 
 MODE_NAMES = {
@@ -67,6 +67,11 @@ MISSION_STATE_NAMES = {
 # 超過這個秒數沒收到 /mower_status 就視為失去聯繫
 CONNECTION_TIMEOUT = 1.0
 
+# 超過這個秒數沒收到 /joy_status 就視為「手把狀態不明」-> 一律顯示未連線。
+# 這與上面那個 manager 的連線判斷是**兩件獨立的事**：
+# teleop 掛掉時 manager 可能還活著，畫面不能停在最後一筆綠色狀態。
+JOY_STATUS_TIMEOUT = 1.0
+
 # 與 mower_manager 的 min_boundary_area 預設值一致。
 # 介面上只是拿來提示「這個邊界會被拒絕」，真正的判定在 manager。
 BOUNDARY_MIN_AREA_HINT = 4.0
@@ -82,10 +87,13 @@ class HmiBackend(Node):
         self.last_status_time = None        # 單調時鐘，用來判斷有沒有失去聯繫
         self.boundary = None
         self.boundary_time = None
+        self.joy_status = None
+        self.joy_status_time = None
 
         self.create_subscription(MowerStatus, '/mower_status', self._on_mower, 10)
         self.create_subscription(MissionStatus, '/mission_status', self._on_mission, 10)
         self.create_subscription(PolygonStamped, '/f2c_boundary', self._on_boundary, 10)
+        self.create_subscription(JoyStatus, '/joy_status', self._on_joy_status, 10)
 
         self.mode_cli = self.create_client(SetDriveMode, 'change_mower_mode')
 
@@ -117,6 +125,29 @@ class HmiBackend(Node):
     def _on_boundary(self, msg):
         self.boundary = msg
         self.boundary_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def _on_joy_status(self, msg):
+        self.joy_status = msg
+        self.joy_status_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def joy_view(self):
+        """回傳 (connected, deadman_held, 說明文字) 給畫面用。
+
+        失效方向一律偏向「未連線」：
+          - 從來沒收到 /joy_status (teleop 沒跑) -> 未連線
+          - /joy_status 自己超過 1 秒沒更新 (teleop 掛了) -> 未連線
+          - 收到的訊息說 connected=False -> 未連線
+        任何不確定的情況都不會顯示綠色。
+        """
+        if self.joy_status is None or self.joy_status_time is None:
+            return (False, False, '沒有收到 /joy_status（teleop 沒在跑？）')
+        age = self.get_clock().now().nanoseconds * 1e-9 - self.joy_status_time
+        if age > JOY_STATUS_TIMEOUT:
+            return (False, False, '/joy_status 已 %.1f 秒沒更新（teleop 可能掛了）' % age)
+        if not self.joy_status.connected:
+            return (False, False,
+                    '最後一筆 /joy 是 %.1f 秒前' % self.joy_status.last_msg_age)
+        return (True, bool(self.joy_status.deadman_held), '')
 
     # ---- 查詢 --------------------------------------------------------
     def seconds_since_status(self):
@@ -196,6 +227,14 @@ class MainWindow(QtWidgets.QWidget):
         self.conn_label.setAlignment(QtCore.Qt.AlignCenter)
         self.conn_label.setStyleSheet('font-size: 18px; font-weight: bold;')
         root.addWidget(self.conn_label)
+
+        # ---- 手把狀態 -------------------------------------------------
+        # 刻意不放進下面的「系統狀態」群組：manager 斷線時那一區會整個變灰，
+        # 但手把是不是連著是另一回事，那個訊息在斷線時反而更需要看得到。
+        self.joy_label = QtWidgets.QLabel('')
+        self.joy_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.joy_label.setWordWrap(True)
+        root.addWidget(self.joy_label)
 
         # ---- 模式 ----------------------------------------------------
         mode_box = QtWidgets.QGroupBox('模式')
@@ -349,6 +388,10 @@ class MainWindow(QtWidgets.QWidget):
                 self._save_futures = None
 
     def _refresh(self):
+        # 手把狀態要先更新：下面 manager 斷線時會提早 return，
+        # 放在後面的話手把那一列會停在舊資料 —— 那正是這個功能要避免的事。
+        self._refresh_joy()
+
         age = self.backend.seconds_since_status()
         connected = (age is not None and age <= CONNECTION_TIMEOUT)
 
@@ -437,6 +480,23 @@ class MainWindow(QtWidgets.QWidget):
                    % BOUNDARY_MIN_AREA_HINT if too_small else ''))
             self.lbl_boundary.setStyleSheet(
                 'color: #c0392b; font-weight: bold;' if too_small else 'color: #1e8449;')
+
+    def _refresh_joy(self):
+        joy_ok, deadman, note = self.backend.joy_view()
+        if joy_ok:
+            self.joy_label.setText(
+                '● 手把已連線　—　安全鈕 %s'
+                % ('按住中' if deadman else '未按住'))
+            self.joy_label.setStyleSheet(
+                'font-size: 16px; font-weight: bold; color: white;'
+                ' background-color: #1e8449; padding: 5px; border-radius: 6px;')
+        else:
+            # 紅色而不是灰色：手把不在線上代表「現在沒有人能用實體按鈕停下它」，
+            # 那是要讓人一眼看到的事。
+            self.joy_label.setText('● 手把未連線　%s' % note)
+            self.joy_label.setStyleSheet(
+                'font-size: 16px; font-weight: bold; color: white;'
+                ' background-color: #c0392b; padding: 5px; border-radius: 6px;')
 
     def closeEvent(self, event):
         self.timer.stop()

@@ -151,9 +151,9 @@ Nav2 沒辦法繞過安全機制直接驅動底盤（由 N4 驗證）。
 
 ## 3. 最終測試結果
 
-共 **40 項**（原本 22 項，階段 3 新增 Phase L 的 4 項，階段 11 新增 B3 / B4，
+共 **44 項**（原本 22 項，階段 3 新增 Phase L 的 4 項，階段 11 新增 B3 / B4，
 階段 14 新增 Phase H 的 5 項，階段 17 新增 Phase O 的 1 項，
-階段 18 新增 Phase P 的 6 項）。
+階段 18 新增 Phase P 的 6 項，階段 19 把 Phase P 補到 10 項）。
 Phase H 測的是實車用的 `bridge_node`，不需要 Gazebo，可以單獨跑
 `--phases=H`，幾十秒就有結果；它的內容見 `hardware_bringup.md`。
 **下面這張表是階段 12 那次 28 項的執行**（Phase H 當時還不存在），
@@ -1683,3 +1683,101 @@ P5 的判定一開始寫錯過：原本想用「切 mode 1 之後 F2C 收到多�
 它比測試發的 25 m² 新、本來就該贏 —— 用它判定會把正常行為判成失敗。
 改成直接看拒絕訊息裡「保留下來的那個邊界」的面積，那才是
 「`latest_boundary` 沒有被小邊界覆蓋」的直接證據。
+
+## 15. 模式仲裁的查核，與手把連線顯示
+
+### 15.1 查核：目前的模式仲裁表
+
+這張表是讀 `manager.joy_vel_cb` / `nav_vel_cb` 與 `teleop.joy_callback`
+的**實際 if 條件**整理出來的，不是照註解抄的。
+
+| 模式 | 手把速度 → `/cmd_vel` | 手把急停鍵 | 程式裡的判斷式 |
+|------|---------------------|-----------|--------------|
+| 0 建圖 | **轉發** | 有效 | `if self.current_mode == 0 or self.current_mode == 2:` → `publish_and_update(msg)` |
+| 1 自動割草 | **不轉發**（靜默丟棄，沒有 else） | 有效 | 上面那條 if 不成立，只有 `elif current_mode == 4` 另做處理 |
+| 2 手動 | **轉發** | 有效 | `current_mode == 2` 命中同一條 if |
+| 3 自動導航 | **不轉發** | 有效 | 同 mode 1 |
+| 4 急停 | **歸零** | 有效 | `elif self.current_mode == 4: handle_estop_violation(...)` → `stop_robot()` |
+
+**與目標規格比對的結果：沒有差異，這一輪沒有修改任何仲裁邏輯。**
+
+急停鍵之所以「五個模式都有效、沒有例外」，是因為它在 **teleop** 端處理，
+而 teleop 根本不知道目前是哪個模式 —— `joy_callback` 的第一件事就是
+
+```python
+is_estop_pressed = data.buttons[self.p['button_stop']] == 1
+if is_estop_pressed:
+    self.vel_pub.publish(Twist())          # 立刻發零
+    if self.last_button[...] == 0:         # rising edge
+        self.call_service(4)               # 通知 manager 進急停
+    return                                  # ← 在 deadman 判斷之前就 return
+```
+
+排在 deadman 判斷**之前**，所以放開 LB 一樣能急停。
+manager 那邊收到 mode 4 之後，`safety_check` 以 20 Hz 持續送零速度，
+`joy_vel_cb` 與 `nav_vel_cb` 也都會攔截後續指令。
+
+**查核結論雖然是「沒有差異」，但原本只是讀碼得到的結論。**
+所以這一輪把它變成三項自動化檢查（P7 / P8 / P9），
+以後任何人改動仲裁邏輯都會被擋下來，不必再靠讀碼確認。
+
+### 15.2 `/joy_status`：手把的連線與按鍵狀態
+
+新增 `JoyStatus.msg`，由 **teleop** 以 5 Hz 發布到 `/joy_status`：
+
+| 欄位 | 意義 |
+|------|------|
+| `connected` | 最近 0.5 秒內有收到 `/joy` |
+| `deadman_held` | 目前 deadman (LB) 是否按住 |
+| `stop_pressed` | 目前急停鍵是否按住 |
+| `last_msg_age` | 距離上一筆 `/joy` 幾秒（從未收到時是 999.0） |
+
+**為什麼由 teleop 發而不是另外寫一個節點**：`button_deadman` / `button_stop`
+的 index 是從 `joystick.yaml` 讀進來的參數，只有 teleop 知道。
+第二個節點要自己再抄一份 index，兩邊遲早會不同步 ——
+而不同步的後果是「畫面說安全鈕沒按，實際上按著」。
+
+**失效方向一律偏安全**：沒有連線時 `deadman_held` 與 `stop_pressed`
+一律回報 false。寧可誤報「安全鈕沒按住」（操作者會再按一次），
+不可誤報「按住中」（那會讓人以為車子隨時可以動）。
+
+**`autorepeat_rate` 不需要改：`joystick.yaml` 原本就是 20.0。**
+joy_node 會以 20 Hz 重複發最後狀態，所以手把靜止時 `/joy` 也不會斷；
+「沒有訊息」就等於「手把不在了」，可以直接當心跳用。
+（本來的規格說「如果是 0 就改成 20.0」—— 實際值已經是 20.0，所以沒有動它。）
+
+### 15.3 HMI 的手把狀態列
+
+畫面上多一列，放在 manager 連線指示的下面、模式按鈕的上面：
+
+- **● 手把已連線** — 綠底，並且顯示「安全鈕 按住中 / 未按住」
+- **● 手把未連線** — **紅底**（不是灰色）。手把不在線上代表
+  「現在沒有人能用實體按鈕停下它」，那是要一眼看到的事
+
+三種情況都顯示未連線，任何不確定一律偏向紅色：
+
+1. 從來沒收到 `/joy_status`（teleop 沒在跑）
+2. `/joy_status` 自己超過 1 秒沒更新（teleop 掛了）—— **不會停在最後一筆綠色**
+3. 收到的訊息本身說 `connected = False`
+
+**這一列與 manager 的連線判斷是獨立的兩件事。**
+實作上它刻意放在「系統狀態」群組**外面**：manager 斷線時那一區會整個變灰，
+但手把在不在線上是另一回事，而且那個訊息在斷線時反而更需要看得到。
+程式裡也把它排在 `_refresh()` 的最前面，因為 manager 斷線那條路徑會提早 return，
+放在後面的話手把那一列就會停在舊資料 —— 那正是這個功能要避免的事。
+
+### 15.4 測試：Phase P 擴充到 10 項
+
+| 項目 | 內容 | 實測 |
+|------|------|------|
+| P7 | 五個模式各按一次手把急停鍵，`/cmd_vel` 都要歸零 | 五個模式急停後 `/cmd_vel` 最大絕對值都是 **0.000000**，模式都變成 4 |
+| P8 | mode 0 建圖模式下 deadman + 搖桿要能驅動車子 | linear.x = **0.5600**（= 0.8 × scale_linear 0.7） |
+| P9 | mode 1 下手把不可以影響 `/cmd_vel` | 46 筆裡等於手把值的有 **0 筆** |
+| P10 | `/joy` 停發 1 秒後 `connected` 轉 false | 發布中 connected=True/deadman=True；停發後 **False/False**（deadman 沒有殘留） |
+
+P9 的判定是「有沒有出現手把那個值 (0.56)」而不是「是不是全零」：
+mode 1 下 `/cmd_vel` 本來就可能有 Nav2 的輸出，用「全零」判會把正常行為判成失敗。
+
+P7 每個模式的流程是：切到該模式 → 先按住 deadman 推搖桿 1 秒
+（在 mode 0/2 會真的動起來）→ 改成只按急停鍵 1.2 秒 → 檢查之後的
+`/cmd_vel` 全為零、且 `/mower_status` 的 mode 已經變成 4。

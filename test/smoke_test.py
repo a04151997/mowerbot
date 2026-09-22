@@ -2838,13 +2838,27 @@ class StatusRig(object):
         import rclpy
         from rclpy.node import Node
         from geometry_msgs.msg import PolygonStamped, Point32
-        from mowerbot_interfaces.msg import MowerStatus, MissionStatus
+        from mowerbot_interfaces.msg import MowerStatus, MissionStatus, JoyStatus
         from mowerbot_interfaces.srv import SetDriveMode
+        from sensor_msgs.msg import Joy
+        from geometry_msgs.msg import Twist
 
         rclpy.init()
         self.rclpy = rclpy
         self.node = Node('smoke_p')
         self.mower = []        # (wall_t, mode, stop_active)
+        self.cmd_vel = []      # (linear.x, angular.z)
+        self.joy_status = []   # (wall_t, connected, deadman_held, stop_pressed, age)
+        self.joy_pub = self.node.create_publisher(Joy, '/joy', 10)
+        self.Joy = Joy
+        self.node.create_subscription(
+            Twist, '/cmd_vel',
+            lambda m: self.cmd_vel.append((m.linear.x, m.angular.z)), 50)
+        self.node.create_subscription(
+            JoyStatus, '/joy_status',
+            lambda m: self.joy_status.append(
+                (time.time(), m.connected, m.deadman_held,
+                 m.stop_pressed, m.last_msg_age)), 20)
         self.mission = []      # (wall_t, state, total, completed, skipped, label, skipped_labels)
         self.node.create_subscription(
             MowerStatus, '/mower_status',
@@ -2875,6 +2889,22 @@ class StatusRig(object):
         fut = self.mode_cli.call_async(req)
         self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
         return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def pub_joy(self, axes, buttons, seconds, rate=20.0):
+        """發合成的 /joy，與 Phase D 的做法一致"""
+        msg = self.Joy()
+        msg.axes = [float(a) for a in axes]
+        msg.buttons = [int(b) for b in buttons]
+        t0 = time.time()
+        period = 1.0 / rate
+        nxt = t0
+        while time.time() - t0 < seconds:
+            now = time.time()
+            if now >= nxt:
+                msg.header.stamp = self.node.get_clock().now().to_msg()
+                self.joy_pub.publish(msg)
+                nxt = now + period
+            self.spin(0.01)
 
     def publish_boundary(self, x0, y0, half, seconds=3.0):
         msg = self.PolygonStamped()
@@ -3106,6 +3136,104 @@ def phase_p():
         record('P', 'P6', 'hmi_node 在無頭環境啟動 12 秒不會 crash',
                'PASS' if (alive and not bad) else 'FAIL',
                '存活=%s, log 裡有 Traceback=%s' % (alive, bool(bad)))
+
+        # ---- P7 五個模式的急停鍵 ----
+        hdr('P7  五個模式各按一次手把急停鍵，/cmd_vel 都要歸零')
+        sub('急停鍵在 teleop 端處理，而 teleop 根本不知道模式 ——')
+        sub('joy_callback 第一件事就是看急停鍵，排在 deadman 判斷之前。')
+        sub('這一項就是把「沒有例外」這句話變成可驗證的事實。')
+        JOY_AXES = [0.0, 0.8, 0.0, 0.0]          # axis_linear=1 推到 0.8
+        JOY_DEADMAN = [0, 0, 0, 0, 1, 0]         # 按住 LB
+        JOY_ESTOP = [0, 0, 0, 0, 0, 1]           # 只按急停鍵 (放開 LB)
+        per_mode = []
+        for mode in (0, 1, 2, 3, 4):
+            rig.set_mode(mode)
+            rig.spin(0.5)
+            # 先讓它有機會動起來 (mode 0/2 會轉發手把)
+            rig.pub_joy(JOY_AXES, JOY_DEADMAN, 1.0)
+            del rig.cmd_vel[:]
+            rig.pub_joy(JOY_AXES, JOY_ESTOP, 1.2)
+            rig.spin(0.5)
+            after = list(rig.cmd_vel)
+            worst = max([max(abs(v), abs(w)) for v, w in after]) if after else 0.0
+            now_mode = rig.mower[-1][1] if rig.mower else None
+            ok = (worst < 1e-6) and now_mode == 4
+            per_mode.append((mode, len(after), worst, now_mode, ok))
+            sub('mode %d (%s)：急停後 /cmd_vel 收到 %d 筆，最大絕對值 %.6f，'
+                '模式變成 %s  %s'
+                % (mode, P_MODE_NAMES[mode], len(after), worst, now_mode,
+                   'OK' if ok else '不合格'))
+        p7_ok = all(x[4] for x in per_mode)
+        record('P', 'P7', '五個模式的手把急停鍵都能讓 /cmd_vel 歸零',
+               'PASS' if p7_ok else 'FAIL',
+               '各模式(模式,筆數,最大值,結果): %s'
+               % [(m, n, round(w, 6), md) for m, n, w, md, _o in per_mode])
+
+        # ---- P8 建圖模式可以手動駕駛 ----
+        hdr('P8  mode 0 建圖模式：deadman + 搖桿要能驅動車子')
+        sub('SLAM 需要人開著車繞場建圖，建圖模式擋掉手把等於整條流程斷掉。')
+        rig.set_mode(2)
+        rig.spin(0.3)
+        rig.set_mode(0)
+        rig.spin(0.5)
+        del rig.cmd_vel[:]
+        rig.pub_joy(JOY_AXES, JOY_DEADMAN, 2.0)
+        rig.spin(0.3)
+        vals = [v for v, _w in rig.cmd_vel]
+        mx = max([abs(v) for v in vals]) if vals else 0.0
+        expected = 0.8 * 0.7      # axes * scale_linear
+        sub('/cmd_vel 收到 %d 筆，linear.x 最大絕對值 = %.4f (預期約 %.2f)'
+            % (len(vals), mx, expected))
+        p8_ok = abs(mx - expected) < 0.05
+        record('P', 'P8', 'mode 0 建圖模式下手把可以驅動車子',
+               'PASS' if p8_ok else 'FAIL',
+               '最大 linear.x=%.4f (預期 %.2f±0.05), 筆數=%d'
+               % (mx, expected, len(vals)))
+
+        # ---- P9 自動割草模式擋掉手把 ----
+        hdr('P9  mode 1 自動割草：手把不可以影響 /cmd_vel')
+        rig.set_mode(1)
+        rig.spin(1.0)
+        del rig.cmd_vel[:]
+        rig.pub_joy(JOY_AXES, JOY_DEADMAN, 2.0)
+        rig.spin(0.3)
+        vals = [v for v, _w in rig.cmd_vel]
+        joyish = [v for v in vals if abs(abs(v) - expected) < 0.02]
+        sub('/cmd_vel 收到 %d 筆，其中等於手把值 (%.2f) 的有 %d 筆'
+            % (len(vals), expected, len(joyish)))
+        sub('(mode 1 下 /cmd_vel 可能有 Nav2 的輸出，所以判定的是'
+            '「有沒有出現手把那個值」而不是「是不是全零」)')
+        p9_ok = (len(joyish) == 0)
+        record('P', 'P9', 'mode 1 下手把的速度不會被轉發到 /cmd_vel',
+               'PASS' if p9_ok else 'FAIL',
+               '總筆數=%d, 等於手把值的筆數=%d' % (len(vals), len(joyish)))
+
+        # ---- P10 /joy 停發 -> connected 轉 false ----
+        hdr('P10  /joy 停發 1 秒後，/joy_status.connected 要轉成 false')
+        rig.set_mode(2)
+        rig.pub_joy(JOY_AXES, JOY_DEADMAN, 1.0)
+        rig.spin(0.3)
+        connected_while = rig.joy_status[-1][1] if rig.joy_status else None
+        deadman_while = rig.joy_status[-1][2] if rig.joy_status else None
+        sub('持續發 /joy 時：connected=%s, deadman_held=%s'
+            % (connected_while, deadman_while))
+        del rig.joy_status[:]
+        rig.spin(1.5)             # 完全不發 /joy
+        after = rig.joy_status[-1] if rig.joy_status else None
+        if after:
+            sub('停發 1.5 秒後：connected=%s, deadman_held=%s, last_msg_age=%.2f s'
+                % (after[1], after[2], after[4]))
+        else:
+            sub('停發之後完全沒有收到 /joy_status（teleop 沒在發？）')
+        p10_ok = (connected_while is True and deadman_while is True
+                  and after is not None and after[1] is False
+                  and after[2] is False)
+        record('P', 'P10',
+               '/joy 停發 1 秒後 connected 轉 false 且 deadman_held 不殘留 true',
+               'PASS' if p10_ok else 'FAIL',
+               '發布中 connected=%s/deadman=%s ; 停發後 connected=%s/deadman=%s'
+               % (connected_while, deadman_while,
+                  after[1] if after else None, after[2] if after else None))
     finally:
         if rig is not None:
             rig.close()

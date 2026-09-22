@@ -3,6 +3,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Joy                         # 接收手把原始資料
 from geometry_msgs.msg import Twist                     # 發布速度指令 (linear.x, angular.z)
 from mowerbot_interfaces.srv import SetDriveMode        # 自定義的模式切換服務
+from mowerbot_interfaces.msg import JoyStatus           # 手把連線狀態 (給 HMI 看)
                                                         
 class MowerTeleop(Node):
     def __init__(self):
@@ -32,13 +33,61 @@ class MowerTeleop(Node):
 
         self.last_button = [0]*12
 
+        # ---- 手把連線狀態 (階段 19) ----
+        # button index 只有這裡從 joystick.yaml 讀得到，所以由 teleop 負責發布，
+        # 不要讓第二個節點再抄一份 index。
+        self.joy_status_pub = self.create_publisher(JoyStatus, '/joy_status', 10)
+        self._last_joy_time = None      # 上一筆 /joy 的時間 (node clock)
+        self._deadman_held = False
+        self._stop_pressed = False
+        self.create_timer(0.2, self.publish_joy_status)
+
         #手把鎖定
         #False表示目前是鎖定
         self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後選可擇模式：A（建圖）, B（F2C）, X(手動), Y（導航）')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
 
+    @staticmethod
+    def _button(buttons, index):
+        """安全地讀按鍵：index 超出範圍就當成沒按。
+
+        只用在狀態回報上，控制邏輯維持原樣 ——
+        /joy_status 不該因為某支手把的按鍵數比較少就把 teleop 弄掛。
+        """
+        return bool(index < len(buttons) and buttons[index] == 1)
+
+    def publish_joy_status(self):
+        """5 Hz 發布 /joy_status。
+
+        失效方向必須是安全的：沒有連線時 deadman_held 與 stop_pressed
+        一律回報 false。寧可誤報「安全鈕沒按住」(操作者會再按一次)，
+        不可誤報「按住中」(那會讓人以為車子隨時可以動)。
+        """
+        msg = JoyStatus()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        if self._last_joy_time is None:
+            msg.connected = False
+            msg.deadman_held = False
+            msg.stop_pressed = False
+            msg.last_msg_age = 999.0
+            self.joy_status_pub.publish(msg)
+            return
+        age = (self.get_clock().now() - self._last_joy_time).nanoseconds * 1e-9
+        connected = age < 0.5
+        msg.connected = bool(connected)
+        msg.deadman_held = bool(self._deadman_held and connected)
+        msg.stop_pressed = bool(self._stop_pressed and connected)
+        msg.last_msg_age = float(min(age, 999.0))
+        self.joy_status_pub.publish(msg)
+
     def joy_callback(self, data):
+        # 先記下狀態再處理控制：下面的急停分支會提早 return，
+        # 記在後面的話急停按住期間 /joy_status 就會停在舊資料。
+        self._last_joy_time = self.get_clock().now()
+        self._deadman_held = self._button(data.buttons, self.p['button_deadman'])
+        self._stop_pressed = self._button(data.buttons, self.p['button_stop'])
+
         if self.last_button is None:
             self.last_button = list(data.buttons)
             return
