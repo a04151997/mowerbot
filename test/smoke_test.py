@@ -4,8 +4,9 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N/O
     python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
+    python3 test/smoke_test.py --phases=O   # 只跑臨時障礙物容錯 (固定用 demo_lawn_obstacle.world)
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
     python3 test/smoke_test.py --overlap=0.3           # 覆寫割草線重疊率
     python3 test/smoke_test.py --world=demo_lawn.world # 換模擬世界
@@ -154,6 +155,7 @@ PHASES = [
     ('H', '底盤橋接'),
     ('L', '存圖與定位'),
     ('N', 'Nav2 路徑跟隨'),
+    ('O', '障礙物容錯'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
 
@@ -2662,6 +2664,159 @@ def phase_h():
 
 
 # --------------------------------------------------------------------------
+# 6.45 Phase O：臨時障礙物容錯
+#
+# 場景：草坪上臨時多了一個東西（椅子被搬出來、樹枝掉下來、有人站在那裡）。
+# 這種障礙物不在地圖裡、也不該為了它重新建圖 —— local costmap 會即時看到它。
+#
+# 這個 Phase 刻意「不告訴規劃器有障礙物」：發一則空的 ObstaclePolygons，
+# 於是 F2C 產生的割草線會直接穿過那個箱子，控制器跟到那一段就會 ABORTED。
+# 要驗證的是 manager 收到 ABORTED 之後的行為：跳過那一段、繼續割其餘的，
+# 而不是讓整片草坪停擺。
+#
+# 世界固定用 demo_lawn_obstacle.world（--world 對這個 Phase 無效），
+# 因為它需要「測試邊界裡面真的有一個實體障礙物」這個條件。
+# --------------------------------------------------------------------------
+O_WORLD = 'demo_lawn_obstacle.world'
+O_BOUNDARY = (-1.5, -1.5, 2.5)      # 中心 x, y, 半徑 -> 與 Phase N 同一塊 5m x 5m
+O_OBSTACLE = (-2.5, -0.75, 0.5)     # 世界檔裡那個箱子的中心與半邊長
+
+RE_O_SUMMARY = re.compile(
+    r'覆蓋任務(?:結束|完成)：共 (\d+) 段，完成 (\d+) 段，跳過 (\d+) 段')
+# label 裡面有空白 (例如「割草線 5/13」「周邊環繞 1/4」)，所以用 (.+?) 而不是 (\S+)
+RE_O_SKIP = re.compile(r'⏭️ 跳過此段 (.+?) \(起點 ([-\d.]+), ([-\d.]+)\)')
+RE_O_UNFINISHED = re.compile(r'未完成：(.+?) \(起點 ([-\d.]+), ([-\d.]+)\)')
+RE_O_SYSTEMIC = re.compile(r'🛑 連續 (\d+) 段都失敗')
+RE_O_FAILCOUNT = re.compile(r'連續失敗 (\d+)/(\d+) 次')
+
+
+def phase_o():
+    hdr('Phase O  臨時障礙物容錯 (割草線被擋住要跳過並繼續，不是整個任務死掉)')
+    sub('世界 = %s（這個 Phase 固定用它，--world 無效）' % O_WORLD)
+    sub('箱子在 (%.2f, %.2f)，邊長 %.1f m，落在 5m x 5m 測試邊界裡面'
+        % (O_OBSTACLE[0], O_OBSTACLE[1], O_OBSTACLE[2] * 2))
+    sub('刻意發一則「空的」障礙物清單給 manager：')
+    sub('  規劃器不知道箱子在那裡 -> 割草線會穿過去 -> 控制器 ABORTED')
+    sub('  這就是實車上「臨時多一張椅子」的情況')
+
+    gz = bg_start('O_gazebo',
+                  ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py',
+                   'gui:=false', 'world:=%s' % O_WORLD])
+    sub('等待 Gazebo 起來 (18 秒)...')
+    time.sleep(18)
+    ctl = bg_start('O_mower_control', mower_control_cmd())
+    sub('等待 mower_control 穩定 (20 秒)...')
+    time.sleep(20)
+    nav = bg_start('O_navigation',
+                   ['ros2', 'launch', 'mowerbot_bringup', 'navigation.launch.py'])
+
+    state = None
+    t0 = time.time()
+    while time.time() - t0 < 40.0:
+        rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server'], timeout=15)
+        cur = out.strip().splitlines()[-1].strip() if out.strip() else '(無回應)'
+        if cur != state:
+            sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
+            state = cur
+        if 'active' in cur:
+            break
+        time.sleep(2.0)
+    if not state or 'active' not in state:
+        print(nav.log_tail(40))
+        record('O', 'O1', '臨時障礙物：跳過該段並完成任務', 'SKIP',
+               'controller_server 沒有進入 active (%s)，與本項無關' % state)
+        return
+
+    rig = None
+    try:
+        rig = NavRig()
+        from mowerbot_interfaces.msg import ObstaclePolygons
+        obs_pub = rig.node.create_publisher(ObstaclePolygons, '/f2c_obstacles', 10)
+        rig.wait_odom()
+
+        # 空的障礙物清單：明確告訴 manager「規劃時不知道有東西擋著」。
+        # 發在邊界之前與之後各一次，確保它是 mode 切換前的最後狀態。
+        empty = ObstaclePolygons()
+        empty.header.frame_id = 'map'
+        for _ in range(3):
+            empty.header.stamp = rig.node.get_clock().now().to_msg()
+            obs_pub.publish(empty)
+            rig.spin(0.3)
+        bcx, bcy, half = O_BOUNDARY
+        rig.publish_boundary(bcx, bcy, half=half, seconds=3.0)
+        for _ in range(3):
+            empty.header.stamp = rig.node.get_clock().now().to_msg()
+            obs_pub.publish(empty)
+            rig.spin(0.3)
+
+        del rig.odom[:]
+        ok_mode = rig.set_mode(1)
+        sub('change_mower_mode(mode=1) 回傳 success = %s' % ok_mode)
+
+        timeout = 600.0
+        sub('監聽最多 %.0f 秒，等 manager 印出任務摘要...' % timeout)
+        t0 = time.time()
+        summary = None
+        last_report = 0.0
+        while time.time() - t0 < timeout:
+            rig.spin(0.5)
+            txt = '\n'.join(ctl.log_grep(r'覆蓋任務|跳過此段|連續失敗|未完成', 400))
+            m = RE_O_SUMMARY.search(txt)
+            if m:
+                summary = m
+                break
+            if time.time() - t0 - last_report > 60.0:
+                last_report = time.time() - t0
+                n_skip = len(RE_O_SKIP.findall(txt))
+                sub('  t=%3.0fs 進行中... 目前已跳過 %d 段' % (last_report, n_skip))
+
+        txt = '\n'.join(ctl.log_grep(r'覆蓋任務|跳過此段|連續失敗|未完成|割草線|環繞|銜接', 600))
+        skips = RE_O_SKIP.findall(txt)
+        unfinished = RE_O_UNFINISHED.findall(txt)
+        systemic = RE_O_SYSTEMIC.findall(txt)
+        failcounts = RE_O_FAILCOUNT.findall(txt)
+        print('')
+        if summary:
+            sub('任務摘要：共 %s 段，完成 %s 段，跳過 %s 段'
+                % (summary.group(1), summary.group(2), summary.group(3)))
+        else:
+            sub('%.0f 秒內沒有看到任務摘要 —— 任務沒有跑到結束' % timeout)
+        sub('跳過的段落 (log 即時輸出) = %d 段' % len(skips))
+        for label, sx, sy in skips:
+            print('        %-16s 起點 (%s, %s)' % (label, sx, sy))
+        sub('摘要裡列出的未完成段落 = %d 段' % len(unfinished))
+        for label, sx, sy in unfinished:
+            print('        %-16s 起點 (%s, %s)' % (label, sx, sy))
+        if failcounts:
+            sub('連續失敗計數的變化 = %s (門檻 %s)'
+                % ([a for a, _b in failcounts], failcounts[-1][1]))
+        sub('是否因「連續失敗達門檻」而提早中止 = %s'
+            % ('是 (%s 段)' % systemic[-1] if systemic else '否'))
+
+        # ---- 判定 ----
+        ended = summary is not None
+        n_skip = int(summary.group(3)) if summary else 0
+        coords_ok = (len(unfinished) == n_skip and n_skip > 0)
+        # 「連續失敗未達門檻時不會提早中止」：
+        # 有提早中止的話，log 必須顯示它確實累積到了門檻，不能是提前放棄。
+        if systemic:
+            early_ok = int(systemic[-1]) >= int(failcounts[-1][1]) if failcounts else False
+        else:
+            early_ok = True
+        o_ok = ended and n_skip >= 1 and coords_ok and early_ok
+        record('O', 'O1',
+               '割草線被臨時障礙物擋住時：跳過該段、繼續執行、並在摘要列出座標',
+               'PASS' if o_ok else 'FAIL',
+               '任務有跑到結束=%s, 跳過=%d 段, 摘要列出座標=%d 段, '
+               '提早中止=%s'
+               % (ended, n_skip, len(unfinished),
+                  ('是(連續%s段)' % systemic[-1]) if systemic else '否'))
+    finally:
+        if rig is not None:
+            rig.close()
+
+
+# --------------------------------------------------------------------------
 # 6.5 Phase L：存圖與定位模式
 # --------------------------------------------------------------------------
 class LocRig(object):
@@ -3030,10 +3185,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDHLN'
+    phases = 'ABCDHLNO'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLN'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNO'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -3113,6 +3268,13 @@ def main():
         if 'N' in phases:
             try:
                 phase_n()
+            finally:
+                bg_stop_all()
+                sweep()
+
+        if 'O' in phases:
+            try:
+                phase_o()
             finally:
                 bg_stop_all()
                 sweep()

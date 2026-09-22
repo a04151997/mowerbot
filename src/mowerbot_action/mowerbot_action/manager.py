@@ -35,6 +35,15 @@ class MowerManager(Node):
         self._swath_queue = []
         self._current_swath_idx = 0     # 目前執行到第幾個任務 (0-based)
         self._swath_total = 0           # 割草線總數 (不含 approach)
+        # 失敗處理的狀態 (詳見 follow_path_result_callback 的說明)
+        self._consecutive_failures = 0  # 連續失敗次數，任一段成功就歸零
+        self._skipped = []              # [(label, (x, y) 或 None, 失敗原因)]
+        self._succeeded = 0             # 成功完成的段數 (含 approach / 環繞)
+        # 【安全關鍵】「這次的結束是我們主動取消的」旗標。
+        # 急停與模式切換會呼叫 cancel_current_goal()，結果回呼必須能分辨
+        # 「控制器自己放棄 (ABORTED)」與「我們喊停 (CANCELED)」——
+        # 前者跳過繼續，後者一定要整個停掉。
+        self._cancelling = False
         self._result_future = None
 
         # TF：manager 本來完全不知道車子在哪裡，但要算出「從當下位置前往第 1 條
@@ -57,6 +66,14 @@ class MowerManager(Node):
         # 一條剛好起點就在旁邊的路徑。所以跑道是可靠度功能而不是覆蓋品質功能。
         # 既然覆蓋品質分不出高下，就取「能用的最小值」：L 同時是階段 2 的地頭寬度，
         # 而地頭會直接吃掉可作業面積 (5x5 m 的地上 L=1.5 只剩 2 m 寬可割)。
+        # 連續失敗幾次就判定為系統性問題、停止整個任務。
+        # 單獨一段失敗多半是臨時障礙物 (椅子、樹枝、有人站在草坪上)，
+        # 那種情況跳過那一段繼續割其餘的才合理；但如果連續好幾段都失敗，
+        # 通常是定位跑掉或 Nav2 掛了，繼續送下去只是讓車子在場上亂撞。
+        self.declare_parameter('max_consecutive_failures', 3)
+        self.max_consecutive_failures = int(
+            self.get_parameter('max_consecutive_failures').value)
+
         self.declare_parameter('lead_in_length', 0.5)
         self.lead_in_length = float(
             self.get_parameter('lead_in_length').value)
@@ -270,8 +287,13 @@ class MowerManager(Node):
         self._result_future = None
 
     def cancel_current_goal(self):
-        """取消目前正在執行的 FollowPath goal"""
+        """取消目前正在執行的 FollowPath goal
+
+        取消之前先立旗標：結果回呼會先看這個旗標，確保「我們主動喊停」
+        永遠走「整個停掉」那條路，不會被誤判成控制器自己放棄而繼續下一段。
+        """
         if self._goal_handle is not None:
+            self._cancelling = True
             self._goal_handle.cancel_goal_async()
             self._goal_handle = None
 
@@ -607,7 +629,7 @@ class MowerManager(Node):
         """送出佇列裡的下一個任務 (approach 或割草線)"""
         total = len(self._swath_queue)
         if self._current_swath_idx >= total:
-            self.get_logger().info(f'🏁 覆蓋任務完成！共完成 {self._swath_total} 條割草線')
+            self.log_mission_summary()
             self.clear_swath_queue()
             self.stop_robot()
             return
@@ -615,38 +637,120 @@ class MowerManager(Node):
         self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
         self.send_path_to_nav2(path)
 
+    def log_mission_summary(self, ended_early=False):
+        """任務結束時印一份摘要：總段數 / 完成 / 跳過，以及每個跳過段落的座標。
+
+        座標印出來是為了實車：割完之後要知道「哪裡沒割到」才能回頭補，
+        只說「跳過 2 段」沒有用。
+        """
+        total = len(self._swath_queue)
+        n_skip = len(self._skipped)
+        head = '🏁 覆蓋任務結束' if (ended_early or n_skip) else '🏁 覆蓋任務完成'
+        self.get_logger().info(
+            f'{head}：共 {total} 段，完成 {self._succeeded} 段，跳過 {n_skip} 段')
+        for label, start, reason in self._skipped:
+            where = f'(起點 {start[0]:.2f}, {start[1]:.2f})' if start else '(起點未知)'
+            self.get_logger().info(f'   未完成：{label} {where} 原因 {reason}')
+        # 全部做完而且沒有跳過任何一段時，才印這一行。
+        # 它的意思就是「整個任務完整跑完」，測試套件也是靠它判斷任務有沒有走完，
+        # 所以有跳過的時候不能印，否則等於謊報。
+        if not ended_early and n_skip == 0:
+            self.get_logger().info(
+                f'🏁 覆蓋任務完成！共完成 {self._swath_total} 條割草線')
+
     def follow_path_result_callback(self, future):
-        """一條割草線執行完的結果處理：成功就送下一條，失敗就整個停掉"""
+        """一段路徑執行完的結果處理。
+
+        三種結果分開處理，不要混在一起：
+
+        SUCCEEDED  送下一段，並把連續失敗次數歸零。
+
+        CANCELED（我們主動喊停：急停 mode 4、或離開 mode 1/3）
+                   清空佇列、整個停掉。**這條路徑的行為與 log 都維持原樣，
+                   一個位元都不能變**：解除急停之後車子絕對不能自己接著跑。
+                   判斷依據是 cancel_current_goal() 事先立的 _cancelling 旗標，
+                   不是只看 status —— 旗標比較可靠。
+
+        ABORTED（控制器自己放棄，例如臨時障礙物擋住那一段）
+                   **跳過這一段，繼續下一段。** 割草環境會變化：椅子被搬出來、
+                   樹枝掉下來、有人站在草坪上。這些由 local costmap 即時偵測，
+                   不需要重新建圖，也不該讓整片草坪停擺。
+                   但連續失敗達到 max_consecutive_failures（預設 3）時就停止：
+                   那通常不是單一障礙物，而是定位跑掉或 Nav2 掛了，
+                   繼續送下去只會讓車子在場上亂撞。
+        """
         result = future.result()
         status = result.status if result is not None else GoalStatus.STATUS_UNKNOWN
         total = len(self._swath_queue)
         if self._current_swath_idx < total:
-            label = self._swath_queue[self._current_swath_idx][1]
+            path, label = self._swath_queue[self._current_swath_idx]
         else:
-            label = '(未知任務)'
+            path, label = None, '(未知任務)'
 
+        status_name = {
+            GoalStatus.STATUS_CANCELED: 'CANCELED',
+            GoalStatus.STATUS_ABORTED: 'ABORTED',
+        }.get(status, f'STATUS_{status}')
+
+        # ---- 1. 主動取消：維持原本的行為與訊息 ----
+        if self._cancelling or status == GoalStatus.STATUS_CANCELED:
+            self._cancelling = False
+            self.get_logger().error(
+                f'❌ [{label}] 失敗 (status={status_name})，'
+                f'停止整個覆蓋任務，不自動重試')
+            self.clear_swath_queue()
+            self.stop_robot()
+            return
+
+        # ---- 2. 成功 ----
         if status == GoalStatus.STATUS_SUCCEEDED:
+            self._consecutive_failures = 0
+            self._succeeded += 1
             if label == 'approach':
                 self.get_logger().info('✅ approach 完成，開始割草')
             else:
                 self.get_logger().info(f'✅ {label} 完成')
             self._current_swath_idx += 1
             if self._current_swath_idx >= total:
-                self.get_logger().info(f'🏁 覆蓋任務完成！共完成 {self._swath_total} 條割草線')
+                self.log_mission_summary()
                 self.clear_swath_queue()
                 self.stop_robot()
             else:
                 self.send_next_swath()
-        else:
-            status_name = {
-                GoalStatus.STATUS_CANCELED: 'CANCELED',
-                GoalStatus.STATUS_ABORTED: 'ABORTED',
-            }.get(status, f'STATUS_{status}')
+            return
+
+        # ---- 3. 控制器放棄 (ABORTED 或未知狀態) ----
+        self._consecutive_failures += 1
+        start = None
+        if path is not None and path.poses:
+            p0 = path.poses[0].pose.position
+            start = (p0.x, p0.y)
+        self._skipped.append((label, start, status_name))
+        self.get_logger().error(
+            f'❌ [{label}] 失敗 (status={status_name})，'
+            f'連續失敗 {self._consecutive_failures}/{self.max_consecutive_failures} 次')
+
+        if self._consecutive_failures >= self.max_consecutive_failures:
             self.get_logger().error(
-                f'❌ [{label}] 失敗 (status={status_name})，'
-                f'停止整個覆蓋任務，不自動重試')
+                f'🛑 連續 {self._consecutive_failures} 段都失敗，'
+                f'判定為系統性問題（定位跑掉、Nav2 異常、或整片區域無法通行），'
+                f'停止整個覆蓋任務。單一障礙物不會造成連續失敗。')
+            self.log_mission_summary(ended_early=True)
             self.clear_swath_queue()
             self.stop_robot()
+            return
+
+        where = f'(起點 {start[0]:.2f}, {start[1]:.2f})' if start else '(起點未知)'
+        self.get_logger().warn(
+            f'⏭️ 跳過此段 {label} {where}，繼續下一段'
+            f'（臨時障礙物不應該讓整片草坪停擺）')
+        self._current_swath_idx += 1
+        if self._current_swath_idx >= total:
+            self.log_mission_summary()
+            self.clear_swath_queue()
+            self.stop_robot()
+        else:
+            self.send_next_swath()
 
     def send_path_to_nav2(self, path_msg):
         """
@@ -750,6 +854,11 @@ class MowerManager(Node):
                 self._swath_queue = queue
                 self._swath_total = total
                 self._current_swath_idx = 0
+                # 每次重新規劃都是一個新任務，失敗統計要歸零
+                self._consecutive_failures = 0
+                self._skipped = []
+                self._succeeded = 0
+                self._cancelling = False
                 self.send_next_swath()
             else:
                 self.get_logger().error('⚠️ F2C 伺服器回報路徑規劃失敗！')
