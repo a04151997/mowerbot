@@ -17,6 +17,7 @@ set(msg_files
   "msg/MowerStatus.msg"
   "msg/MotorStatus.msg"
   "msg/ObstaclePolygons.msg" # <== 階段 11：作業區內部障礙物的輪廓集合
+  "msg/MissionStatus.msg"   # <== 階段 18：覆蓋任務的即時進度，給 HMI 用
 )
 
 # 宣告你要編譯哪些 Service 檔案

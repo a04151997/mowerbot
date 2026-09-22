@@ -4,7 +4,7 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N/O
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N/O/P
     python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
     python3 test/smoke_test.py --phases=O   # 只跑臨時障礙物容錯 (固定用 demo_lawn_obstacle.world)
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
@@ -156,6 +156,7 @@ PHASES = [
     ('L', '存圖與定位'),
     ('N', 'Nav2 路徑跟隨'),
     ('O', '障礙物容錯'),
+    ('P', '狀態發布'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
 
@@ -2817,6 +2818,201 @@ def phase_o():
 
 
 # --------------------------------------------------------------------------
+# 6.46 Phase P：狀態發布 (/mower_status 與 /mission_status)
+#
+# 這兩支話題是 HMI 唯一的資訊來源。GUI 本身不好自動化測試，
+# 但「狀態有沒有正確發出來」可以，而且那才是真正會被別的東西依賴的介面。
+# --------------------------------------------------------------------------
+P_MODE_NAMES = {0: '建圖', 1: '自動割草(F2C)', 2: '手動', 3: '自動導航', 4: '緊急停止'}
+
+
+class StatusRig(object):
+    """Phase P 的測試夾具：收兩支狀態話題、發邊界、切模式"""
+
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from geometry_msgs.msg import PolygonStamped, Point32
+        from mowerbot_interfaces.msg import MowerStatus, MissionStatus
+        from mowerbot_interfaces.srv import SetDriveMode
+
+        rclpy.init()
+        self.rclpy = rclpy
+        self.node = Node('smoke_p')
+        self.mower = []        # (wall_t, mode, stop_active)
+        self.mission = []      # (wall_t, state, total, completed, skipped, label, skipped_labels)
+        self.node.create_subscription(
+            MowerStatus, '/mower_status',
+            lambda m: self.mower.append((time.time(), m.mode, m.stop_active)), 20)
+        self.node.create_subscription(
+            MissionStatus, '/mission_status',
+            lambda m: self.mission.append(
+                (time.time(), m.state, m.total_segments, m.completed_segments,
+                 m.skipped_segments, m.current_label, list(m.skipped_labels))), 20)
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        self.boundary_pub = self.node.create_publisher(
+            PolygonStamped, '/f2c_boundary', 10)
+        self.PolygonStamped = PolygonStamped
+        self.Point32 = Point32
+        self.SetDriveMode = SetDriveMode
+        self.MissionStatus = MissionStatus
+
+    def spin(self, seconds):
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def set_mode(self, mode):
+        if not self.mode_cli.wait_for_service(timeout_sec=10.0):
+            return None
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        self.rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def publish_boundary(self, x0, y0, half, seconds=3.0):
+        msg = self.PolygonStamped()
+        msg.header.frame_id = 'map'
+        for cx, cy in [(x0 - half, y0 - half), (x0 + half, y0 - half),
+                       (x0 + half, y0 + half), (x0 - half, y0 + half)]:
+            msg.polygon.points.append(self.Point32(x=float(cx), y=float(cy), z=0.0))
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            msg.header.stamp = self.node.get_clock().now().to_msg()
+            self.boundary_pub.publish(msg)
+            self.spin(0.3)
+
+    def close(self):
+        self.node.destroy_node()
+        self.rclpy.shutdown()
+
+
+def phase_p():
+    hdr('Phase P  狀態發布 (/mower_status 與 /mission_status)')
+    sub('HMI 完全依賴這兩支話題。GUI 本身不好自動化測，但介面本身可以。')
+
+    gz = bg_start('P_gazebo', gazebo_cmd())
+    sub('等待 Gazebo 起來 (18 秒)...')
+    time.sleep(18)
+    ctl = bg_start('P_mower_control', mower_control_cmd())
+    sub('等待 mower_control 穩定 (20 秒)...')
+    time.sleep(20)
+    nav = bg_start('P_navigation',
+                   ['ros2', 'launch', 'mowerbot_bringup', 'navigation.launch.py'])
+
+    rig = None
+    try:
+        rig = StatusRig()
+
+        # ---- P1 /mower_status ----
+        hdr('P1  /mower_status 有發布、頻率約 5 Hz、mode 與實際切換一致')
+        del rig.mower[:]
+        rig.spin(4.0)
+        n = len(rig.mower)
+        rate = n / 4.0
+        sub('4 秒內收到 %d 筆 -> %.2f Hz (預期 5 Hz)' % (n, rate))
+        mode_ok = []
+        for mode in (0, 2, 3):
+            ok = rig.set_mode(mode)
+            rig.spin(1.2)
+            seen = rig.mower[-1][1] if rig.mower else None
+            match = (seen == mode)
+            mode_ok.append(match)
+            sub('切到 mode %d (%s)：服務回傳 %s，/mower_status 的 mode = %s  %s'
+                % (mode, P_MODE_NAMES[mode], ok, seen, 'OK' if match else '不一致'))
+        rate_ok = 3.5 <= rate <= 7.0
+        p1_ok = n > 0 and rate_ok and all(mode_ok)
+        record('P', 'P1', '/mower_status 以約 5 Hz 發布且 mode 與實際模式一致',
+               'PASS' if p1_ok else 'FAIL',
+               '%.2f Hz (%d 筆/4s), 三次模式切換一致=%s' % (rate, n, mode_ok))
+
+        # ---- P2 /mission_status ----
+        hdr('P2  /mission_status 在覆蓋任務執行時會正確更新')
+        state = None
+        t0 = time.time()
+        while time.time() - t0 < 40.0:
+            rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server'], timeout=15)
+            cur = out.strip().splitlines()[-1].strip() if out.strip() else '(無回應)'
+            if cur != state:
+                sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
+                state = cur
+            if 'active' in cur:
+                break
+            time.sleep(2.0)
+        if not state or 'active' not in state:
+            record('P', 'P2', '/mission_status 隨任務更新', 'SKIP',
+                   'controller_server 沒進入 active，與狀態發布無關')
+        else:
+            rig.set_mode(2)
+            rig.spin(1.0)
+            idle = rig.mission[-1] if rig.mission else None
+            sub('任務開始前：state=%s, total=%s, completed=%s, label=%r'
+                % (idle[1], idle[2], idle[3], idle[5]) if idle else '(沒有收到)')
+            rig.publish_boundary(-1.5, -1.5, 2.5, seconds=3.0)
+            del rig.mission[:]
+            rig.set_mode(1)
+            sub('切到 mode 1，監聽最多 150 秒，等 completed >= 2 段...')
+            t0 = time.time()
+            labels_seen = []
+            best = None
+            while time.time() - t0 < 150.0:
+                rig.spin(0.5)
+                if not rig.mission:
+                    continue
+                cur = rig.mission[-1]
+                if cur[5] and cur[5] not in labels_seen:
+                    labels_seen.append(cur[5])
+                    sub('  t=%3.0fs  state=%d total=%d completed=%d label=%r'
+                        % (time.time() - t0, cur[1], cur[2], cur[3], cur[5]))
+                if cur[3] >= 2:
+                    best = cur
+                    break
+            states = sorted(set(m[1] for m in rig.mission))
+            totals = sorted(set(m[2] for m in rig.mission if m[2] > 0))
+            completed_max = max((m[3] for m in rig.mission), default=0)
+            print('')
+            sub('觀察到的 state 值 = %s (1=規劃中 2=執行中)' % states)
+            sub('觀察到的 total_segments = %s' % totals)
+            sub('completed_segments 最大值 = %d' % completed_max)
+            sub('看到的 current_label = %s' % labels_seen[:8])
+            p2_ok = (bool(totals) and completed_max >= 2 and len(labels_seen) >= 2
+                     and rig.MissionStatus.STATE_EXECUTING in states)
+            record('P', 'P2',
+                   '/mission_status 的 state / total / completed / current_label 會更新',
+                   'PASS' if p2_ok else 'FAIL',
+                   'state值=%s, total=%s, completed最大=%d, 看到 %d 種 label'
+                   % (states, totals, completed_max, len(labels_seen)))
+
+        # ---- P3 急停 ----
+        hdr('P3  急停時 stop_active 變 true、mission state 變 ABORTED')
+        del rig.mower[:]
+        del rig.mission[:]
+        ok = rig.set_mode(4)
+        rig.spin(2.0)
+        last_m = rig.mower[-1] if rig.mower else None
+        last_s = rig.mission[-1] if rig.mission else None
+        sub('切到 mode 4：服務回傳 %s' % ok)
+        sub('/mower_status: mode=%s, stop_active=%s'
+            % (last_m[1] if last_m else None, last_m[2] if last_m else None))
+        sub('/mission_status: state=%s (預期 %d = ABORTED)'
+            % (last_s[1] if last_s else None, rig.MissionStatus.STATE_ABORTED))
+        p3_ok = (last_m is not None and last_m[1] == 4 and last_m[2] is True
+                 and last_s is not None
+                 and last_s[1] == rig.MissionStatus.STATE_ABORTED)
+        record('P', 'P3', '急停時 stop_active=true 且 mission state=ABORTED',
+               'PASS' if p3_ok else 'FAIL',
+               'mode=%s, stop_active=%s, mission state=%s'
+               % (last_m[1] if last_m else None,
+                  last_m[2] if last_m else None,
+                  last_s[1] if last_s else None))
+    finally:
+        if rig is not None:
+            rig.close()
+        _ = (gz, ctl, nav)
+
+
+# --------------------------------------------------------------------------
 # 6.5 Phase L：存圖與定位模式
 # --------------------------------------------------------------------------
 class LocRig(object):
@@ -3185,10 +3381,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDHLNO'
+    phases = 'ABCDHLNOP'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNO'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNOP'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -3275,6 +3471,13 @@ def main():
         if 'O' in phases:
             try:
                 phase_o()
+            finally:
+                bg_stop_all()
+                sweep()
+
+        if 'P' in phases:
+            try:
+                phase_p()
             finally:
                 bg_stop_all()
                 sweep()
