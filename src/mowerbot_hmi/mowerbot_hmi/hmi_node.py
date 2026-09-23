@@ -270,6 +270,13 @@ class MainWindow(QtWidgets.QWidget):
             grid.addWidget(QtWidgets.QLabel(name + '：'), row, 0)
             widget.setStyleSheet('font-size: 16px; font-weight: bold;')
             grid.addWidget(widget, row, 1)
+        # 任務訊息：目前唯一的來源是「拒絕開始」(淨空不足以原地掉頭)。
+        # 只有 state 的「已中止」不夠 —— 使用者需要知道該做什麼才能繼續。
+        # 佔滿整行並允許換行，因為這則訊息會很長。
+        self.lbl_mission_msg = QtWidgets.QLabel('')
+        self.lbl_mission_msg.setWordWrap(True)
+        self.lbl_mission_msg.setVisible(False)
+        grid.addWidget(self.lbl_mission_msg, 7, 0, 1, 2)
         self.progress = QtWidgets.QProgressBar()
         self.progress.setMinimumHeight(24)
         grid.addWidget(self.progress, 4, 0, 1, 2)
@@ -450,6 +457,7 @@ class MainWindow(QtWidgets.QWidget):
             self.lbl_current.setText('—')
             self.progress.setValue(0)
             self.skipped_list.clear()
+            self.lbl_mission_msg.setVisible(False)
         else:
             self.lbl_mission.setText(
                 MISSION_STATE_NAMES.get(ms.state, '未知 (%d)' % ms.state))
@@ -463,6 +471,13 @@ class MainWindow(QtWidgets.QWidget):
             self.skipped_list.clear()
             for label in ms.skipped_labels:
                 self.skipped_list.addItem(label)
+            message = getattr(ms, 'message', '')
+            self.lbl_mission_msg.setText(message)
+            self.lbl_mission_msg.setStyleSheet(
+                'font-size: 15px; font-weight: bold; color: #b00020;'
+                if ms.state == MissionStatus.STATE_ABORTED
+                else 'font-size: 15px;')
+            self.lbl_mission_msg.setVisible(bool(message))
 
         info = self.backend.boundary_info()
         if info is None:

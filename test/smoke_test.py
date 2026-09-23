@@ -3322,6 +3322,11 @@ RE_Q_QUEUE = re.compile(
 RE_Q_BOUNDARY = re.compile(r'邊界提取成功！共化簡出 (\d+) 個多邊形頂點')
 
 
+class _Q3Done(Exception):
+    """Q3 已經記錄結果，用來跳出而不影響 finally 的清理"""
+
+
+
 def phase_q():
     hdr('Phase Q  真實地圖 -> 邊界 -> F2C -> 路徑可通行性')
     sub('其餘 Phase 用的是測試自己發的理想邊界，這一項用真實 SLAM 地圖，')
@@ -3366,6 +3371,14 @@ def phase_q():
             return
         sub('map_to_boundary 萃取的邊界：%d 個頂點，面積 %.2f m²'
             % (len(bnd), polygon_area(bnd)))
+
+        # ---- 1.5 先把車開回開闊處 ----
+        # drive_square 跑完車子停在場地角落，而 manager 從階段 23 起會拒絕
+        # 在淨空不足以原地掉頭的位置啟動任務。那是產品的正確行為，Q3 專門測它；
+        # 這裡只是把夾具的前提補上，Q1 的判定標準不變。
+        clear0 = rig.drive_to_clearance(bnd, Q_CIRCUM + 0.4, verbose=True)
+        sub('建圖結束後把車開回開闊處：離邊界 %s m（任務開始門檻 %.2f m）'
+            % (('%.2f' % clear0) if clear0 is not None else 'n/a', Q_CIRCUM))
 
         # ---- 2. 讓 manager 用這個邊界規劃 (mode 1) ----
         sub('切 mode 1 讓 manager 規劃（沒有啟動 Nav2，所以只會規劃不會開走）')
@@ -3500,6 +3513,99 @@ def phase_q():
                    '掉頭點最小淨空 %s m'
                    % (len(segs), len(bad_rot), len(bad_pass),
                       ('%.3f' % worst_rot[0]) if worst_rot[1] else 'n/a'))
+
+        # ---- Q3：車子自己停在轉不了身的地方時，任務必須拒絕開始 ----
+        #
+        # 階段 21 的檢查涵蓋「規劃出來的段落」，不涵蓋「使用者按下開始的當下
+        # 車子停在哪裡」。報告 18.4 節那次就是這樣：車子停在離東牆 0.40 m 的
+        # 角落，第一段 approach 連續三次 Failed to make progress，46 秒中止，
+        # 而且沒有任何一則訊息講出真正的原因。
+        #
+        # 這一項把車子開到離邊界不足外接半徑的地方，再要求切 mode 1，
+        # 期望：任務狀態變成 ABORTED、訊息說得出原因、而且**車子不會自己動**
+        # (不產生脫困動作 —— 74 kg 的機器在受限空間自己亂動風險更大)。
+        q3_note = []
+        q3_ok = False
+        try:
+            bnd = rig.boundaries[-1] if rig.boundaries else None
+            pose = rig.pose()
+            if bnd is None or pose is None:
+                record('Q', 'Q3', '淨空不足時任務拒絕開始', 'SKIP',
+                       '沒有邊界或查不到 map -> base_footprint 的 TF')
+                raise _Q3Done()
+
+            # 1. 轉向最近的邊界，往前開到淨空 < 0.45 m (遠低於 0.5841 才不會誤判)
+            rig.set_mode(2)
+            target_clear = 0.45
+            for _ in range(40):
+                pose = rig.pose()
+                if pose is None:
+                    break
+                near = nearest_boundary_point(pose[0], pose[1], bnd)
+                clear = point_polygon_distance(pose[0], pose[1], bnd)
+                if clear < target_clear:
+                    break
+                want = math.atan2(near[1] - pose[1], near[0] - pose[0])
+                err = math.atan2(math.sin(want - pose[2]),
+                                 math.cos(want - pose[2]))
+                if abs(err) > 0.15:
+                    rig.drive(0.0, 0.5 if err > 0 else -0.5,
+                              min(abs(err) / 0.5, 1.2))
+                else:
+                    rig.drive(0.25, 0.0, 0.6)
+                rig.drive(0.0, 0.0, 0.2)
+            rig.drive(0.0, 0.0, 0.5)
+            pose = rig.pose()
+            clear = (point_polygon_distance(pose[0], pose[1], bnd)
+                     if pose else None)
+            sub('Q3 車子開到 (%.2f, %.2f)，離邊界 %s m'
+                % (pose[0], pose[1],
+                   ('%.2f' % clear) if clear is not None else 'n/a'))
+            if clear is None or clear >= Q_CIRCUM:
+                record('Q', 'Q3', '淨空不足時任務拒絕開始', 'SKIP',
+                       '開不到離邊界 < %.2f m 的位置 (實際 %s m)，'
+                       '這一項的前提沒成立'
+                       % (Q_CIRCUM, ('%.2f' % clear) if clear else 'n/a'))
+                raise _Q3Done()
+
+            # 2. 要求開始任務
+            n_before = len(rig.f2c_path)
+            del rig.mission[:]
+            rig.set_mode(1)
+            rig.spin(8.0)
+            ms = rig.latest_mission(3.0)
+            if ms is None:
+                record('Q', 'Q3', '淨空不足時任務拒絕開始', 'FAIL',
+                       '切 mode 1 之後收不到 /mission_status')
+                raise _Q3Done()
+            refused = (ms.state == rig.MissionStatus.STATE_ABORTED
+                       and '無法開始' in ms.message)
+            no_new_path = (len(rig.f2c_path) == n_before)
+            q3_note.append('拒絕=%s (state=%d)，沒有重新規劃=%s，訊息「%s」'
+                           % (refused, ms.state, no_new_path,
+                              ms.message[:70] if ms.message else ''))
+
+            # 3. 把車推回開闊處，同一支程式必須能正常開始
+            rig.set_mode(0)
+            rig.set_mode(2)
+            clear2 = rig.drive_to_clearance(bnd, Q_CIRCUM + 0.4)
+            del rig.mission[:]
+            rig.set_mode(1)
+            rig.spin(10.0)
+            ms2 = rig.latest_mission(3.0)
+            started = (ms2 is not None and ms2.state in (
+                rig.MissionStatus.STATE_PLANNING,
+                rig.MissionStatus.STATE_EXECUTING))
+            q3_note.append('回到淨空 %s m 後可以開始=%s (state=%s)'
+                           % (('%.2f' % clear2) if clear2 else 'n/a', started,
+                              ms2.state if ms2 else 'n/a'))
+            rig.set_mode(0)
+            q3_ok = refused and no_new_path and started
+            record('Q', 'Q3',
+                   '車子自己淨空不足時拒絕開始、移到開闊處後可以開始',
+                   'PASS' if q3_ok else 'FAIL', '；'.join(q3_note))
+        except _Q3Done:
+            pass
     finally:
         if rig is not None:
             rig.close()
@@ -3553,6 +3659,18 @@ class MapRig(object):
         self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
         self.Twist = Twist
         self.SetDriveMode = SetDriveMode
+
+        # Q3 用：車子的位置要跟 manager 看到的完全一樣，所以查 TF
+        # (map -> base_footprint)，不要用 /odom —— 兩者之間差一個 map->odom。
+        import tf2_ros
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self.node)
+        from mowerbot_interfaces.msg import MissionStatus
+        self.MissionStatus = MissionStatus
+        self.mission = []
+        self.node.create_subscription(
+            MissionStatus, '/mission_status',
+            lambda m: self.mission.append(m), 10)
 
     def spin(self, seconds):
         t0 = time.time()
@@ -3622,9 +3740,121 @@ class MapRig(object):
             return None
         return float(dist[row, col])
 
+    def drive_to_clearance(self, boundary, want, max_steps=45, verbose=False):
+        """把車開到離邊界至少 want 公尺的地方，回傳最後量到的淨空。
+
+        Q1 需要這一步，是因為 drive_square 跑完之後車子停在場地角落
+        (實測 (5.60, 4.91)，離邊界只有 0.22 m)。manager 從階段 23 起會
+        拒絕在這種位置啟動任務 —— 那是產品的正確行為 (見 Q3)，
+        所以夾具要先把車開回開闊處，Q1 才測得到它真正要測的東西
+        (「真實地圖規劃出來的路徑可不可通行」)。Q1 的判定標準沒有動。
+
+        車子卡在角落時**不能只靠原地旋轉脫困**：實測連轉 30 次，yaw 只從
+        1.65 動到 1.89 —— 車體壓在兩面牆之間，輪子空轉。所以先倒車退出來
+        再轉向，而且偵測到「轉不動」時再倒一次。
+        (這是測試夾具的脫困，不是產品行為；產品那邊刻意不做脫困動作。)
+        """
+        cx = sum(p[0] for p in boundary) / len(boundary)
+        cy = sum(p[1] for p in boundary) / len(boundary)
+        self.drive(-0.3, 0.0, 2.5)          # 先倒車離開牆面
+        self.drive(0.0, 0.0, 0.4)
+        clear, last = None, None
+        stall = 0
+        for step in range(max_steps):
+            pose = self.pose()
+            if pose is None:
+                break
+            clear = point_polygon_distance(pose[0], pose[1], boundary)
+            if verbose:
+                sub('  第 %d 步：(%.2f, %.2f) yaw %.2f，淨空 %.2f m'
+                    % (step, pose[0], pose[1], pose[2], clear))
+            if clear >= want:
+                break
+            if last is not None and math.hypot(pose[0] - last[0],
+                                               pose[1] - last[1]) < 0.02 \
+                    and abs(math.atan2(math.sin(pose[2] - last[2]),
+                                       math.cos(pose[2] - last[2]))) < 0.05:
+                stall += 1
+            else:
+                stall = 0
+            last = pose
+            if stall >= 2:                   # 卡住了，再倒一次
+                self.drive(-0.3, 0.0, 2.0)
+                self.drive(0.0, 0.0, 0.3)
+                stall = 0
+                continue
+            want_yaw = math.atan2(cy - pose[1], cx - pose[0])
+            err = math.atan2(math.sin(want_yaw - pose[2]),
+                             math.cos(want_yaw - pose[2]))
+            if abs(err) > 0.20:
+                self.drive(0.0, 0.6 if err > 0 else -0.6,
+                           min(abs(err) / 0.6, 1.5))
+            else:
+                self.drive(0.35, 0.0, 1.0)
+            self.drive(0.0, 0.0, 0.2)
+        self.drive(0.0, 0.0, 0.5)
+        pose = self.pose()
+        if pose is not None:
+            clear = point_polygon_distance(pose[0], pose[1], boundary)
+        return clear
+
+    def pose(self):
+        """車子在 map 座標系的 (x, y, yaw)，查不到回傳 None。"""
+        import math as _m
+        from rclpy.time import Time
+        from rclpy.duration import Duration
+        self.spin(0.2)
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', Time(), timeout=Duration(seconds=1.0))
+        except Exception:
+            return None
+        t = tf.transform.translation
+        q = tf.transform.rotation
+        yaw = _m.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return (t.x, t.y, yaw)
+
+    def latest_mission(self, timeout=5.0):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.mission:
+            self.spin(0.2)
+        return self.mission[-1] if self.mission else None
+
     def close(self):
         self.node.destroy_node()
         self.rclpy.shutdown()
+
+
+def point_polygon_distance(x, y, pts):
+    """點到多邊形邊界的最短距離 (與 manager 的 _point_polygon_distance 同一套算法)"""
+    best = float('inf')
+    for i in range(len(pts)):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % len(pts)]
+        vx, vy = bx - ax, by - ay
+        norm2 = vx * vx + vy * vy
+        t = 0.0 if norm2 < 1e-18 else max(
+            0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / norm2))
+        best = min(best, math.hypot(x - (ax + t * vx), y - (ay + t * vy)))
+    return best
+
+
+def nearest_boundary_point(x, y, pts):
+    """多邊形上離 (x, y) 最近的那個點"""
+    best, bp = float('inf'), None
+    for i in range(len(pts)):
+        ax, ay = pts[i]
+        bx, by = pts[(i + 1) % len(pts)]
+        vx, vy = bx - ax, by - ay
+        norm2 = vx * vx + vy * vy
+        t = 0.0 if norm2 < 1e-18 else max(
+            0.0, min(1.0, ((x - ax) * vx + (y - ay) * vy) / norm2))
+        px, py = ax + t * vx, ay + t * vy
+        d = math.hypot(x - px, y - py)
+        if d < best:
+            best, bp = d, (px, py)
+    return bp
 
 
 # --------------------------------------------------------------------------

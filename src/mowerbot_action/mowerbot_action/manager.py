@@ -51,6 +51,7 @@ class MowerManager(Node):
         self._mission_total = 0        # 任務開始時的佇列總段數 (任務結束後仍保留，給畫面顯示)
         self._lead_in_hist = {}        # 跑道長度 -> 幾條割草線用了這個長度
         self._current_label = ''
+        self._mission_message = ''     # 任務層級的說明訊息，給 HMI 顯示 (階段 23)
         self._result_future = None
 
         # TF：manager 本來完全不知道車子在哪裡，但要算出「從當下位置前往第 1 條
@@ -331,6 +332,17 @@ class MowerManager(Node):
             self.set_mission_state(MissionStatus.STATE_ABORTED)
             return
 
+        # 規劃之前先看車子自己站得下站不下。這一項擋的是「車子當下停的位置」，
+        # 與階段 21 那些針對「規劃出來的段落」的檢查互補 —— 見 start_pose_blocked()。
+        blocked = self.start_pose_blocked()
+        if blocked is not None:
+            text = ('無法開始：%s，不足以原地掉頭。'
+                    '請先用手動模式(模式 0)把車輛移到開闊處，再切回自動割草。'
+                    % blocked)
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+
         if not self.f2c_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error('⚠️ F2C 伺服器未上線，請確認 f2c_server 已經啟動！')
             self.set_mission_state(MissionStatus.STATE_ABORTED)
@@ -471,6 +483,7 @@ class MowerManager(Node):
                 labels.append('%s (起點未知)' % label)
             _ = reason
         ms.skipped_labels = labels
+        ms.message = self._mission_message
         self.mission_status_pub.publish(ms)
 
     def abort_mission_if_running(self):
@@ -483,9 +496,15 @@ class MowerManager(Node):
                                    MissionStatus.STATE_EXECUTING):
             self.set_mission_state(MissionStatus.STATE_ABORTED)
 
-    def set_mission_state(self, state, label=None):
-        """集中改任務狀態，順便把「目前段落」一起更新，避免兩邊各改一半"""
+    def set_mission_state(self, state, label=None, message=''):
+        """集中改任務狀態，順便把「目前段落」與說明訊息一起更新。
+
+        message 預設是空字串而不是 None：每一次狀態轉換都要把上一則訊息清掉，
+        否則「無法開始」的字樣會留在畫面上，使用者把車推開、任務正常跑起來之後
+        還看得到它。要顯示訊息的人自己傳進來。
+        """
         self._mission_state = state
+        self._mission_message = message
         if label is not None:
             self._current_label = label
         if state in (MissionStatus.STATE_IDLE, MissionStatus.STATE_DONE,
@@ -713,6 +732,38 @@ class MowerManager(Node):
             if bd < need_b:
                 return '離邊界只有 %.2f m (%s需要 %.2f m)' % (bd, what, need_b)
         return None
+
+    def start_pose_blocked(self):
+        """任務開始前，檢查**車子當下停的位置**自己轉不轉得了身。
+
+        回傳不可行的原因字串，可以開始就回傳 None。
+
+        【為什麼需要這一項】
+        階段 21 把外接半徑 0.5841 m 的掉頭淨空檢查套在「規劃出來的段落」上：
+        跑道起點、approach 目標、佇列每一段的起訖點都查過了。
+        但是沒有任何一項檢查涵蓋「使用者按下開始的當下，車子停在哪裡」。
+        實測 (報告 18.4 節)：建圖繞完之後車子停在離東牆 0.40 m 的角落，
+        第一段 approach 連續三次 `Failed to make progress`，任務 46 秒就中止，
+        而且 log 裡沒有任何一則訊息指出真正的原因。
+
+        【為什麼不自己脫困】
+        淨空不足時不產生任何脫困動作。74 kg 的機器在受限空間裡自己亂動，
+        風險大於讓人把它推開；而且脫困路徑本身也需要它沒有的那塊空間。
+        正確的預設是拒絕開始並把原因講清楚。
+        """
+        xy = self.get_robot_pose_in_map()
+        if xy is None:
+            # 查不到位置時**不擋**。這一項檢查的職責是「淨空不足就拒絕開始」，
+            # 「不知道車子在哪裡」是另一回事，不要混進來變成第二種拒絕理由
+            # （訊息會變成叫人去把車推開，但問題根本不在位置上）。
+            # 處理方式與 maybe_insert_approach() 一致：警告並放行。
+            self.get_logger().warn(
+                '⚠️ 查不到車子位置，任務開始前的淨空檢查這次跳過')
+            return None
+        reason = self.lead_in_point_unsafe(xy[0], xy[1], need_rotation=True)
+        if reason is None:
+            return None
+        return '車輛目前位置 (%.2f, %.2f) %s' % (xy[0], xy[1], reason)
 
     def lead_in_first_feasible(self, ax, ay, ux, uy, index, total):
         """從設定的長度開始往下試，回傳第一個「整條都安全」的跑道長度。

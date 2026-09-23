@@ -205,14 +205,14 @@ graph LR
         N["Phase N Nav2 路徑跟隨<br/>6 項"]
         O["Phase O 障礙物容錯<br/>1 項"]
         P["Phase P 狀態發布 +<br/>模式仲裁 + 手把<br/>10 項"]
-        Q["Phase Q 真實地圖<br/>路徑與佇列可通行性<br/>2 項"]
+        Q["Phase Q 真實地圖<br/>路徑、佇列、開始前淨空<br/>3 項"]
     end
     A --> C
     B --> C
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **47 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **48 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |
@@ -226,7 +226,7 @@ graph LR
 | N | Nav2 生命週期、F2C 路徑、端到端覆蓋任務、remap、RTF、急停清佇列 | ✓ |
 | O | 臨時障礙物擋住割草線時跳過該段並繼續（固定用 `demo_lawn_obstacle.world`） | ✓ |
 | P | 狀態發布（`/mower_status`、`/mission_status`、`/joy_status`）、邊界防呆、HMI 無頭啟動、五個模式的急停鍵與手把仲裁 | ✓ |
-| Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑與**佇列**可通行性（含掉頭空間，規劃出轉不過去的點就擋下來） | ✓ |
+| Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑與**佇列**可通行性（含掉頭空間，規劃出轉不過去的點就擋下來）＋**任務開始前車子自己的淨空** | ✓ |
 
 覆蓋率拆帳不在測試套件裡（它要跑一次 23 分鐘的完整任務），
 用 `test/tools/coverage_run.py` + `test/tools/coverage_budget.py` 手動量，
@@ -279,7 +279,10 @@ Gazebo 物理上擋住車子，**全程沒有任何一則訊息指出真正的�
 
 目前的緩解是**規劃層**的幾何檢查（階段 21）：需要掉頭的點要求淨空
 ≥ 0.5841 m，只直線通過的點要求 ≥ 0.34 m（內切半徑）。
-**這是預防，不是保護** —— 規劃層算錯或地圖過期時，控制層不會攔下來。
+階段 23 又補上「任務開始前檢查車子自己當下的位置」（`start_pose_blocked()`），
+淨空不足就拒絕開始、不產生脫困動作 —— 因為在受限空間裡自己亂動的風險
+大於讓人把它推開，而且脫困路徑本身也需要它正好沒有的那塊空間。
+**這些都是預防，不是保護** —— 規劃層算錯或地圖過期時，控制層不會攔下來。
 
 `nav2` 有 `ObstacleFootprint` critic 會檢查完整外框，但它的隱含門檻更嚴
 （見 `simulation_results.md` 17.5 節的量測），要不要採用是未決的決定。
@@ -307,9 +310,17 @@ Gazebo 物理上擋住車子，**全程沒有任何一則訊息指出真正的�
 |------|------|--------------|
 | `coverage_overlap_000.png` | 重疊率 0 的覆蓋示意圖（灰=地頭、淺綠=已割、紅=沒掃到、藍=實際軌跡）。每兩條割草線之間都有月牙形的縫 | 4.6.4 節 |
 | `coverage_overlap_040.png` | 重疊率 0.4（選定值）。月牙縫被隔壁那刀補掉，只剩開頭一塊 | 4.6.4 節 |
+| `coverage_heatmap.png` | demo_lawn 完整任務的覆蓋熱圖（白=割到、紅=草坪上沒割到、深灰=牆體），疊上規劃的割草線與周邊環繞的實際軌跡 | 18.3.1 節 |
 
-兩張圖都可以用下列指令重新產生：
+前兩張圖可以用下列指令重新產生：
 
 ```bash
 python3 test/tools/coverage_analysis.py --figure test/logs/<timestamp>
+```
+
+熱圖：
+
+```bash
+python3 test/tools/coverage_budget.py <prefix> --log <manager log> \
+        --heatmap docs/coverage_heatmap.png
 ```
