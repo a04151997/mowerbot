@@ -228,6 +228,10 @@ graph LR
 | P | 狀態發布（`/mower_status`、`/mission_status`、`/joy_status`）、邊界防呆、HMI 無頭啟動、五個模式的急停鍵與手把仲裁 | ✓ |
 | Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑與**佇列**可通行性（含掉頭空間，規劃出轉不過去的點就擋下來） | ✓ |
 
+覆蓋率拆帳不在測試套件裡（它要跑一次 23 分鐘的完整任務），
+用 `test/tools/coverage_run.py` + `test/tools/coverage_budget.py` 手動量，
+量法與最新結果見 `simulation_results.md` 第 18 節。
+
 另有 17 項純 Python 的里程計單元測試（`mowerbot_bridge/test/test_odometry.py`），
 不需要 ROS，一秒內跑完：
 
