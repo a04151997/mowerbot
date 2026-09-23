@@ -18,6 +18,6 @@ mower_teleop:
         button_a: 0             # 建圖
         button_b: 1             # F2C
         button_x: 2             # 手動
-        button_y: 3             # 導航
+        button_y: 3             # 未繫結（階段 23 拿掉；mode 3 是保留值，未實作）
         button_deadman: 4       # 安全鈕 (LB)，按住才會輸出速度
         button_stop: 5          # 緊急停止

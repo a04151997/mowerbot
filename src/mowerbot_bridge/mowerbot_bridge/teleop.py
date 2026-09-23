@@ -123,9 +123,14 @@ class MowerTeleop(Node):
                 elif data.buttons[self.p['button_x']] == 1 and self.last_button[self.p['button_x']] == 0:
                     self.call_service(2) #手動
                     self.get_logger().info('切換至手動模式')
-                elif data.buttons[self.p['button_y']] == 1 and self.last_button[self.p['button_y']] == 0:
-                    self.call_service(3) # mode 3：保留值，未實作
-                    self.get_logger().warn('切換到 mode 3（保留值，未實作）')
+                # Y 鍵沒有繫結（階段 23）。
+                # 它以前呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
+                # （需要 planner_server + bt_navigator，見 architecture.md 3.1）。
+                # 留著一顆會把車切進未實作模式的按鍵，等於在實車上提供一個
+                # 沒有人測過用途的入口，所以整個分支拿掉。
+                # **不要拿 Y 去做別的事** —— 按鍵語意改變在實車上比沒有功能危險。
+                # button_y 這個參數本身留著：joystick.yaml 還在宣告它，
+                # 刪掉會讓現有的設定檔變成「未宣告的參數」而啟動失敗。
 
                 #處理速度輸出：只有按住 LB (deadman) 時才把搖桿值算進 twist
                 twist = Twist()

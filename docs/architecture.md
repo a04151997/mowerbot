@@ -143,8 +143,11 @@ stateDiagram-v2
 
 因此階段 23 把 mode 3 從介面上移掉：
 
-* **HMI 沒有「3」這顆按鈕**（`SELECTABLE_MODES = (0, 1, 2)`），
-  手把的啟動提示也不再把 Y 列成可用功能。
+* **HMI 沒有「3」這顆按鈕**（`SELECTABLE_MODES = (0, 1, 2)`）。
+* **手把的 Y 鍵不繫結任何東西**。它以前呼叫 `change_mower_mode(3)`，
+  那個分支已經移除，而且沒有拿去做別的事 —— 按鍵語意改變在實車上比
+  沒有功能危險。`Phase P` 的 P11 驗證「按下 Y 模式不變」，
+  並用「同一條 `/joy` 路徑按 A 要切得動」當對照組，避免空過。
 * **編號不重新排。** mode 4 必須維持是急停，那是安全介面；
   為了讓表格好看而把 4 挪成 3 是不能接受的。所以 3 留著當空號。
 * **manager 對 mode 3 的仲裁行為完全保留**：轉發 `/cmd_vel_nav`、
@@ -229,7 +232,7 @@ graph LR
         L["Phase L 存圖與定位<br/>4 項"]
         N["Phase N Nav2 路徑跟隨<br/>6 項"]
         O["Phase O 障礙物容錯<br/>1 項"]
-        P["Phase P 狀態發布 +<br/>模式仲裁 + 手把<br/>10 項"]
+        P["Phase P 狀態發布 +<br/>模式仲裁 + 手把<br/>11 項"]
         Q["Phase Q 真實地圖<br/>路徑、佇列、開始前淨空<br/>3 項"]
     end
     A --> C
@@ -237,7 +240,7 @@ graph LR
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **48 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **49 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |

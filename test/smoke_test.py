@@ -3290,6 +3290,54 @@ def phase_p():
                '發布中 connected=%s/deadman=%s ; 停發後 connected=%s/deadman=%s'
                % (connected_while, deadman_while,
                   after[1] if after else None, after[2] if after else None))
+
+        # ---- P11 手把 Y 鍵沒有繫結 ----
+        #
+        # Y 以前會呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
+        # （需要 planner_server + bt_navigator）。階段 23 把那個分支拿掉了，
+        # 這一項確認它真的沒有回來，而且沒有被拿去做別的事。
+        #
+        # mode 值 3 本身、manager 對 mode 3 的仲裁、以及 P7 / P9 / N6 那些
+        # **用服務**設 mode 3 的測試全部不受影響 —— 它們本來就不經過手把。
+        hdr('P11  按下手把 Y 鍵不會改變模式（Y 未繫結）')
+        # 按鈕順序 = [A, B, X, Y, LB(deadman), 急停]
+        JOY_NONE = [0, 0, 0, 0, 1, 0]            # 只按住 LB
+        JOY_Y    = [0, 0, 0, 1, 1, 0]            # LB + Y
+        JOY_A    = [1, 0, 0, 0, 1, 0]            # LB + A（對照組）
+        idle = [0.0, 0.0, 0.0, 0.0]
+
+        rig.set_mode(2)
+        rig.spin(0.6)
+        mode_before = rig.mower[-1][1] if rig.mower else None
+        sub('起始模式 = %s' % mode_before)
+
+        # teleop 只認上升緣，所以先送「沒按 Y」再送「按下 Y」
+        rig.pub_joy(idle, JOY_NONE, 0.6)
+        del rig.mower[:]
+        rig.pub_joy(idle, JOY_Y, 2.0)
+        rig.spin(0.8)
+        modes_after_y = sorted({m[1] for m in rig.mower})
+        sub('按住 LB 並按下 Y 共 2 秒：期間出現過的模式 = %s' % modes_after_y)
+
+        # 對照組：同一支測試、同一條 /joy 路徑，按 A 一定要切得動。
+        # 沒有這一步的話，「模式沒變」也可能只是 teleop 根本沒收到 /joy。
+        rig.pub_joy(idle, JOY_NONE, 0.6)
+        del rig.mower[:]
+        rig.pub_joy(idle, JOY_A, 2.0)
+        rig.spin(0.8)
+        modes_after_a = sorted({m[1] for m in rig.mower})
+        sub('對照組：按住 LB 並按下 A：期間出現過的模式 = %s' % modes_after_a)
+        rig.set_mode(2)
+
+        y_no_change = (modes_after_y == [mode_before])
+        a_changed = (0 in modes_after_a)
+        p11_ok = y_no_change and a_changed
+        record('P', 'P11',
+               '按下手把 Y 鍵不會改變模式，但同一條路徑按 A 切得動',
+               'PASS' if p11_ok else 'FAIL',
+               'Y：模式 %s -> %s（不變=%s）；A（對照組）：模式 -> %s（切換成功=%s）'
+               % (mode_before, modes_after_y, y_no_change,
+                  modes_after_a, a_changed))
     finally:
         if rig is not None:
             rig.close()
