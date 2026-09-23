@@ -9,6 +9,21 @@
 
 標籤來自 /mission_status.current_label，所以每一個軌跡取樣點都知道
 它當下屬於哪一段 (周邊環繞 / 割草線 / approach)。
+
+<prefix>_traj.csv 的欄位：
+
+    t, x, y, label, odom_vx, odom_wz, cmd_vx, cmd_wz, cmd_age
+
+  odom_vx / odom_wz  /odom 的 twist，車子**實際**的線速度與角速度
+  cmd_vx  / cmd_wz   /cmd_vel 最後一筆的 linear.x 與 angular.z，也就是**指令**
+  cmd_age  這一筆 cmd 是多久以前收到的 (秒)。/cmd_vel 是 20 Hz、
+           /odom 是 30 Hz，正常情況下 < 0.05 s；數值變大代表那段時間
+           根本沒有人在下指令，這本身就是資訊。
+
+  指令與實際分開錄，是因為「車子在原地轉圈」有兩種完全不同的成因：
+  控制器一直在下轉向指令，或是指令是直線但車子被擋住走不動。
+  只錄位置分不出來 —— 階段 23 的那次診斷就是卡在這裡。
+  取樣時刻與 x / y / label 完全對齊：全部在同一個 /odom 回呼裡寫進同一列。
 """
 import csv, math, sys, time, numpy as np, rclpy
 from rclpy.node import Node
@@ -26,12 +41,21 @@ qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
 odom, maps, bnds = [], [], []
 state = {'label': '', 'state': 0, 'total': 0, 'done': 0, 'skipped': 0}
 pose = {'x': 0.0, 'y': 0.0, 'yaw': 0.0}
+# /cmd_vel 最後一筆：(收到的時刻, linear.x, angular.z)。
+# 沒收到過就用 t=0，這樣 cmd_age 會是一個很大的數字，一眼看得出「沒有指令」。
+cmd = {'t': 0.0, 'vx': 0.0, 'wz': 0.0}
+n.create_subscription(
+    Twist, '/cmd_vel',
+    lambda m: cmd.update(t=time.time(), vx=m.linear.x, wz=m.angular.z), 50)
 def on_odom(m):
     q = m.pose.pose.orientation
     pose['x'] = m.pose.pose.position.x
     pose['y'] = m.pose.pose.position.y
     pose['yaw'] = math.atan2(2*(q.w*q.z), 1-2*(q.z*q.z))
-    odom.append((time.time(), pose['x'], pose['y'], state['label']))
+    now = time.time()
+    odom.append((now, pose['x'], pose['y'], state['label'],
+                 m.twist.twist.linear.x, m.twist.twist.angular.z,
+                 cmd['vx'], cmd['wz'], now - cmd['t'] if cmd['t'] else 999.0))
 n.create_subscription(Odometry, '/odom', on_odom, 50)
 n.create_subscription(OccupancyGrid, '/map', lambda m: maps.append(m), qos)
 n.create_subscription(PolygonStamped, '/f2c_boundary',
@@ -98,8 +122,13 @@ print('任務結束：state=%d 完成 %d/%d 跳過 %d，耗時 %.0f s'
       % (state['state'], state['done'], state['total'], state['skipped'], time.time()-t0))
 mode(2)
 with open(OUT + '_traj.csv', 'w', newline='') as fh:
-    w = csv.writer(fh); w.writerow(['t', 'x', 'y', 'label'])
-    for row in odom: w.writerow(['%.3f' % row[0], '%.4f' % row[1], '%.4f' % row[2], row[3]])
+    w = csv.writer(fh)
+    w.writerow(['t', 'x', 'y', 'label',
+                'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz', 'cmd_age'])
+    for r in odom:
+        w.writerow(['%.3f' % r[0], '%.4f' % r[1], '%.4f' % r[2], r[3],
+                    '%.4f' % r[4], '%.4f' % r[5],
+                    '%.4f' % r[6], '%.4f' % r[7], '%.3f' % r[8]])
 m = maps[-1]
 g = np.array(m.data, dtype=np.int8).reshape((m.info.height, m.info.width))
 np.savez(OUT + '_map.npz', grid=g, res=m.info.resolution,

@@ -2183,6 +2183,22 @@ python3 test/tools/coverage_budget.py <prefix> --log <log> \
 `/mission_status.current_label` 把每個取樣點標成外圈／割草線／approach ——
 這是階段 18 才有的介面，在那之前沒辦法做這種拆帳。
 
+`<prefix>_traj.csv` 的欄位（階段 23 補上後四欄）：
+
+| 欄位 | 內容 |
+|------|------|
+| `t, x, y, label` | 時刻、位置、`current_label` |
+| `odom_vx, odom_wz` | `/odom` 的 twist —— 車子**實際**的線速度與角速度 |
+| `cmd_vx, cmd_wz` | `/cmd_vel` 最後一筆的 `linear.x` / `angular.z` —— **指令** |
+| `cmd_age` | 這一筆指令是多久以前收到的（秒）。`/cmd_vel` 20 Hz、`/odom` 30 Hz，正常 < 0.05 s；變大代表那段時間根本沒有指令 |
+
+九個欄位全部在同一個 `/odom` 回呼裡寫進同一列，所以時間戳天生對齊。
+
+**為什麼要分開錄指令與實際**：「車子在原地轉圈」有兩種完全不同的成因 ——
+控制器一直在下轉向指令，或是指令是直線但車子被擋住走不動。只錄位置分不出來。
+階段 23 的診斷（第 21 節）就是卡在這裡：`/cmd_vel` 從來沒有被錄過，
+「linear.x 是不是恆為 0」這個基本問題答不出來。
+
 ### 18.3 結果（demo_lawn，headland = 0.70，2026-09-24 的執行）
 
 那次任務**完整跑到結束**（`state=DONE`）：共 80 段、完成 74、跳過 6、耗時 1394 s。
