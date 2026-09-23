@@ -48,13 +48,21 @@ from geometry_msgs.msg import PolygonStamped
 from mowerbot_interfaces.msg import MowerStatus, MissionStatus, JoyStatus
 from mowerbot_interfaces.srv import SetDriveMode
 
+# mode 3 留在表裡但沒有按鈕：它是保留值、沒有實作，介面上不提供給使用者。
+# 還是要有名字，因為如果有東西（例如手把、或直接呼叫服務）把模式設成 3，
+# 畫面必須誠實顯示它現在是什麼狀態，而不是「未知」。
 MODE_NAMES = {
     0: '建圖模式',
     1: '自動割草 (F2C)',
     2: '手動模式',
-    3: '自動導航',
+    3: '保留（未實作）',
     4: '緊急停止',
 }
+
+# 畫面上提供給使用者的模式按鈕。
+# 不含 3：自動導航需要 planner_server + bt_navigator，不在本專題的宣告範圍內。
+# 不含 4：急停在最上面那顆大按鈕，重複放一顆小的只會讓人在急的時候按錯。
+SELECTABLE_MODES = (0, 1, 2)
 
 MISSION_STATE_NAMES = {
     MissionStatus.STATE_IDLE: '待命',
@@ -240,9 +248,7 @@ class MainWindow(QtWidgets.QWidget):
         mode_box = QtWidgets.QGroupBox('模式')
         mode_layout = QtWidgets.QVBoxLayout(mode_box)
         self.mode_buttons = {}
-        # 緊急停止 (mode 4) 不放在這裡 —— 它在最上面那顆大按鈕，
-        # 重複放一顆小的只會讓人在急的時候按錯。
-        for mode in (0, 1, 2, 3):
+        for mode in SELECTABLE_MODES:
             btn = QtWidgets.QPushButton('%d  %s' % (mode, MODE_NAMES[mode]))
             btn.setMinimumHeight(46)
             btn.setStyleSheet('font-size: 17px;')

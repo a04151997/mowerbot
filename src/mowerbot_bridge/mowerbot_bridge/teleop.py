@@ -44,7 +44,11 @@ class MowerTeleop(Node):
 
         #手把鎖定
         #False表示目前是鎖定
-        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後選可擇模式：A（建圖）, B（F2C）, X(手動), Y（導航）')
+        # Y 不列出來：它對應 mode 3，那是保留值、沒有實作(階段 23)。
+        # 按鍵繫結本身沒有動 —— 模式仲裁的行為不在這次的變更範圍內，
+        # 而且 manager 對 mode 3 的處理是定義好而且安全的(擋手把、急停有效)。
+        # 這裡只是不再把它當成一個可用功能宣傳。
+        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
 
@@ -120,8 +124,8 @@ class MowerTeleop(Node):
                     self.call_service(2) #手動
                     self.get_logger().info('切換至手動模式')
                 elif data.buttons[self.p['button_y']] == 1 and self.last_button[self.p['button_y']] == 0:
-                    self.call_service(3) #導航
-                    self.get_logger().info('切換導航模式')
+                    self.call_service(3) # mode 3：保留值，未實作
+                    self.get_logger().warn('切換到 mode 3（保留值，未實作）')
 
                 #處理速度輸出：只有按住 LB (deadman) 時才把搖桿值算進 twist
                 twist = Twist()

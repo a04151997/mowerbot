@@ -124,17 +124,26 @@ class MowerManager(Node):
             f'🔪 實際刀盤寬 = {self.blade_width:.3f} m，'
             f'重疊率 = {self.overlap_ratio:.2f}，'
             f'割草線間距 = {self.swath_spacing:.3f} m')
-        # 模式標籤說明現況：
-        # mode 1 與 mode 3 在 nav_vel_cb 裡的行為完全相同(兩者都轉發 /cmd_vel_nav)，
-        # 唯一差別是切到 mode 1 會觸發 call_f2c_planner() 去規劃並執行覆蓋任務。
-        # 也就是說 mode 3 目前沒有任何獨立功能，標籤先改誠實，行為不動。
-        # 未來 mode 3 可用於點對點導航(接 planner_server 的 ComputePathToPose)，
-        # 屆時兩個模式才會真正分家。
+        # mode 3 是**保留值，沒有實作**(階段 23)。
+        #
+        # 【為什麼不重新編號】
+        # mode 4 必須維持是急停。把 3 拿掉再往前挪會動到急停的編號，
+        # 那是安全介面，不能為了讓表格好看而改。所以 3 留著當空號。
+        #
+        # 【為什麼仲裁行為要保留】
+        # 介面上已經沒有任何按鈕可以切到 3，但服務 change_mower_mode 仍然
+        # 接受它。萬一有東西(手把、外部腳本、之後的程式碼)把模式設成 3，
+        # 行為必須是定義好而且安全的 —— 所以 nav_vel_cb 的轉發、joy_vel_cb
+        # 的擋手把、急停與離開時的清空佇列，全部維持原狀，測試也全部保留。
+        #
+        # 【要做出來需要什麼】
+        # 點對點導航要 planner_server(ComputePathToPose) 與 bt_navigator，
+        # 兩者都沒有啟動；本專題只跑 controller_server。列為未來工作。
         self.mode_map = {
             0: '建圖模式(SLAM)',
             1: '自動割草(F2C規劃+執行)',
             2: '手動模式',
-            3: '自動導航(保留，目前與模式1行為相同)',
+            3: '保留(未實作)',
             4: '緊急停止(E-STOP)'
         }
 
@@ -201,7 +210,7 @@ class MowerManager(Node):
             self.handle_estop_violation('手把 (Teleop)')
 
     """ 
-    接收導航速度：僅在 F2C(1) 或自動導航(3) 模式下轉發 
+    接收導航速度：僅在 F2C(1) 或保留的 mode 3 下轉發 
     """
     def nav_vel_cb(self,msg):
         if self.current_mode == 1 or self.current_mode == 3:
@@ -399,7 +408,7 @@ class MowerManager(Node):
             else:
                 self.get_logger().info(f'成功切換至 {mode_name}')
 
-                # 【安全關鍵】從 F2C(1) 或自動導航(3) 離開時同樣要清空佇列。
+                # 【安全關鍵】從 F2C(1) 或保留的 mode 3 離開時同樣要清空佇列。
                 # 理由同急停：殘留在佇列裡的割草線會被結果回呼接續執行，
                 # 使用者以為已經離開自動模式，車子卻還會自己跑完剩下的任務。
                 if previous_mode in (1, 3) and self.current_mode != previous_mode:

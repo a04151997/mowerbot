@@ -2162,7 +2162,7 @@ def phase_n():
 
         # ---- N3 端到端覆蓋任務 ----
         hdr('N3  端到端覆蓋任務 (manager 逐條割草線循序執行)')
-        sub('說明：manager 的 call_f2c_planner() 綁在 mode 1 (F2C)，mode 3 不會觸發規劃，')
+        sub('說明：manager 的 call_f2c_planner() 綁在 mode 1 (F2C)，mode 3（保留值）不會觸發規劃，')
         sub('      因此這裡用 mode 1 啟動任務；nav_vel_cb 在 mode 1 與 3 都會轉發速度。')
         sub('先對 /f2c_boundary 發布同一個 5m x 5m 邊界給 manager')
         rig.publish_boundary(bcx, bcy, half=half, seconds=3.0)
@@ -2880,7 +2880,10 @@ def phase_o():
 # 這兩支話題是 HMI 唯一的資訊來源。GUI 本身不好自動化測試，
 # 但「狀態有沒有正確發出來」可以，而且那才是真正會被別的東西依賴的介面。
 # --------------------------------------------------------------------------
-P_MODE_NAMES = {0: '建圖', 1: '自動割草(F2C)', 2: '手動', 3: '自動導航', 4: '緊急停止'}
+# mode 3 是保留值(階段 23 起介面上沒有按鈕)，但仲裁行為仍然定義明確，
+# 所以 P7 的五模式急停與 P9 的擋手把都還是要測到它 —— 用服務直接設模式即可。
+P_MODE_NAMES = {0: '建圖', 1: '自動割草(F2C)', 2: '手動', 3: '保留(未實作)',
+                4: '緊急停止'}
 
 
 class StatusRig(object):
