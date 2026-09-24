@@ -52,6 +52,10 @@ class MowerManager(Node):
         self._lead_in_hist = {}        # 跑道長度 -> 幾條割草線用了這個長度
         self._current_label = ''
         self._mission_message = ''     # 任務層級的說明訊息，給 HMI 顯示 (階段 23)
+        # approach 迴圈的終止：記住「現在在接近哪一段」與歷次量到的距離
+        self._approach_for = None      # 目前在為哪一個段落插 approach
+        self._approach_dists = []      # 每一輪量到的「離目標多遠」
+        self._approach_tries = 0       # 已經為這個目標插了幾段 approach
         self._result_future = None
 
         # TF：manager 本來完全不知道車子在哪裡，但要算出「從當下位置前往第 1 條
@@ -532,6 +536,7 @@ class MowerManager(Node):
         self._current_swath_idx = 0
         self._swath_total = 0
         self._result_future = None
+        self._reset_approach_tracking()
 
     def cancel_current_goal(self):
         """取消目前正在執行的 FollowPath goal
@@ -547,6 +552,23 @@ class MowerManager(Node):
     # approach 路徑的兩個常數
     APPROACH_SKIP_DISTANCE = 0.5      # 距離小於這個值就不用 approach
     APPROACH_WAYPOINT_SPACING = 0.1   # 與割草線的航點間距一致
+
+    # ---- approach 迴圈的終止條件 (階段 23) ----
+    #
+    # 【為什麼需要】
+    # approach 完成之後 manager 會重新量「離目標多遠」，還是太遠就再插一段。
+    # 問題是這個迴圈由**連續成功**構成：每一段 approach 都回 SUCCEEDED，
+    # 所以 max_consecutive_failures 永遠歸零、永遠擋不到。
+    # 實測 (報告 21 節)：跳過周邊環繞 4/5 之後連插 5 段 approach，
+    # 量到的距離是 0.55 → 0.63 → 0.52 → 0.55 → 0.51 → 0.50，
+    # 在 0.5 m 門檻邊上徘徊了 87.8 秒，最後靠「剛好掉到 0.4999」才跳出來。
+    # manager 手上一直有這串數字，卻沒有任何地方發現它不收斂。
+    #
+    # 原則：**一個沒有改變任何東西的重試，不應該被重試。**
+    # 放棄接近之後直接送出原本的段落 —— 它本來就只差不到 0.5 m，
+    # 控制器自己就走得到；繼續插 approach 只是換個包裝重試同一件事。
+    APPROACH_MIN_IMPROVEMENT = 0.1    # 兩次之間距離至少要縮短這麼多才算有進展
+    APPROACH_MAX_TRIES = 2            # 同一個目標最多連續插入幾段 approach
 
     def get_robot_pose_in_map(self):
         """查詢車子在 map 座標系的當下位置，查不到就回傳 None。
@@ -1043,13 +1065,46 @@ class MowerManager(Node):
                 '⚠️ 查不到車子位置，這一段直接送出，不補 approach')
             return False
         target = self.approach_target(path, label)
+        tgt = target.poses[0].pose.position
+        distance = math.hypot(tgt.x - robot_xy[0], tgt.y - robot_xy[1])
+
+        # 換了一個目標段落就重新計數
+        if label != self._approach_for:
+            self._reset_approach_tracking()
+            self._approach_for = label
+        self._approach_dists.append(distance)
+
+        # 已經為這個目標插過 approach 了，檢查它到底有沒有讓事情前進。
+        # 距離已經在門檻之內時不要走這裡：那是正常結束，交給
+        # build_approach_path 印「只差 x.xx m，直接開始割草」就好，
+        # 不要多一則看起來像出事的警告。
+        if self._approach_tries > 0 and distance >= self.APPROACH_SKIP_DISTANCE:
+            chain = ' → '.join('%.2f m' % d for d in self._approach_dists)
+            improvement = self._approach_dists[-2] - distance
+            if improvement < self.APPROACH_MIN_IMPROVEMENT:
+                self.get_logger().warn(
+                    f'⚠️ [{label}] approach 連續 {self._approach_tries} 次未改善距離 '
+                    f'({chain})，放棄接近，直接送出該段落')
+                return False
+            if self._approach_tries >= self.APPROACH_MAX_TRIES:
+                self.get_logger().warn(
+                    f'⚠️ [{label}] approach 已連續插入 {self._approach_tries} 段仍未到達 '
+                    f'({chain})，達到上限，放棄接近，直接送出該段落')
+                return False
+
         approach = self.build_approach_path(robot_xy, target)
         if approach is None:
             return False            # 夠近，不需要 approach
+        self._approach_tries += 1
         self._swath_queue.insert(self._current_swath_idx, (approach, 'approach'))
         # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
         self._mission_total = len(self._swath_queue)
         return True
+
+    def _reset_approach_tracking(self):
+        self._approach_for = None
+        self._approach_dists = []
+        self._approach_tries = 0
 
     APPROACH_TARGET_SEARCH_M = 1.0     # 最多往後找這麼長
 
