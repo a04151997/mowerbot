@@ -2890,10 +2890,10 @@ def phase_o():
         if cur != state:
             sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
             state = cur
-        if 'active' in cur:
+        if cur.startswith('active'):
             break
         time.sleep(2.0)
-    if not state or 'active' not in state:
+    if not state or not state.startswith('active'):
         print(nav.log_tail(40))
         record('O', 'O1', '臨時障礙物：跳過該段並完成任務', 'SKIP',
                'controller_server 沒有進入 active (%s)，與本項無關' % state)
@@ -3313,10 +3313,10 @@ def phase_p():
             if cur != state:
                 sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
                 state = cur
-            if 'active' in cur:
+            if cur.startswith('active'):
                 break
             time.sleep(2.0)
-        nav_ready = bool(state) and 'active' in state
+        nav_ready = bool(state) and state.startswith('active')
 
         # ---- P3 任務進度 ----
         hdr('P3  /mission_status 在覆蓋任務執行時會正確更新')

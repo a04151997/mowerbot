@@ -3559,3 +3559,14 @@ Phase P 等 Nav2 的迴圈用 `'active' in cur` 判斷，而 `inactive [2]` 也�
 而不是走到「controller_server 沒進入 active」的 SKIP 分支。
 Phase O 的等待迴圈也是同樣的寫法；N1 用的是 `cur.startswith('active')`，沒有這個問題。
 結果都不是 PASS，所以沒有綠燈被掩蓋，但失敗的歸因會被寫錯。不在本階段規格內，沒有改。
+（階段 28 已修，見 28.0。）
+
+## 28. 覆蓋率變異量、掉頭外擺分布、障礙物世界、間歇性失敗率（階段 28）
+
+### 28.0 等待 controller_server 的子字串判定（量測修正）
+
+27.4 節發現的問題：Phase O 與 Phase P 等 Nav2 時用 `'active' in cur`，
+`inactive [2]` 也含 `active`，controller 卡住時走到 FAIL 而不是 SKIP。
+全檔掃過共 4 處（Phase O 2 處、Phase P 2 處），統一成 N1 用的 `startswith('active')`。
+這是量測修正：**任何一項的判定條件都沒有改**，只改「Nav2 有沒有起來」的判斷，
+讓 7.12 節的競態發生時被歸因成 SKIP（與本項無關），而不是本項 FAIL。
