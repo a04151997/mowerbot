@@ -1172,7 +1172,7 @@ class MowerManager(Node):
         self._current_label = label
         self._mission_state = MissionStatus.STATE_EXECUTING
         self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
-        self.send_path_to_nav2(path)
+        self.send_path_to_nav2(path, label)
 
     def log_mission_summary(self, ended_early=False):
         """任務結束時印一份摘要：總段數 / 完成 / 跳過，以及每個跳過段落的座標。
@@ -1306,9 +1306,34 @@ class MowerManager(Node):
         else:
             self.send_next_swath()
 
-    def send_path_to_nav2(self, path_msg):
-        """
-        將一條割草線打包成 Action Goal 交給 Nav2 底層控制器
+    # 兩個 goal checker 的名字 (階段 24)，要與 nav2_params.yaml 的
+    # goal_checker_plugins 完全一致。
+    #
+    # 【為什麼不能用空字串表示「用預設」】
+    # controller_server 只有在**只註冊一個** goal checker 時才接受空字串。
+    # 一旦 goal_checker_plugins 有兩個，空字串會被拒絕：
+    #   FollowPath called with goal_checker name  in parameter
+    #   'current_goal_checker', which does not exist.
+    #   Available goal checkers are: general_goal_checker approach_goal_checker .
+    # 實測代價：那一趟 83 段裡有 40 段因此直接 ABORTED（報告 25.2 節）。
+    # 所以非 approach 的段落要把 general_goal_checker 明寫出來。
+    APPROACH_GOAL_CHECKER = 'approach_goal_checker'
+    DEFAULT_GOAL_CHECKER = 'general_goal_checker'
+
+    def send_path_to_nav2(self, path_msg, label=''):
+        """將一條割草線打包成 Action Goal 交給 Nav2 底層控制器。
+
+        label 決定要用哪一個 goal checker：
+
+        * approach —— 用 approach_goal_checker（只看位置，yaw 容忍 3.15 rad）。
+          approach 的刀盤是關的，朝向沒有作業意義；而它到站時的車頭方向
+          與下一段要走的方向平均差 171 度（報告 22.3 節）。用預設的
+          goal checker 會讓車子在終點原地轉那 171 度，
+          stateful 又已經把 xy 關掉，於是平均飄開 0.36 m 才回報成功。
+        * 其他（割草線、周邊環繞）—— 明寫 general_goal_checker（不能留空字串，
+          原因見 DEFAULT_GOAL_CHECKER 的註解）。
+          這些段落到站時本來就已經對準（實測飄移只有 0.009 m），
+          朝向也真的有意義，不要動它。
         """
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error('⚠️ 找不到 Nav2 的 follow_path 伺服器，請確認 Nav2 是否正常啟動！')
@@ -1320,6 +1345,9 @@ class MowerManager(Node):
         goal_msg = FollowPath.Goal()
         goal_msg.path = path_msg
         goal_msg.controller_id = 'FollowPath' # 呼叫 Nav2 預設的循跡控制器
+        goal_msg.goal_checker_id = (
+            self.APPROACH_GOAL_CHECKER if label == 'approach'
+            else self.DEFAULT_GOAL_CHECKER)
 
         # 發送非同步 Action 請求
         self._send_goal_future = self.nav_client.send_goal_async(goal_msg)

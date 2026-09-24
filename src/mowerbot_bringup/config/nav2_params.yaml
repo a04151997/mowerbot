@@ -15,7 +15,7 @@ controller_server:
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
-    goal_checker_plugins: ["general_goal_checker"]
+    goal_checker_plugins: ["general_goal_checker", "approach_goal_checker"]
     controller_plugins: ["FollowPath"]
 
     # 割草機速度慢，進度檢查的時間給寬一點，避免正常慢速前進被誤判成卡住
@@ -34,6 +34,28 @@ controller_server:
       # 收緊到 0.10 m 讓車子必須真的走到端點才算完成。
       xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 0.5
+      stateful: true
+
+    # approach 段落專用 (階段 24)。**general_goal_checker 一個字都沒有動。**
+    #
+    # 【為什麼 approach 要另一個 goal checker】
+    # approach 是「從車子當下位置直線開到下一段起點」，到站時車頭朝向就是
+    # 那條直線的方向，而下一段要走的方向與它平均差 **171 度**
+    # (報告 22.3 節，24 段量出來的中位數)，因為弓字形一條往東、下一條往西。
+    #
+    # general_goal_checker 的 stateful: true 會在 xy 達標之後把 xy 關掉、
+    # 只等 yaw。於是車子開到目標 0.09 m 以內、xy 鎖定，接著花好幾秒轉那 171 度，
+    # 轉的過程平均飄開 **0.36 m**（最大 0.67 m，割草線只飄 0.009 m）。
+    # 飄完才回報 Reached the goal!，此時離目標 0.53 m，
+    # manager 量到 >= 0.5 m 又插一段 approach —— 這就是 21 節那個 87.8 秒的迴圈。
+    #
+    # 對 approach 來說「到了沒」只該看位置：刀盤是關的，朝向沒有作業意義，
+    # 下一段的對齊本來就由 DWB 的 PathAlign / PathDist 在那一段裡處理。
+    # 所以 yaw 容忍設成 3.15 rad (> pi)，等於不檢查朝向。
+    approach_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.10
+      yaw_goal_tolerance: 3.15
       stateful: true
 
     FollowPath:

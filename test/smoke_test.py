@@ -2732,6 +2732,59 @@ def phase_o():
     sub('  規劃器不知道箱子在那裡 -> 割草線會穿過去 -> 控制器 ABORTED')
     sub('  這就是實車上「臨時多一張椅子」的情況')
 
+    # ---- O3 approach 迴圈守門（先跑，因為它不需要 Gazebo）----
+    #
+    # 【為什麼放在最前面】
+    # 這一項會建一個 mower_manager 節點來直接呼叫 maybe_insert_approach()。
+    # 等 Gazebo 與真正的 mower_manager 起來之後再做，會有兩個同名節點在
+    # 同一個 ROS graph 上，服務與話題會互搶。所以在任何東西啟動之前先做完。
+    #
+    # 【為什麼不用「跑一趟任務看它有沒有觸發」】
+    # 階段 24 的 approach_goal_checker 把 approach 的終點飄移修掉之後，
+    # 正常任務裡守門**根本不會被觸發**。用真實任務當情境的話，
+    # 這一項會在缺陷修好之後變成永遠測不到東西的空殼。
+    hdr('O3  approach 迴圈守門：連續插入有上限、沒進展就放棄')
+    sub('守門是唯一擋住「全部回報成功的無窮迴圈」的東西 ——')
+    sub('沒有任何既有機制會發現它失效，所以要有自己的測試。')
+    rc, out = run(['python3', os.path.join(WS, 'test', 'tools',
+                                           'approach_guard_probe.py')],
+                  timeout=90)
+    kv = {}
+    for line in out.splitlines():
+        if '=' in line and not line.startswith(' '):
+            k, _, v = line.partition('=')
+            kv[k.strip()] = v.strip()
+    for k in ('A_first_inserted', 'A_second_inserted', 'A_warned_no_progress',
+              'B_inserts', 'B_warned_max_tries', 'C_inserts', 'C_no_warning',
+              'MAX_TRIES', 'MIN_IMPROVEMENT'):
+        sub('%-22s = %s' % (k, kv.get(k, '(沒有輸出)')))
+    o3_checks = [
+        # A 情境：第 1 次插入，第 2 次因為距離沒有改善而被擋下來
+        kv.get('A_first_inserted') == 'True',
+        kv.get('A_second_inserted') == 'False',
+        kv.get('A_warned_no_progress') == 'True',
+        # B 情境：每次都有進展，但連續插滿 APPROACH_MAX_TRIES 就停
+        kv.get('B_inserts') == '110',
+        kv.get('B_warned_max_tries') == 'True',
+        # C 對照組：一路順利接近，最後自然進到門檻內，不可以有守門警告
+        kv.get('C_inserts') == '110',
+        kv.get('C_no_warning') == 'True',
+        kv.get('MAX_TRIES') == '2',
+    ]
+    o3_ok = (rc == 0) and all(o3_checks)
+    if not o3_ok:
+        print(('     ' + out.strip()).replace('\n', '\n     '))
+    record('O', 'O3',
+           'approach 連續插入不超過 %s 次、沒進展就放棄，順利時不誤觸發'
+           % kv.get('MAX_TRIES', '?'),
+           'PASS' if o3_ok else 'FAIL',
+           'probe rc=%d；A(擋下沒進展)=%s/%s/%s，B(插入序列)=%s 上限警告=%s，'
+           '對照組 C(插入序列)=%s 無警告=%s'
+           % (rc, kv.get('A_first_inserted'), kv.get('A_second_inserted'),
+              kv.get('A_warned_no_progress'), kv.get('B_inserts'),
+              kv.get('B_warned_max_tries'), kv.get('C_inserts'),
+              kv.get('C_no_warning')))
+
     gz = bg_start('O_gazebo',
                   ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py',
                    'gui:=false', 'world:=%s' % O_WORLD])
