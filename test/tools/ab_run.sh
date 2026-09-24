@@ -38,6 +38,7 @@
 #   python3 test/tools/coverage_budget.py <dir>/run --log <dir>/manager.log
 #
 # 地圖名預設 ab_map，可用環境變數 AB_MAP 改。maps/ 裡的地圖檔不進版控。
+# 世界預設 demo_lawn.world（run_demo.sh 的預設），可用環境變數 AB_WORLD 改（階段 28）。
 # ==========================================================================
 set -u
 MODE=${1:?用法: ab_run.sh map|run <輸出目錄>}
@@ -52,7 +53,7 @@ date +%s > "$OUT/t_start"
 
 # 背景工作在非互動 shell 裡會忽略 SIGINT，所以收尾一律用 SIGTERM
 # （run_demo.sh 有 trap TERM）。
-setsid ./run_demo.sh rviz:=false hmi:=false > "$OUT/demo.log" 2>&1 &
+setsid ./run_demo.sh rviz:=false hmi:=false world:="${AB_WORLD:-demo_lawn.world}" > "$OUT/demo.log" 2>&1 &
 DEMO=$!
 LOC=; MS=
 if [ "$MODE" = run ]; then
