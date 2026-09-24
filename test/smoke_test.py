@@ -3057,7 +3057,8 @@ def phase_o():
         # ---- O1 判定（階段 26）----
         # 舊判定只問「有沒有照流程走完」（有摘要、有跳過、摘要列座標），
         # 任務只完成 1 段、一條割草線都沒割時照樣 PASS，綠了超過一天。
-        # 改成問「這趟有沒有做到這項測試宣稱的事」，兩個條件都要成立：
+        # 改成問「這趟有沒有做到這項測試宣稱的事」，條件 1、2 都要成立
+        # （階段 27 再把「摘要列出座標」恢復成條件 3，見下方）：
         #
         # 條件 1（情境前提）：第一個失敗的段落必須是割草線。
         #   這項測的是「割草線被臨時障礙物擋住之後能跳過繼續」。先壞的是
@@ -3089,22 +3090,38 @@ def phase_o():
                        if kind == 'ok' and lab.startswith('周邊環繞'))
         cond1 = first_fail is not None and first_fail.startswith('割草線')
         cond2 = i_skip is not None and swaths_after_skip >= 1
+        # 條件 3（階段 27 恢復）：摘要要列出每一段被跳過的段落與起點座標。
+        # 它測的是 skipped_labels 帶座標這個獨立功能，條件 1/2 涵蓋不到。
+        # 判定式與階段 26 以前的 coords_ok 相同，一個字都沒有改。
+        cond3 = coords_ok
+        # 只印不判定（階段 27）：第一個失敗的割草線是不是「會被箱子擋住」的那幾條。
+        # 新舊夾具都是離箱子 0.9 m、沒被擋住的那一條先壞（報告 27 節），
+        # 這一行讓人看得見 O1 到底有沒有驗到它宣稱的機制。
+        first_fail_swath = next((lab for kind, lab in outcomes
+                                 if kind == 'fail' and lab.startswith('割草線')), None)
         print('')
         sub('第一個失敗的段落 = %s  (條件 1：必須是割草線 -> %s)'
             % (first_fail or '(沒有失敗)', cond1))
         sub('第一次跳過之後完成的割草線 = %d 條  (條件 2：>= 1 -> %s)'
             % (swaths_after_skip, cond2))
+        sub('摘要列出座標 = %d 段，跳過 = %d 段  (條件 3：兩者相等且 > 0 -> %s)'
+            % (len(unfinished), n_skip, cond3))
         sub('周邊環繞完成 = %d 段' % per_done)
+        sub('第一個失敗的割草線 = %s，是否在「被箱子擋住」的清單內 = %s  (只印不判定)'
+            % (first_fail_swath or '(沒有)',
+               (first_fail_swath in blocked) if first_fail_swath else '-'))
 
-        o_ok = cond1 and cond2
+        o_ok = cond1 and cond2 and cond3
         record('O', 'O1',
-               '割草線被臨時障礙物擋住時：跳過該段並繼續割其餘割草線',
+               '割草線被臨時障礙物擋住時：跳過該段、繼續割其餘割草線、並在摘要列出座標',
                'PASS' if o_ok else 'FAIL',
-               '第一個失敗=%s, 跳過後完成割草線=%d 條, 周邊環繞完成=%d 段, '
-               '任務有跑到結束=%s, 跳過=%d 段, 摘要列出座標=%d 段, 提早中止=%s'
-               % (first_fail or '無', swaths_after_skip, per_done,
-                  ended, n_skip, len(unfinished),
-                  ('是(連續%s段)' % systemic[-1]) if systemic else '否'))
+               '第一個失敗=%s, 跳過後完成割草線=%d 條, 摘要列出座標=%d 段, '
+               '周邊環繞完成=%d 段, 任務有跑到結束=%s, 跳過=%d 段, 提早中止=%s, '
+               '第一個失敗的割草線在被擋清單內=%s'
+               % (first_fail or '無', swaths_after_skip, len(unfinished), per_done,
+                  ended, n_skip,
+                  ('是(連續%s段)' % systemic[-1]) if systemic else '否',
+                  (first_fail_swath in blocked) if first_fail_swath else '-'))
     finally:
         if rig is not None:
             rig.close()

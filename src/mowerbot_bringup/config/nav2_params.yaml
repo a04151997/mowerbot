@@ -96,6 +96,13 @@ controller_server:
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
+      # 明寫出來，值等於 Nav2 預設 2.0，行為不變 (階段 27)。
+      # DWB 轉換路徑時，找第一個「離車子 < min(local costmap 半邊長, prune_distance)」
+      # 的航點；找不到就回 "Resulting plan has 0 poses"。
+      # mower_manager 的守門退路 (階段 26) 用 local costmap 半邊長 2.50 m 當門檻，
+      # 所以目標在 2.0 ~ 2.5 m 之間時，守門會放行、控制器仍可能回 0 poses ——
+      # 這是已知的放行縫隙 (報告 26.6 / 27 節)。改這個值等於改那道縫。
+      prune_distance: 2.0
 
       critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign",
                 "PathAlign", "PathDist", "GoalDist"]
