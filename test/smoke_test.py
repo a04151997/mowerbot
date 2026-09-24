@@ -2711,23 +2711,65 @@ def phase_h():
 # 因為它需要「測試邊界裡面真的有一個實體障礙物」這個條件。
 # --------------------------------------------------------------------------
 O_WORLD = 'demo_lawn_obstacle.world'
-O_BOUNDARY = (-1.5, -1.5, 2.5)      # 中心 x, y, 半徑 -> 與 Phase N 同一塊 5m x 5m
+# 中心 x, y, 半徑 -> 6m x 6m（階段 26 以前是與 Phase N 同一塊 5m x 5m）。
+#
+# 【為什麼從 5 m 改成 6 m，而不是挪箱子】
+# 周邊環繞走在「邊界往內 headland + 0.15 m」處。5 m 邊界、headland 0.50 時
+# 環繞離箱子西面 0.35 m，扣掉車體半寬只剩 0.01 m；階段 21 把 headland 改成
+# 0.70，環繞往內移 0.20 m 直接撞進箱子，O1 卻一路綠燈超過一天（報告 26 節）。
+# 挪箱子解不開：5 m 邊界裡，1 m 的箱子同時要離開環繞、又要離開
+# 「原點 -> 環繞起點」那條直線 approach（11.5 節：approach 不會繞障礙物），
+# 兩者都扣掉車體半寬之後最多只剩約 0.04 m 可分。
+# 邊界放大到 6 m、箱子不動：環繞離箱子 0.31 m（扣掉半寬後）、
+# approach 對角線的距離不變，世界檔（11 節的示範也在用）也不用改。
+# 依賴 headland 的部分由 O_FIXTURE_MARGIN 的啟動斷言顯性化 ——
+# headland 超過 0.81 m 時斷言就會以「夾具幾何問題」失敗。
+O_BOUNDARY = (-1.5, -1.5, 3.0)
 O_OBSTACLE = (-2.5, -0.75, 0.5)     # 世界檔裡那個箱子的中心與半邊長
+# 車體半寬 = footprint 寬 0.68 m / 2（nav2_params.yaml 的 footprint，車體物理尺寸）
+O_BODY_HALF_WIDTH = 0.34
+# 夾具餘裕：周邊環繞離箱子至少要「車體半寬 + 這個值」。
+#   0.10 = local costmap 2 格 (resolution 0.05)：箱子表面被標成佔據格時
+#          最多往外多 1 格，車體 footprint 光柵化時最多再多 1 格
+#   0.10 = 循跡誤差：xy_goal_tolerance 0.10，實測割草線終點 p95 0.11 m (25.4 節)
+# 舊的 0.01 m 連一格都不到。也不能太大：箱子要還能擋住割草線，
+# 所以另外斷言「至少一條割草線穿過箱子」（離箱子 < 車體半寬）。
+O_FIXTURE_MARGIN = 0.20
+RE_O_QUEUE = re.compile(
+    r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
+    r'終點 \(([-\d.]+), ([-\d.]+)\)')
 
 RE_O_SUMMARY = re.compile(
     r'覆蓋任務(?:結束|完成)：共 (\d+) 段，完成 (\d+) 段，跳過 (\d+) 段')
 # label 裡面有空白 (例如「割草線 5/13」「周邊環繞 1/4」)，所以用 (.+?) 而不是 (\S+)
 RE_O_SKIP = re.compile(r'⏭️ 跳過此段 (.+?) \(起點 ([-\d.]+), ([-\d.]+)\)')
 RE_O_UNFINISHED = re.compile(r'未完成：(.+?) \(起點 ([-\d.]+), ([-\d.]+)\)')
-RE_O_SYSTEMIC = re.compile(r'🛑 連續 (\d+) 段都失敗')
+# 階段 20 起 manager 的訊息是「🛑 連續 3 段失敗，達到 max_consecutive_failures=3...」，
+# 舊的「段都失敗」從此比對不到，「提早中止」一直印「否」（階段 26 修正）。
+RE_O_SYSTEMIC = re.compile(r'🛑 連續 (\d+) 段失敗')
+# O1 用：依時間順序的段落結果，判斷第一個失敗是誰、跳過之後又完成了什麼
+RE_O_OUTCOME = re.compile(r'✅ (.+?) 完成|❌ \[(.+?)\] 失敗|⏭️ 跳過此段 (.+?) \(起點')
 RE_O_FAILCOUNT = re.compile(r'連續失敗 (\d+)/(\d+) 次')
+
+
+def _seg_box_dist(x1, y1, x2, y2, cx, cy, h):
+    """線段 (x1,y1)-(x2,y2) 到軸對齊正方形 (中心 cx,cy、半邊長 h) 的最短距離，相交為 0"""
+    def pt_box(px, py):
+        dx = max(abs(px - cx) - h, 0.0)
+        dy = max(abs(py - cy) - h, 0.0)
+        return math.hypot(dx, dy)
+    # 沿線段取樣：佇列段落最長約 5 m，1 cm 一點就遠小於 costmap 解析度
+    n = max(2, int(math.hypot(x2 - x1, y2 - y1) / 0.01) + 1)
+    return min(pt_box(x1 + (x2 - x1) * k / (n - 1), y1 + (y2 - y1) * k / (n - 1))
+               for k in range(n))
 
 
 def phase_o():
     hdr('Phase O  臨時障礙物容錯 (割草線被擋住要跳過並繼續，不是整個任務死掉)')
     sub('世界 = %s（這個 Phase 固定用它，--world 無效）' % O_WORLD)
-    sub('箱子在 (%.2f, %.2f)，邊長 %.1f m，落在 5m x 5m 測試邊界裡面'
-        % (O_OBSTACLE[0], O_OBSTACLE[1], O_OBSTACLE[2] * 2))
+    sub('箱子在 (%.2f, %.2f)，邊長 %.1f m，落在 %.0fm x %.0fm 測試邊界裡面'
+        % (O_OBSTACLE[0], O_OBSTACLE[1], O_OBSTACLE[2] * 2,
+           O_BOUNDARY[2] * 2, O_BOUNDARY[2] * 2))
     sub('刻意發一則「空的」障礙物清單給 manager：')
     sub('  規劃器不知道箱子在那裡 -> 割草線會穿過去 -> 控制器 ABORTED')
     sub('  這就是實車上「臨時多一張椅子」的情況')
@@ -2740,7 +2782,7 @@ def phase_o():
     # 同一個 ROS graph 上，服務與話題會互搶。所以在任何東西啟動之前先做完。
     #
     # 【為什麼不用「跑一趟任務看它有沒有觸發」】
-    # 階段 24 的 approach_goal_checker 把 approach 的終點飄移修掉之後，
+    # 階段 25 的 approach_goal_checker 把 approach 的終點飄移修掉之後，
     # 正常任務裡守門**根本不會被觸發**。用真實任務當情境的話，
     # 這一項會在缺陷修好之後變成永遠測不到東西的空殼。
     #
@@ -2791,6 +2833,42 @@ def phase_o():
               kv.get('A_warned_no_progress'), kv.get('B_inserts'),
               kv.get('B_warned_max_tries'), kv.get('C_inserts'),
               kv.get('C_no_warning')))
+
+    # ---- O4 守門放棄接近之後的退路：超出 local costmap 範圍就跳過（階段 26）----
+    # 與 O3 同一次 probe 執行（D、E 兩個情境），所以 logger 攔截有沒有效
+    # 一樣由 O3 的 A/B 保證。E 是 D 的對照組：一樣沒進展，差別只在距離。
+    hdr('O4  守門退路：目標超出 local costmap 範圍就跳過，範圍內維持直接送出')
+    for k in ('D_reach', 'D_first_inserted', 'D_second_inserted', 'D_skipped',
+              'D_idx_advanced', 'D_warned_out_of_range',
+              'E_first_inserted', 'E_second_inserted', 'E_skipped',
+              'E_idx_unchanged', 'E_warned_send', 'E_no_out_of_range'):
+        sub('%-22s = %s' % (k, kv.get(k, '(沒有輸出)')))
+    o4_checks = [
+        # D：目標 4.95 m > 範圍 2.50 m -> 不插 approach、跳過該段、印超出範圍
+        kv.get('D_first_inserted') == 'True',
+        kv.get('D_second_inserted') == 'False',
+        kv.get('D_skipped') == '割草線 1/1',
+        kv.get('D_idx_advanced') == 'True',
+        kv.get('D_warned_out_of_range') == 'True',
+        # E 對照組：目標 1.95 m < 2.50 m -> 維持直接送出，不跳過
+        kv.get('E_first_inserted') == 'True',
+        kv.get('E_second_inserted') == 'False',
+        kv.get('E_skipped') == '-',
+        kv.get('E_idx_unchanged') == 'True',
+        kv.get('E_warned_send') == 'True',
+        kv.get('E_no_out_of_range') == 'True',
+    ]
+    o4_ok = (rc == 0) and all(o4_checks)
+    if not o4_ok:
+        print(('     ' + out.strip()).replace('\n', '\n     '))
+    record('O', 'O4',
+           '守門放棄接近時：目標超出 local costmap 範圍 (%s m) 就跳過，範圍內直接送出'
+           % kv.get('D_reach', '?'),
+           'PASS' if o4_ok else 'FAIL',
+           'D(超出範圍) 跳過=%s idx 前進=%s 警告=%s；E(範圍內，對照組) 跳過=%s 直接送出=%s'
+           % (kv.get('D_skipped'), kv.get('D_idx_advanced'),
+              kv.get('D_warned_out_of_range'), kv.get('E_skipped'),
+              kv.get('E_warned_send')))
 
     gz = bg_start('O_gazebo',
                   ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py',
@@ -2846,6 +2924,61 @@ def phase_o():
         del rig.odom[:]
         ok_mode = rig.set_mode(1)
         sub('change_mower_mode(mode=1) 回傳 success = %s' % ok_mode)
+
+        # ---- 夾具幾何斷言（階段 26）----
+        # 用 manager 實際規劃出來的佇列（不是自己重算一次 F2C 的公式）檢查兩件事：
+        #   1. 周邊環繞離箱子 >= 車體半寬 + O_FIXTURE_MARGIN
+        #      否則周邊環繞會先撞箱子，O1 的情境根本不會發生
+        #   2. 至少一條割草線離箱子 < 車體半寬（車體會壓到箱子，真的被擋住）
+        #      否則箱子擋不到任何割草線，O1 也不是在測它宣稱的東西
+        # 不成立就以「夾具幾何問題」失敗 —— 那不是產品的問題，
+        # 而是產品參數（例如 headland）改了之後夾具沒跟著改。
+        queue = {}
+        n_queue = 0
+        t0 = time.time()
+        while time.time() - t0 < 20.0:
+            rig.spin(0.5)
+            for ln in ctl.log_grep(r'📋 佇列', 400):
+                m = RE_O_QUEUE.search(ln)
+                if m:
+                    queue[int(m.group(1))] = (m.group(3),) + tuple(
+                        float(m.group(k)) for k in range(4, 8))
+                    n_queue = int(m.group(2))
+            if queue and len(queue) >= n_queue:
+                break
+        ox, oy, oh = O_OBSTACLE
+        per_d = [(lab, _seg_box_dist(x1, y1, x2, y2, ox, oy, oh))
+                 for lab, x1, y1, x2, y2 in queue.values() if lab.startswith('周邊環繞')]
+        sw_d = [(lab, _seg_box_dist(x1, y1, x2, y2, ox, oy, oh))
+                for lab, x1, y1, x2, y2 in queue.values() if lab.startswith('割草線')]
+        need = O_BODY_HALF_WIDTH + O_FIXTURE_MARGIN
+        per_min = min(per_d, key=lambda t: t[1]) if per_d else None
+        blocked = [lab for lab, d in sw_d if d < O_BODY_HALF_WIDTH]
+        print('')
+        sub('夾具幾何（依實際佇列）：')
+        if per_min:
+            sub('  周邊環繞離箱子最近 = %.2f m（%s），要求 >= 車體半寬 %.2f + 餘裕 %.2f = %.2f m'
+                % (per_min[1], per_min[0], O_BODY_HALF_WIDTH, O_FIXTURE_MARGIN, need))
+        sub('  離箱子 < 車體半寬 %.2f m 的割草線（會被擋住）= %s'
+            % (O_BODY_HALF_WIDTH, ', '.join(blocked) or '(沒有)'))
+        fixture_err = None
+        if not per_d or not sw_d:
+            fixture_err = '20 秒內讀不到完整佇列（周邊環繞 %d 段、割草線 %d 條）' % (
+                len(per_d), len(sw_d))
+        elif per_min[1] < need:
+            fixture_err = ('%s 離箱子只有 %.2f m < %.2f m，會先撞到箱子'
+                           % (per_min[0], per_min[1], need))
+        elif not blocked:
+            fixture_err = '沒有任何割草線會被箱子擋住，O1 的情境不會發生'
+        if fixture_err:
+            sub('❌ 夾具幾何問題（不是產品問題）：%s。' % fixture_err)
+            sub('   多半是產品參數（headland 等）改了，要調整 O_BOUNDARY / 箱子位置。')
+            rig.set_mode(2)
+            record('O', 'O1', '割草線被臨時障礙物擋住時：跳過該段並繼續割其餘割草線',
+                   'FAIL', '夾具幾何問題（不是產品問題）：%s' % fixture_err)
+            record('O', 'O2', '跳過某一段之後會重新產生 approach，不會因為 0 poses 而失敗',
+                   'SKIP', '夾具幾何不成立，任務沒有跑')
+            return
 
         timeout = 600.0
         sub('監聽最多 %.0f 秒，等 manager 印出任務摘要...' % timeout)
@@ -2921,13 +3054,56 @@ def phase_o():
                '0 poses 次數=%d (預期 0), 跳過後補的 approach=%d 段, 跳過=%d 段'
                % (zero_poses, approach_after_skip, n_skip))
 
-        o_ok = ended and n_skip >= 1 and coords_ok and early_ok
+        # ---- O1 判定（階段 26）----
+        # 舊判定只問「有沒有照流程走完」（有摘要、有跳過、摘要列座標），
+        # 任務只完成 1 段、一條割草線都沒割時照樣 PASS，綠了超過一天。
+        # 改成問「這趟有沒有做到這項測試宣稱的事」，兩個條件都要成立：
+        #
+        # 條件 1（情境前提）：第一個失敗的段落必須是割草線。
+        #   這項測的是「割草線被臨時障礙物擋住之後能跳過繼續」。先壞的是
+        #   周邊環繞或 approach 的話，這個情境根本沒發生。
+        # 條件 2（繼續執行要有效果）：第一次跳過之後，至少還完成 1 條割草線。
+        #   「>= 1」是「繼續執行」字面上最低的意思，不是估出來的數字。
+        #
+        # 另外一定要印「第一次跳過之後完成的割草線條數」，不論通過與否。
+        # 它不當門檻（9 -> 6 -> 4 -> 1 這種緩慢劣化任何門檻都攔不住），
+        # 但印在報表上會讓人起疑。
+        outcomes = []                 # [('ok'|'fail'|'skip', label), ...] 依時間順序
+        for ln in ctl.log_grep(r'✅ .+ 完成|❌ \[.+\] 失敗|⏭️ 跳過此段', 5000):
+            m = RE_O_OUTCOME.search(ln)
+            if not m:
+                continue
+            if m.group(1) is not None:
+                outcomes.append(('ok', m.group(1)))
+            elif m.group(2) is not None:
+                outcomes.append(('fail', m.group(2)))
+            else:
+                outcomes.append(('skip', m.group(3)))
+        first_fail = next((lab for kind, lab in outcomes if kind == 'fail'), None)
+        i_skip = next((i for i, (kind, _l) in enumerate(outcomes) if kind == 'skip'), None)
+        swaths_after_skip = 0
+        if i_skip is not None:
+            swaths_after_skip = sum(1 for kind, lab in outcomes[i_skip + 1:]
+                                    if kind == 'ok' and lab.startswith('割草線'))
+        per_done = sum(1 for kind, lab in outcomes
+                       if kind == 'ok' and lab.startswith('周邊環繞'))
+        cond1 = first_fail is not None and first_fail.startswith('割草線')
+        cond2 = i_skip is not None and swaths_after_skip >= 1
+        print('')
+        sub('第一個失敗的段落 = %s  (條件 1：必須是割草線 -> %s)'
+            % (first_fail or '(沒有失敗)', cond1))
+        sub('第一次跳過之後完成的割草線 = %d 條  (條件 2：>= 1 -> %s)'
+            % (swaths_after_skip, cond2))
+        sub('周邊環繞完成 = %d 段' % per_done)
+
+        o_ok = cond1 and cond2
         record('O', 'O1',
-               '割草線被臨時障礙物擋住時：跳過該段、繼續執行、並在摘要列出座標',
+               '割草線被臨時障礙物擋住時：跳過該段並繼續割其餘割草線',
                'PASS' if o_ok else 'FAIL',
-               '任務有跑到結束=%s, 跳過=%d 段, 摘要列出座標=%d 段, '
-               '提早中止=%s'
-               % (ended, n_skip, len(unfinished),
+               '第一個失敗=%s, 跳過後完成割草線=%d 條, 周邊環繞完成=%d 段, '
+               '任務有跑到結束=%s, 跳過=%d 段, 摘要列出座標=%d 段, 提早中止=%s'
+               % (first_fail or '無', swaths_after_skip, per_done,
+                  ended, n_skip, len(unfinished),
                   ('是(連續%s段)' % systemic[-1]) if systemic else '否'))
     finally:
         if rig is not None:

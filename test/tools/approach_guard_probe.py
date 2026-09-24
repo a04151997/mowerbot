@@ -3,7 +3,7 @@
 """approach 迴圈守門的確定性檢查（不需要 Gazebo、不需要 Nav2）。
 
 為什麼不用「跑一趟任務看它有沒有觸發」來測：
-階段 24 的 approach_goal_checker 把 approach 的終點飄移修掉之後，
+階段 25 的 approach_goal_checker 把 approach 的終點飄移修掉之後，
 正常情況下守門**根本不會被觸發** —— 用真實任務當測試情境，
 這一項會在修好之後變成「永遠測不到東西」。
 
@@ -16,7 +16,7 @@ import sys
 
 import rclpy
 from geometry_msgs.msg import Point32, PolygonStamped, PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import OccupancyGrid, Path
 
 from mowerbot_action.manager import MowerManager
 
@@ -100,6 +100,38 @@ def main():
     out['C_inserts'] = ''.join('1' if x else '0' for x in c)
     out['C_no_warning'] = not any(
         ('未改善距離' in w or '達到上限' in w) for w in warnings)
+
+    # ---- D 放棄接近時目標超出 local costmap 範圍：要跳過該段，不是直接送出 ----
+    # 階段 26。直接送出的話起點落在 local costmap 之外，控制器 0.4 s 回 0 poses。
+    # 範圍由 costmap 本身算 (max(寬,高) x 解析度 / 2)，這裡給 5 m x 5 m -> 2.50 m，
+    # 與 nav2_params.yaml 的 local_costmap 相同。
+    cm = OccupancyGrid()
+    cm.info.width, cm.info.height, cm.info.resolution = 100, 100, 0.05
+    node.local_costmap = cm
+    fresh()                              # 目標 5.00 m 外
+    node._skipped = []
+    d1 = step(0.0)                       # 5.00 m -> 插
+    d2 = step(0.05)                      # 4.95 m，沒進展，且 > 2.50 m -> 跳過
+    out['D_reach'] = '%.2f' % node.local_costmap_reach()
+    out['D_first_inserted'] = d1
+    out['D_second_inserted'] = d2
+    out['D_skipped'] = ','.join(s[0] for s in node._skipped) or '-'
+    out['D_idx_advanced'] = node._current_swath_idx == 1
+    out['D_warned_out_of_range'] = any('超出局部代價地圖範圍' in w for w in warnings)
+
+    # ---- E 對照組：一樣沒進展，但目標在範圍內 -> 維持直接送出，不可以跳過 ----
+    fresh(target_x=2.0)                  # 目標 2.00 m 外 (< 2.50 m)
+    node._skipped = []
+    e1 = step(0.0)                       # 2.00 m -> 插
+    e2 = step(0.05)                      # 1.95 m，沒進展，但在範圍內 -> 直接送出
+    out['E_first_inserted'] = e1
+    out['E_second_inserted'] = e2
+    out['E_skipped'] = ','.join(s[0] for s in node._skipped) or '-'
+    out['E_idx_unchanged'] = node._current_swath_idx == 0
+    out['E_warned_send'] = any('未改善距離' in w and '直接送出該段落' in w
+                               for w in warnings)
+    out['E_no_out_of_range'] = not any('超出局部代價地圖範圍' in w for w in warnings)
+    node.local_costmap = None
 
     out['MAX_TRIES'] = node.APPROACH_MAX_TRIES
     out['MIN_IMPROVEMENT'] = node.APPROACH_MIN_IMPROVEMENT

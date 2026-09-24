@@ -5,6 +5,9 @@
 
 用法（模擬要先用 ./run_demo.sh 起來）:
     python3 test/tools/coverage_run.py <prefix> [秒數上限]
+    python3 test/tools/coverage_run.py --map-only          # 只建圖開車
+    python3 test/tools/coverage_run.py <prefix> 1500 --no-drive
+        # 不建圖開車（前後量測用；請透過 test/tools/ab_run.sh 執行）
 
 
 標籤來自 /mission_status.current_label，所以每一個軌跡取樣點都知道
@@ -33,8 +36,15 @@ from geometry_msgs.msg import Twist, PolygonStamped
 from mowerbot_interfaces.msg import MissionStatus
 from mowerbot_interfaces.srv import SetDriveMode
 
-OUT = sys.argv[1]
-LIMIT = float(sys.argv[2]) if len(sys.argv) > 2 else 1500.0
+_pos = [a for a in sys.argv[1:] if not a.startswith('--')]
+OUT = _pos[0] if _pos else 'unused'
+LIMIT = float(_pos[1]) if len(_pos) > 1 else 1500.0
+# 前後量測（同一張地圖）用的兩個選項，流程見 test/tools/ab_run.sh：
+#   --map-only  只做建圖開車，不切 mode 1、不存檔（之後由 save_map.sh 存圖）
+#   --no-drive  不開車建圖：/map 是 map_server 發布的存檔 .pgm，
+#               開車只會讓定位模式把即時掃描併進地圖，規劃就不可重現
+MAP_ONLY = '--map-only' in sys.argv
+NO_DRIVE = '--no-drive' in sys.argv
 rclpy.init(); n = Node('coverage_run')
 qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                  reliability=ReliabilityPolicy.RELIABLE)
@@ -79,31 +89,47 @@ def drive(v, w, sec):
     while time.time()-t < sec:
         pub.publish(m_); rclpy.spin_once(n, timeout_sec=0.05)
 
-print('切 mode 2，開車繞一圈建圖...'); mode(2)
-# 3 m 見方的小方塊就夠：雷達 12 m，在 12x12 的草坪中央就看得到所有牆面。
-# 走 6 m 會直接頂到牆，車子還會停在角落轉不了身。
-for _ in range(4):
-    drive(0.45, 0.0, 6.5); drive(0.0, 0.6, 2.6); drive(0.0, 0.0, 0.6)
-drive(0.0, 0.0, 2.0)
+if NO_DRIVE:
+    # map_server 只發一次 /map，map_to_boundary 也只算一次邊界；
+    # 等 30 s 讓 manager 收到邊界再開始。
+    mode(2)
+    t0 = time.time()
+    while time.time()-t0 < 30:
+        rclpy.spin_once(n, timeout_sec=0.2)
+    m_ = maps[-1] if maps else None
+    print('收到 /map %d 次，最後一張 %s；收到邊界 %d 次' % (
+        len(maps), ('%dx%d' % (m_.info.width, m_.info.height)) if m_ else '-',
+        len(bnds)))
+else:
+    print('切 mode 2，開車繞一圈建圖...'); mode(2)
+    # 3 m 見方的小方塊就夠：雷達 12 m，在 12x12 的草坪中央就看得到所有牆面。
+    # 走 6 m 會直接頂到牆，車子還會停在角落轉不了身。
+    for _ in range(4):
+        drive(0.45, 0.0, 6.5); drive(0.0, 0.6, 2.6); drive(0.0, 0.0, 0.6)
+    drive(0.0, 0.0, 2.0)
 
-print('開回場中央 (用 odom 的實際朝向)...')
-for _ in range(80):
-    rclpy.spin_once(n, timeout_sec=0.05)
-    x, y, yaw = pose['x'], pose['y'], pose['yaw']
-    if math.hypot(x, y) < 0.8:
-        break
-    want = math.atan2(-y, -x)
-    err = math.atan2(math.sin(want-yaw), math.cos(want-yaw))
-    if abs(err) > 0.20:
-        drive(0.0, 0.6 if err > 0 else -0.6, 0.25)
-    else:
-        drive(0.45, 0.0, 0.5)
-drive(0.0, 0.0, 1.5)
-print('回到 (%.2f, %.2f)' % (pose['x'], pose['y']))
+    print('開回場中央 (用 odom 的實際朝向)...')
+    for _ in range(80):
+        rclpy.spin_once(n, timeout_sec=0.05)
+        x, y, yaw = pose['x'], pose['y'], pose['yaw']
+        if math.hypot(x, y) < 0.8:
+            break
+        want = math.atan2(-y, -x)
+        err = math.atan2(math.sin(want-yaw), math.cos(want-yaw))
+        if abs(err) > 0.20:
+            drive(0.0, 0.6 if err > 0 else -0.6, 0.25)
+        else:
+            drive(0.45, 0.0, 0.5)
+    drive(0.0, 0.0, 1.5)
+    print('回到 (%.2f, %.2f)' % (pose['x'], pose['y']))
 
-t0 = time.time()
-while time.time()-t0 < 20 and not (maps and bnds): rclpy.spin_once(n, timeout_sec=0.2)
-print('地圖 %s，邊界 %s 頂點' % (bool(maps), len(bnds[-1]) if bnds else 0))
+    t0 = time.time()
+    while time.time()-t0 < 20 and not (maps and bnds): rclpy.spin_once(n, timeout_sec=0.2)
+    print('地圖 %s，邊界 %s 頂點' % (bool(maps), len(bnds[-1]) if bnds else 0))
+
+if MAP_ONLY:
+    rclpy.shutdown()
+    sys.exit(0)
 
 del odom[:]
 print('切 mode 1 開始覆蓋任務...'); mode(1)

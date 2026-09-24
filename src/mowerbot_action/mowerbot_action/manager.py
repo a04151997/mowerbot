@@ -1081,15 +1081,35 @@ class MowerManager(Node):
         if self._approach_tries > 0 and distance >= self.APPROACH_SKIP_DISTANCE:
             chain = ' → '.join('%.2f m' % d for d in self._approach_dists)
             improvement = self._approach_dists[-2] - distance
+            give_up = None
             if improvement < self.APPROACH_MIN_IMPROVEMENT:
+                give_up = (f'approach 連續 {self._approach_tries} 次未改善距離 '
+                           f'({chain})')
+            elif self._approach_tries >= self.APPROACH_MAX_TRIES:
+                give_up = (f'approach 已連續插入 {self._approach_tries} 段仍未到達 '
+                           f'({chain})，達到上限')
+            if give_up is not None:
+                # 【放棄接近之後的退路依距離分支（階段 26）】
+                # 原本一律「直接送出該段落」，假設它只差不到 0.5 m。實測有一次
+                # 目標在 9.8 m 外，起點落在 local costmap 之外，
+                # controller_server 0.4 s 就回 0 poses —— 保證失敗，
+                # 還白白吃掉一次連續失敗計數（報告 26 節）。
+                reach = self.local_costmap_reach()
+                if reach is not None and distance > reach:
+                    self.get_logger().warn(
+                        f'⚠️ [{label}] {give_up}，目標仍在 {distance:.2f} m 外、'
+                        f'超出局部代價地圖範圍 ({reach:.2f} m)，'
+                        f'直接送出必然失敗，跳過此段')
+                    p0 = path.poses[0].pose.position if path.poses else None
+                    self._skipped.append(
+                        (label, (p0.x, p0.y) if p0 else None, '超出局部代價地圖範圍'))
+                    # 沒有送給 Nav2，不算控制器失敗，連續失敗計數不動。
+                    self._current_swath_idx += 1
+                    self._reset_approach_tracking()
+                    # 下一段同樣要先看要不要補 approach
+                    return self.maybe_insert_approach()
                 self.get_logger().warn(
-                    f'⚠️ [{label}] approach 連續 {self._approach_tries} 次未改善距離 '
-                    f'({chain})，放棄接近，直接送出該段落')
-                return False
-            if self._approach_tries >= self.APPROACH_MAX_TRIES:
-                self.get_logger().warn(
-                    f'⚠️ [{label}] approach 已連續插入 {self._approach_tries} 段仍未到達 '
-                    f'({chain})，達到上限，放棄接近，直接送出該段落')
+                    f'⚠️ [{label}] {give_up}，放棄接近，直接送出該段落')
                 return False
 
         approach = self.build_approach_path(robot_xy, target)
@@ -1100,6 +1120,23 @@ class MowerManager(Node):
         # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
         self._mission_total = len(self._swath_queue)
         return True
+
+    def local_costmap_reach(self):
+        """送出去的路徑至少要有一個航點離車子在這個距離內，控制器才接得住。
+
+        不寫死：從收到的 local costmap 算 max(寬, 高) 格數 × 解析度 / 2，
+        也就是 DWB transformGlobalPlan 裡的 dist_threshold。現在的設定 (5 m x 5 m) 是 2.50 m。
+        還沒收到 costmap 就回傳 None（無法判斷）。
+
+        注意這是上界，不是 DWB 實際的門檻：prune_plan 開著（預設）時，
+        DWB 用的是 min(dist_threshold, prune_distance)，prune_distance 沒寫在
+        nav2_params.yaml 裡、預設 2.0 m。所以 2.0 ~ 2.5 m 之間的目標這裡會放行，
+        控制器仍可能回 0 poses；這裡擋的是 9.8 m 那種遠遠超出的情況（報告 26 節）。
+        """
+        cm = self.local_costmap
+        if cm is None:
+            return None
+        return max(cm.info.width, cm.info.height) * cm.info.resolution / 2.0
 
     def _reset_approach_tracking(self):
         self._approach_for = None
@@ -1306,7 +1343,7 @@ class MowerManager(Node):
         else:
             self.send_next_swath()
 
-    # 兩個 goal checker 的名字 (階段 24)，要與 nav2_params.yaml 的
+    # 兩個 goal checker 的名字 (階段 25)，要與 nav2_params.yaml 的
     # goal_checker_plugins 完全一致。
     #
     # 【為什麼不能用空字串表示「用預設」】
