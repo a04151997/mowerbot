@@ -36,7 +36,7 @@ controller_server:
       yaw_goal_tolerance: 0.5
       stateful: true
 
-    # approach 段落專用 (階段 24)。**general_goal_checker 一個字都沒有動。**
+    # approach 段落專用 (階段 25)。**general_goal_checker 一個字都沒有動。**
     #
     # 【為什麼 approach 要另一個 goal checker】
     # approach 是「從車子當下位置直線開到下一段起點」，到站時車頭朝向就是

@@ -1315,7 +1315,8 @@ class MowerManager(Node):
     #   FollowPath called with goal_checker name  in parameter
     #   'current_goal_checker', which does not exist.
     #   Available goal checkers are: general_goal_checker approach_goal_checker .
-    # 實測代價：那一趟 83 段裡有 40 段因此直接 ABORTED（報告 25.2 節）。
+    # 實測代價：那一趟 83 段裡有 40 段因此直接 ABORTED
+    # （docs/simulation_results.md 25.2 節）。
     # 所以非 approach 的段落要把 general_goal_checker 明寫出來。
     APPROACH_GOAL_CHECKER = 'approach_goal_checker'
     DEFAULT_GOAL_CHECKER = 'general_goal_checker'
