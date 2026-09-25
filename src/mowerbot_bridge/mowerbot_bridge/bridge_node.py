@@ -22,6 +22,7 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
 from tf2_ros import TransformBroadcaster
@@ -41,9 +42,11 @@ class MowerBridge(Node):
         # 1. 參數
         # ==============================================================
         # 車體物理量：都是實車量到的值，不是調出來的。
-        # 輪半徑 0.17 m、輪距 0.58 m 與 URDF、Gazebo 的 diff_drive plugin 一致。
-        self.declare_parameter('wheel_radius', 0.17)
-        self.declare_parameter('wheel_separation', 0.58)
+        # 來自 mowerbot_description/config/vehicle.yaml (由 bringup_real.launch.py 傳入)，
+        # 與 URDF、Gazebo 的 diff_drive plugin 同一個來源。這裡不給預設值：
+        # 沒傳就在 get_parameter 時直接失敗，不要安靜地用一個寫死的數字。
+        self.declare_parameter('wheel_radius', Parameter.Type.DOUBLE)
+        self.declare_parameter('wheel_separation', Parameter.Type.DOUBLE)
 
         # 每轉的編碼器 tick 數（含減速比與四倍頻）。
         # 【沒有合理的預設值】這個值只能從驅動板/編碼器的文件查到，
@@ -55,7 +58,7 @@ class MowerBridge(Node):
         # 校正用的乘數，靠 test/tools/calibrate_odometry.py 實測決定。
         self.declare_parameter('wheel_radius_correction', 1.0)
         # 【這個值一定要校正】四輪 skid-steer 轉彎時輪胎會橫向滑動，
-        # 有效輪距比幾何值大 1.3 ~ 1.8 倍。直接用 0.58 計算的話，
+        # 有效輪距比幾何值大 1.3 ~ 1.8 倍。直接用幾何輪距 (vehicle.yaml) 計算的話，
         # 車子實際轉 360 度時里程計可能只累積出 240 度，
         # scan matching 會直接發散。預設 1.0 只是「還沒校正」的意思。
         self.declare_parameter('wheel_separation_correction', 1.0)

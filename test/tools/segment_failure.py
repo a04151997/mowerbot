@@ -147,7 +147,12 @@ def main():
             if a.pgm:
                 do, du = map_dist_fn(a.pgm)(px, py)
                 parts.append('離存檔地圖的佔據格 %.2f m、未知格 %.2f m' % (do, du))
-            print('%s淨空：%s（原地掉頭需 0.58 m，直線通過需 0.34 m）' % (name, '，'.join(parts)))
+            # 門檻由 vehicle.yaml 的 footprint 算（外接 / 內切半徑），同 coverage_budget 的讀法
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from coverage_budget import VEHICLE
+            half_l, half_w = VEHICLE['footprint_length'] / 2.0, VEHICLE['footprint_width'] / 2.0
+            print('%s淨空：%s（原地掉頭需 %.2f m，直線通過需 %.2f m）'
+                  % (name, '，'.join(parts), math.hypot(half_l, half_w), half_w))
 
 
 if __name__ == '__main__':

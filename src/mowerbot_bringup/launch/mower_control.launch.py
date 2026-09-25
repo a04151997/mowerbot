@@ -1,4 +1,6 @@
 import os
+
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
@@ -13,6 +15,10 @@ def generate_launch_description():
     bringup_dir = get_package_share_directory('mowerbot_bringup')
     description_dir = get_package_share_directory('mowerbot_description')
     bridge_dir = get_package_share_directory('mowerbot_bridge')
+
+    # 車輛幾何的單一來源 (階段 30)
+    with open(os.path.join(description_dir, 'config', 'vehicle.yaml')) as fh:
+        vehicle = yaml.safe_load(fh)
 
     # 2. 宣告 Launch 參數
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
@@ -106,6 +112,10 @@ def generate_launch_description():
             'lead_in_length': LaunchConfiguration('lead_in_length'),
             # 割草線重疊率，讓實測可以掃不同數值而不用重建
             'overlap_ratio': LaunchConfiguration('overlap_ratio'),
+            # 車體 footprint 與刀盤寬：來自 vehicle.yaml，淨空門檻由 manager 自己算
+            'footprint_length': vehicle['footprint_length'],
+            'footprint_width': vehicle['footprint_width'],
+            'blade_width': vehicle['blade_width'],
         }]
     )
 

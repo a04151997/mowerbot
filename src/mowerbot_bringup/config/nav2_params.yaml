@@ -139,9 +139,10 @@ local_costmap:
       height: 5
       resolution: 0.05
 
-      # 車體實際尺寸：長 0.95 m，寬度要算到輪子外緣
-      # 輪中心 +-0.29 m，輪寬 0.1 m -> 外緣 +-0.34 m，總寬 0.68 m
-      footprint: "[[0.475, 0.34], [0.475, -0.34], [-0.475, -0.34], [-0.475, 0.34]]"
+      # 車體 footprint 不寫在這裡 (階段 30)：由 navigation.launch.py 從
+      # mowerbot_description/config/vehicle.yaml 的 footprint_length / footprint_width
+      # 算出 [[L/2, W/2], [L/2, -W/2], [-L/2, -W/2], [-L/2, W/2]] 再傳給 local_costmap。
+      # 寬度要算到輪子外緣 (輪外緣到輪外緣)。
 
       plugins: ["obstacle_layer", "inflation_layer"]
 

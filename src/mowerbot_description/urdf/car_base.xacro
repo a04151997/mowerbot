@@ -1,10 +1,13 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mowerbot">
 
-    <xacro:property name="car_length" value="0.95"/>
-    <xacro:property name="car_width" value="0.46"/>
-    <xacro:property name="car_height" value="0.46"/>
-    <xacro:property name="car_mass" value="73.4"/> 
+    <!-- 車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml (階段 30) -->
+    <xacro:property name="vehicle" value="${xacro.load_yaml('$(find mowerbot_description)/config/vehicle.yaml')}"/>
+
+    <xacro:property name="car_length" value="${vehicle['body_length']}"/>
+    <xacro:property name="car_width" value="${vehicle['body_width']}"/>
+    <xacro:property name="car_height" value="${vehicle['body_height']}"/>
+    <xacro:property name="car_mass" value="${vehicle['mass']}"/>
     <xacro:property name="ground_height" value="0.2"/>
 
     <xacro:include filename="car_inertia.xacro"/>
@@ -41,8 +44,8 @@
     <plugin name="mowerbot_diff_drive" filename="libgazebo_ros_diff_drive.so">
         <left_joint>left_rear_wheel_joint</left_joint>
         <right_joint>right_rear_wheel_joint</right_joint>
-        <wheel_separation>0.58</wheel_separation>
-        <wheel_diameter>0.34</wheel_diameter>
+        <wheel_separation>${vehicle['wheel_separation']}</wheel_separation>
+        <wheel_diameter>${2 * vehicle['wheel_radius']}</wheel_diameter>
         <max_wheel_torque>200</max_wheel_torque> 
         <max_wheel_acceleration>3.0</max_wheel_acceleration>
         <command_topic>cmd_vel</command_topic>

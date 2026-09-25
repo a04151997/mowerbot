@@ -26,7 +26,21 @@ from rclpy.serialization import deserialize_message
 from rosidl_runtime_py.utilities import get_message
 
 OBST = (-2.5, -0.75, 0.5)          # 與 smoke_test.py 的 O_OBSTACLE 相同
-HALF_L, HALF_W = 0.475, 0.34       # footprint（nav2_params.yaml）
+
+
+def _load_vehicle():
+    """車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml（安裝後的那一份）"""
+    import os
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_description'),
+                           'config', 'vehicle.yaml')) as fh:
+        return yaml.safe_load(fh)
+
+
+_VEHICLE = _load_vehicle()
+HALF_L = _VEHICLE['footprint_length'] / 2.0    # footprint（vehicle.yaml）
+HALF_W = _VEHICLE['footprint_width'] / 2.0
 
 TOPICS = ['/rosout', '/tf', '/odom', '/cmd_vel', '/received_global_plan',
           '/local_costmap/costmap', '/local_plan']

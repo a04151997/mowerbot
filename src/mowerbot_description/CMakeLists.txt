@@ -16,6 +16,7 @@ install(
     urdf
     launch
     rviz
+    config
   DESTINATION share/${PROJECT_NAME}
 )
 if(BUILD_TESTING)

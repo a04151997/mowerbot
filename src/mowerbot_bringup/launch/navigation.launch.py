@@ -1,4 +1,7 @@
 import os
+import tempfile
+
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, TimerAction
@@ -10,6 +13,23 @@ def generate_launch_description():
     # 1. 取得套件路徑與預設參數檔
     bringup_dir = get_package_share_directory('mowerbot_bringup')
     default_params = os.path.join(bringup_dir, 'config', 'nav2_params.yaml')
+
+    # 車體 footprint 由 vehicle.yaml (車輛幾何的單一來源) 算出來，不寫在 nav2_params.yaml。
+    # local_costmap 是 controller_server 行程裡另一個節點 (/local_costmap/local_costmap)，
+    # 所以寫成獨立的參數檔、排在 params_file 後面傳給 controller_server，
+    # 以節點全名對應，後面的檔案覆蓋前面的。
+    description_dir = get_package_share_directory('mowerbot_description')
+    with open(os.path.join(description_dir, 'config', 'vehicle.yaml')) as fh:
+        vehicle = yaml.safe_load(fh)
+    half_l = vehicle['footprint_length'] / 2.0
+    half_w = vehicle['footprint_width'] / 2.0
+    footprint = str([[half_l, half_w], [half_l, -half_w],
+                     [-half_l, -half_w], [-half_l, half_w]])
+    footprint_params = tempfile.NamedTemporaryFile(
+        mode='w', prefix='mowerbot_footprint_', suffix='.yaml', delete=False)
+    yaml.safe_dump({'local_costmap': {'local_costmap': {'ros__parameters': {
+        'footprint': footprint}}}}, footprint_params)
+    footprint_params.close()
 
     # 2. 宣告 Launch 參數
     use_sim_time = LaunchConfiguration('use_sim_time')
@@ -23,7 +43,8 @@ def generate_launch_description():
         executable='controller_server',
         name='controller_server',
         output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        parameters=[params_file, footprint_params.name,
+                    {'use_sim_time': use_sim_time}],
         remappings=[
             # 【安全關鍵】controller_server 預設把速度指令發到 /cmd_vel，
             # 那是直接進底盤的話題，會完全繞過 mower_manager 的模式仲裁

@@ -90,9 +90,25 @@ OVERLAP = float(OVERLAP) if OVERLAP not in (None, '') else None
 # 拿參考路徑也要用這個值，否則量到的是別條路徑的落差。兩邊必須同步修改。
 DEFAULT_OVERLAP = 0.4
 
+# 車輛幾何的單一來源 (階段 30)：mowerbot_description/config/vehicle.yaml。
+# 讀安裝後的那一份 —— 與 launch 檔給節點的是同一份，改了 src 沒重建時兩邊才不會各用各的。
+def _load_vehicle():
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_description'),
+                           'config', 'vehicle.yaml')) as fh:
+        return yaml.safe_load(fh)
+
+
+VEHICLE = _load_vehicle()
+# 衍生值用算的，不寫死
+VEHICLE_INSCRIBED = VEHICLE['footprint_width'] / 2.0
+VEHICLE_CIRCUMSCRIBED = math.hypot(VEHICLE['footprint_length'] / 2.0,
+                                   VEHICLE['footprint_width'] / 2.0)
+
 # 實際刀盤寬，單位公尺。這是車體的物理屬性，不隨重疊率改變，
 # 覆蓋落差的判定基準固定是它的一半 (COVERAGE_TOL)。
-BLADE_WIDTH = 0.5
+BLADE_WIDTH = VEHICLE['blade_width']
 COVERAGE_TOL = BLADE_WIDTH / 2.0
 # 割草線間距 = 刀盤寬 x (1 - 重疊率)，要與 mower_manager 算出來的一致，
 # 測試自己呼叫 F2C 拿參考路徑時必須用同一個值，否則量到的是別條路徑的落差。
@@ -1214,7 +1230,12 @@ class SafetyRig(object):
                             'mowerbot_bridge', 'config', 'joystick.yaml')
         self.manager = bg_start('D_mower_manager',
                                 ['ros2', 'run', 'mowerbot_action', 'mower_manager',
-                                 '--ros-args', '-p', 'use_sim_time:=false'])
+                                 '--ros-args', '-p', 'use_sim_time:=false',
+                                 # footprint 與刀盤寬沒有預設值 (階段 30)，
+                                 # 照 mower_control.launch.py 一樣從 vehicle.yaml 傳
+                                 '-p', 'footprint_length:=%r' % VEHICLE['footprint_length'],
+                                 '-p', 'footprint_width:=%r' % VEHICLE['footprint_width'],
+                                 '-p', 'blade_width:=%r' % VEHICLE['blade_width']])
         self.teleop = bg_start('D_mower_teleop',
                                ['ros2', 'run', 'mowerbot_bridge', 'teleop_node',
                                 '--ros-args', '--params-file', yaml,
@@ -2467,8 +2488,10 @@ def phase_n():
 # 差多少要靠 test/tools/calibrate_odometry.py 實測。
 # --------------------------------------------------------------------------
 H_TICKS_PER_REV = 4096      # 測試用的假值（真值要查驅動板文件）
-H_WHEEL_RADIUS = 0.17
-H_WHEEL_SEPARATION = 0.58
+# bridge_node 的輪半徑與輪距不再有預設值 (階段 30)，這裡照 bringup_real.launch.py
+# 一樣從 vehicle.yaml 傳進去。
+H_WHEEL_RADIUS = VEHICLE['wheel_radius']
+H_WHEEL_SEPARATION = VEHICLE['wheel_separation']
 
 
 class BridgeRig(object):
@@ -2550,6 +2573,8 @@ def phase_h():
                        '-p', 'use_sim_time:=false',
                        '-p', 'driver_type:=loopback',
                        '-p', 'encoder_ticks_per_rev:=%d' % H_TICKS_PER_REV,
+                       '-p', 'wheel_radius:=%r' % H_WHEEL_RADIUS,
+                       '-p', 'wheel_separation:=%r' % H_WHEEL_SEPARATION,
                        '-p', 'odom_rate:=30.0',
                        '-p', 'cmd_vel_timeout:=0.5'])
     sub('啟動參數: driver_type=loopback, encoder_ticks_per_rev=%d, '
@@ -2726,8 +2751,8 @@ O_WORLD = 'demo_lawn_obstacle.world'
 # headland 超過 0.81 m 時斷言就會以「夾具幾何問題」失敗。
 O_BOUNDARY = (-1.5, -1.5, 3.0)
 O_OBSTACLE = (-2.5, -0.75, 0.5)     # 世界檔裡那個箱子的中心與半邊長
-# 車體半寬 = footprint 寬 0.68 m / 2（nav2_params.yaml 的 footprint，車體物理尺寸）
-O_BODY_HALF_WIDTH = 0.34
+# 車體半寬 = footprint 寬 / 2（vehicle.yaml 的 footprint_width，車體物理尺寸；目前 0.68 m / 2）
+O_BODY_HALF_WIDTH = VEHICLE_INSCRIBED
 # 夾具餘裕：周邊環繞離箱子至少要「車體半寬 + 這個值」。
 #   0.10 = local costmap 2 格 (resolution 0.05)：箱子表面被標成佔據格時
 #          最多往外多 1 格，車體 footprint 光柵化時最多再多 1 格
@@ -3612,14 +3637,16 @@ def phase_p():
 # 在車子動之前就攔下來，這是最便宜的一道檢查。
 # --------------------------------------------------------------------------
 Q_WORLD = 'demo_lawn.world'
-Q_INSCRIBED = 0.34        # 車體內切半徑 (footprint 0.95 x 0.68)
+Q_INSCRIBED = VEHICLE_INSCRIBED        # 車體內切半徑 (vehicle.yaml 的 footprint)
 Q_INFLATION = 0.45        # 與 nav2_params.yaml 的 inflation_radius 一致
 RE_Q_LEADIN = re.compile(
     r'割草線 (\d+)/(\d+) 加跑道：長度 ([\d.]+) m，起點 \(([-\d.]+), ([-\d.]+)\)')
 RE_Q_LEADIN_SHORT = re.compile(r'割草線 (\d+)/(\d+) 跑道縮短為 ([\d.]+) m')
 RE_Q_LEADIN_NONE = re.compile(r'割草線 (\d+)/(\d+) 不加跑道')
 RE_Q_HIST = re.compile(r'跑道長度分布：(.+)')
-Q_CIRCUM = 0.5841          # 車體外接半徑 sqrt(0.475^2 + 0.34^2)，原地掉頭需要
+# 車體外接半徑 sqrt((L/2)^2 + (W/2)^2)，原地掉頭需要。
+# 階段 30 以前寫死成 0.5841 (精確值 0.584145 四捨五入)，改用算的之後門檻大 4.4e-5 m。
+Q_CIRCUM = VEHICLE_CIRCUMSCRIBED
 RE_Q_QUEUE = re.compile(
     r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
     r'終點 \(([-\d.]+), ([-\d.]+)\) 長度 ([\d.]+) m')
@@ -3811,7 +3838,8 @@ def phase_q():
                 print('        %-18s (%.2f, %.2f) 淨空 %.3f m' % (lbl, a[0], a[1], d))
             q2_ok = (not bad_rot) and (not bad_pass)
             record('Q', 'Q2',
-                   '佇列每一段：直線通過點 >= 0.34 m、需要掉頭的點 >= 0.5841 m',
+                   '佇列每一段：直線通過點 >= %.2f m、需要掉頭的點 >= %.4f m'
+                   % (Q_INSCRIBED, Q_CIRCUM),
                    'PASS' if q2_ok else 'FAIL',
                    '佇列 %d 段，掉頭點不足 %d 段，通過點不足 %d 段，'
                    '掉頭點最小淨空 %s m'

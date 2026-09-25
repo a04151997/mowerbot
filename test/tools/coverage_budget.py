@@ -55,8 +55,20 @@ import cv2
 import xml.etree.ElementTree as ET
 
 CELL = 0.01
-BLADE_HALF = 0.25          # 刀盤寬 0.50 m
-BODY_HALF = 0.34           # 車體半寬 (footprint 0.95 x 0.68)
+
+
+def _load_vehicle():
+    """車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml（安裝後的那一份）"""
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_description'),
+                           'config', 'vehicle.yaml')) as fh:
+        return yaml.safe_load(fh)
+
+
+VEHICLE = _load_vehicle()
+BLADE_HALF = VEHICLE['blade_width'] / 2.0          # 刀盤半徑 (目前 0.50 / 2)
+BODY_HALF = VEHICLE['footprint_width'] / 2.0       # 車體半寬 = 內切半徑 (目前 0.68 / 2)
 ERODE = 0.10               # map_to_boundary 的邊界腐蝕量
 E1_BAND = BODY_HALF + ERODE - BLADE_HALF      # 0.19 m
 

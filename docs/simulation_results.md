@@ -4149,3 +4149,85 @@ run4 那次成功是停在 x = −4.81，剛好在容忍邊上。
 * 地圖 `stage29_lawn` / `stage29_obst` / `stage29_probe` 在 `maps/`，不進版控。
 * **沒有做的事**：掉頭外擺沒有動（使用者要先與 will 確認優先順序）。
   29.3 的 approach 穿過障礙物、29.1 / 29.3 的未知碎點、29.4 的角落幾何都只有記錄，沒有修。
+
+## 30. 車輛幾何單一來源化（階段 30）
+
+真車確認是**後兩輪差速驅動 + 前兩輪固定方向從動輪**（滑移轉向），輪徑、輪距、軸距即將重新量測。
+原本 0.17 / 0.58 / 0.34 / 0.5841 / 0.95 × 0.68 散落在 URDF、nav2、manager、bridge、測試與工具裡，
+量測值一到就要找遍全專案。這一階段是**純重構**：把它們收到一個檔案，衍生值改用算的。
+
+### 30.1 單一來源與讀它的地方
+
+`src/mowerbot_description/config/vehicle.yaml`（`CMakeLists.txt` 安裝 `config/`）。
+每一項標了「量測值 / 暫定值」，目前全部是暫定值；`wheelbase` 照規格寫 `TBD`。
+使用方式與「量完要人工重看的值」寫在 `hardware_bringup.md` 的「車輛幾何」一節。
+
+| 地方 | 改法 |
+|------|------|
+| `car_base.xacro` / `car_wheels.xacro` | `xacro.load_yaml` 讀；車體方塊、質量、輪半徑、diff_drive 的輪距與輪徑（= 2 × 輪半徑）。輪子 y 改成 ±`wheel_separation`/2（原本 `body_width/2 + wheel_width/2 + 0.01`），z 改成 `wheel_radius − (car_height/2 + ground_height)`（原本寫死 −0.26） |
+| `nav2_params.yaml` | 拿掉 `footprint`；`navigation.launch.py` 由 `footprint_length/width` 算出四角，寫成一個以 `local_costmap/local_costmap` 為鍵的參數檔，排在 `params_file` 後面傳給 `controller_server` |
+| `mower_manager` | 新參數 `footprint_length` / `footprint_width`，`blade_width` 改成由 launch 傳入；三者**沒有預設值**。`LEAD_IN_BOUNDARY_CLEARANCE` = W/2、`ROTATION_CLEARANCE` = hypot(L/2, W/2) 在 `__init__` 算，啟動時印出 |
+| `bridge_node` | `wheel_radius` / `wheel_separation` **沒有預設值**；`bringup_real.launch.py` 從 `vehicle.yaml` 傳 |
+| `smoke_test.py` | `VEHICLE` 讀**安裝後**的 `vehicle.yaml`；`BLADE_WIDTH`、`O_BODY_HALF_WIDTH`、`Q_INSCRIBED`、`Q_CIRCUM`、`H_WHEEL_*` 改讀它。Phase D / H 直接 `ros2 run` 節點的地方補上 `-p`（夾具，判定沒動） |
+| `test/tools/` | `coverage_budget.py`（`BODY_HALF`、`BLADE_HALF`）、`o_failure_trace.py`（`HALF_L/W`）、`segment_failure.py`（印出的門檻）、`approach_guard_probe.py`（建 manager 時傳參數） |
+
+`f2c_server` 本身不用車體幾何（刀盤寬由 manager 在請求裡帶），沒有改。
+
+### 30.2 驗收數字
+
+**重構前後的每一個值**（前 = git `de45481` 的寫死值，後 = 由 `vehicle.yaml` 算出來的值）：
+
+| 值 | 前 | 後 | 差 |
+|----|----|----|----|
+| manager 內切 `LEAD_IN_BOUNDARY_CLEARANCE` | 0.34 | 0.34 | 0（位元相同） |
+| manager 外接 `ROTATION_CLEARANCE` | 0.5841 | 0.584144673860851 | **+4.467e-5 m** |
+| smoke `Q_INSCRIBED` / `O_BODY_HALF_WIDTH` | 0.34 | 0.34 | 0 |
+| smoke `Q_CIRCUM` | 0.5841 | 0.584144673860851 | **+4.467e-5 m** |
+| smoke `BLADE_WIDTH` | 0.5 | 0.5 | 0 |
+| `coverage_budget` `BODY_HALF` / `BLADE_HALF` | 0.34 / 0.25 | 0.34 / 0.25 | 0 |
+| `o_failure_trace` `HALF_L` / `HALF_W` | 0.475 / 0.34 | 0.475 / 0.34 | 0 |
+| nav2 footprint（執行中 `ros2 param get /local_costmap/local_costmap footprint`） | `[[0.475, 0.34], …]` | `[[0.475, 0.34], [0.475, -0.34], [-0.475, -0.34], [-0.475, 0.34]]` | 字串相同 |
+| bridge `wheel_radius` / `wheel_separation` | 0.17 / 0.58 | 0.17 / 0.58 | 0 |
+| URDF（`xacro` 輸出逐行 diff） | 輪子 y = ±0.29000000000000004 | ±0.29 | 4e-17 m（0.23+0.05+0.01 的浮點表示），其餘逐字相同 |
+
+**唯一有物理量級的差異是外接半徑 +4.467e-5 m。** 來源：0.5841 是精確值 sqrt(0.475² + 0.34²) = 0.584145
+四捨五入到 4 位的結果；改成用算的之後就是精確值。量級是地圖解析度 0.05 m 的千分之一，
+而且門檻往保守方向走。使用者決定用精確值、不把「四捨五入到 4 位」寫進衍生公式
+（那會變成藏在公式裡的任意常數），並把驗收條件修正為「差異必須可解釋且物理上無意義」。
+這個差異同時碰到 manager 的淨空檢查與 **Phase Q 的判定門檻 `Q_CIRCUM`**；
+Q2 的項目名稱用 `%.4f` 印，所以仍顯示 0.5841。
+
+**完整套件**：**51/51 PASS**（`test/logs/20260926_012017`）。
+
+第一次完整跑是 47/51（`test/logs/20260926_005634`）：D1 ~ D4 SKIP，因為 Phase D 用
+`ros2 run mowerbot_action mower_manager` 直接起 manager，沒有帶新參數，manager 以
+`ParameterUninitializedException: blade_width` 啟動失敗。修的是夾具（補上 `-p`），判定沒動。
+掃描時漏掉它是因為 `smoke_test.py` 把指令寫成 list，`'mower_manager'` 與 `'ros2', 'run'` 不在同一行。
+
+**Phase Q 門檻變動後的判定**（三次都 PASS，掉頭點淨空不足 0 段、通過點不足 0 段）：
+
+| 跑次 | Q2 佇列段數 | 掉頭點最小淨空 | Q3 |
+|------|------|------|------|
+| `20260925_054727`（改動前） | 51 | 0.850 m | 拒絕 → 淨空 1.21 m 後可開始 |
+| `20260925_060542`（改動前） | 45 | 0.721 m | 拒絕 → 1.20 m 後可開始 |
+| `20260926_005634`（改動後） | 51 | 0.783 m | 拒絕 → 1.15 m 後可開始 |
+| `20260926_012017`（改動後） | 53 | 0.711 m | 拒絕 → 1.17 m 後可開始 |
+
+Phase Q 每次自己建圖，所以段數與最小淨空每趟不同；最小淨空離 0.5841 / 0.584145 都有 0.13 m 以上，
+4.5e-5 m 的門檻變動不可能改變任何一項判定，實際上也沒有。
+
+### 30.3 找到但沒有改的地方
+
+| 位置 | 值 | 理由 |
+|------|----|------|
+| `nav2_params.yaml` `acc_lim_x` 0.5 / `acc_lim_theta` 1.5 與其推導註解 | 由 0.17、0.58 推導 | 速度 / 加速度上限，在不可自行更動的清單上；而且含「保守取整」的判斷 |
+| `headland_width` 0.70（`mower_control.launch.py`、`f2c_server.cpp`） | 外接半徑 + 0.10 再進位 | 含進位判斷；自動算會變成 0.6841（行為改變）或要新增一條進位規則。列入「量完要重看」 |
+| `inflation_radius` 0.45 與 `LEAD_IN_OBSTACLE_CLEARANCE` 0.45 | 依內切半徑選的 | costmap 調校值，不是幾何 |
+| `PathAlign.forward_point_distance` 註解「車長 0.95」 | —— | DWB 權重相關，不動 |
+| `car_wheels.xacro` 前後輪 x = ±0.35 | 軸距 0.70 | `wheelbase` 是 TBD；量到之後改成讀 `vehicle.yaml` |
+| `car_wheels.xacro` 輪寬 0.1 | —— | 不在規格列的項目裡。`footprint_width` 0.68 = 0.58 + 0.1 是分開填的，列入「量完要重看」 |
+| `mowerbot_bridge/test/test_odometry.py` `WHEEL_RADIUS` 0.17 / `WHEEL_SEPARATION` 0.58 | —— | 里程計數學的單元測試，這兩個是任意夾具值，與真車無關；讓 `colcon test` 依賴 description 套件沒有好處 |
+| `manager.py`、`f2c_server.cpp`、`coverage_budget.py` 裡描述階段 21 等歷史推導的註解 | 0.34 / 0.5841 | 是當時的紀錄，保留；描述「現在的值」的註解已改成公式 |
+| `MissionStatus.msg` 註解「掉頭需要 0.58 m」、`map_to_boundary.py` 註解「車體 0.95 x 0.68」 | —— | 只是說明文字，不影響行為 |
+| workspace 根目錄 `test.urdf` | 0.17、0.95×0.46×0.46、73.4 | 舊的 xacro 輸出，沒有任何程式讀它 |
+| `segment_endpoint.py` 的 0.95 | —— | 是 p95 分位數，不是車長 |

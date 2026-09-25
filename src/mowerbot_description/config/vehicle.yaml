@@ -1,0 +1,30 @@
+# 車輛幾何的單一來源 (階段 30)
+#
+# 實測值(目前為暫定,待實機量測後更新)
+#
+# 實機量測之後只改這個檔案，然後重新 colcon build。
+# 讀這個檔案的地方：
+#   - URDF (car_base.xacro / car_wheels.xacro)：車體方塊、輪子、diff_drive plugin
+#   - navigation.launch.py：local_costmap 的 footprint
+#   - mower_control.launch.py：mower_manager 的淨空檢查與刀盤寬
+#   - bringup_real.launch.py：bridge_node 的輪半徑與輪距
+#   - test/smoke_test.py、test/tools/ 下的工具
+#
+# 衍生值一律用算的，不要在任何地方寫死：
+#   inscribed_radius     = footprint_width / 2
+#   circumscribed_radius = sqrt((footprint_length/2)^2 + (footprint_width/2)^2)
+#
+# 【標註】每一項後面註明「量測值」或「暫定值」。
+# 目前全部是暫定值：真車確認是後兩輪差速驅動 + 前兩輪固定方向從動輪，
+# 輪徑、輪距、軸距即將重新量測。量完一項就把該項改成「量測值」。
+
+wheel_radius:        0.17    # 暫定值。後輪(驅動輪)半徑
+wheel_separation:    0.58    # 暫定值。後輪中心距 (URDF 的輪子擺在 +-wheel_separation/2)
+wheelbase:           TBD     # 暫定值。前後軸距，待量 (URDF 目前前後輪 x = +-0.35，尚未讀這一項)
+footprint_length:    0.95    # 暫定值。footprint 長 (nav2 footprint、淨空檢查)
+footprint_width:     0.68    # 暫定值。輪外緣到輪外緣
+body_length:         0.95    # 暫定值。視覺用 (URDF 車體方塊)
+body_width:          0.46    # 暫定值。視覺用 (URDF 車體方塊)
+body_height:         0.46    # 暫定值。視覺用 (URDF 車體方塊)
+blade_width:         0.50    # 暫定值。刀盤寬 (mower_manager 的割草線間距與覆蓋判定)
+mass:                73.4    # 暫定值。整車質量 kg (車體 57.2 + 電池 16.2)

@@ -14,6 +14,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
 from nav2_msgs.action import FollowPath
 import rclpy
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
 
@@ -119,7 +120,9 @@ class MowerManager(Node):
         # 「實際未割面積比例」兩個指標上都是最低的 (7.82% / 10.70%)，
         # 代價是任務耗時比零重疊多 45% (107.9 s -> 156.8 s)。
         # 注意曲線到 0.4 還沒有平掉，0.5 可能更好，只是沒有測。
-        self.declare_parameter('blade_width', 0.5)
+        # 刀盤寬來自 vehicle.yaml (由 mower_control.launch.py 傳入)，這裡不給預設值：
+        # 沒傳就在 get_parameter 時直接失敗，不要安靜地用一個寫死的數字。
+        self.declare_parameter('blade_width', Parameter.Type.DOUBLE)
         self.declare_parameter('overlap_ratio', 0.4)
         self.blade_width = float(self.get_parameter('blade_width').value)
         self.overlap_ratio = float(self.get_parameter('overlap_ratio').value)
@@ -128,6 +131,20 @@ class MowerManager(Node):
             f'🔪 實際刀盤寬 = {self.blade_width:.3f} m，'
             f'重疊率 = {self.overlap_ratio:.2f}，'
             f'割草線間距 = {self.swath_spacing:.3f} m')
+
+        # 車體 footprint：來自 vehicle.yaml (由 mower_control.launch.py 傳入)，不給預設值，
+        # 理由同 blade_width。兩種淨空門檻由它算出來，說明見 lead_in_point_unsafe() 上方。
+        self.declare_parameter('footprint_length', Parameter.Type.DOUBLE)
+        self.declare_parameter('footprint_width', Parameter.Type.DOUBLE)
+        footprint_length = float(self.get_parameter('footprint_length').value)
+        footprint_width = float(self.get_parameter('footprint_width').value)
+        self.LEAD_IN_BOUNDARY_CLEARANCE = footprint_width / 2.0
+        self.ROTATION_CLEARANCE = math.hypot(footprint_length / 2.0,
+                                             footprint_width / 2.0)
+        self.get_logger().info(
+            f'🚙 footprint = {footprint_length} x {footprint_width} m，'
+            f'內切半徑 = {self.LEAD_IN_BOUNDARY_CLEARANCE!r} m，'
+            f'外接半徑 = {self.ROTATION_CLEARANCE!r} m')
         # mode 3 是**保留值，沒有實作**(階段 23)。
         #
         # 【為什麼不重新編號】
@@ -650,12 +667,16 @@ class MowerManager(Node):
 
     # ---- 兩種淨空門檻：直線通過 vs 原地掉頭 ----
     #
-    # 【直線通過】只要車體不重疊就好 = 內切半徑 0.34 m
-    #   (footprint 0.95 x 0.68，半寬 0.34)
+    # 【直線通過】只要車體不重疊就好 = 內切半徑 = footprint_width / 2
+    #   (目前 footprint 0.95 x 0.68，半寬 0.34)
     #
     # 【原地掉頭】車體四角會掃出一個圓 = 外接半徑
-    #   sqrt(0.475^2 + 0.34^2) = 0.5841 m
+    #   sqrt((footprint_length/2)^2 + (footprint_width/2)^2)
+    #   (目前 sqrt(0.475^2 + 0.34^2) = 0.584145 m；階段 30 以前寫死成四捨五入的 0.5841)
     #   淨空小於這個值時，原地旋轉一定會掃到障礙物。
+    #
+    # 兩個值在 __init__ 裡由 vehicle.yaml 的 footprint 算出來
+    # (self.LEAD_IN_BOUNDARY_CLEARANCE / self.ROTATION_CLEARANCE)，不要寫死。
     #
     # 這個區分是階段 21 才補上的。之前所有檢查都用 0.34，
     # 結果實車那次在 (-5.36, -4.57) 卡住：該點淨空 0.492 m，
@@ -663,8 +684,6 @@ class MowerManager(Node):
     # DWB 的 BaseObstacle critic 只看軌跡中心點的 cost (中心是自由的)，
     # 所以它不會判軌跡無效，只會一直發指令直到 progress checker
     # 15 秒後中止 —— 全程沒有任何一則錯誤訊息指出真正的原因。
-    LEAD_IN_BOUNDARY_CLEARANCE = 0.34          # 直線通過
-    ROTATION_CLEARANCE = 0.5841                # 原地掉頭 (外接半徑)
 
     # 跑道長度的退讓階梯。不可行時依序縮短，取第一個可行的；全部不行就不加跑道。
     # 不是「有或沒有」二選一：0.3 m 的跑道仍然能收斂一部分橫向誤差，
@@ -729,7 +748,7 @@ class MowerManager(Node):
         檢查兩件事 —— **邊界與內部障礙物都要看**：
 
         1. 邊界：點必須落在邊界多邊形**裡面**，而且離邊界至少
-           LEAD_IN_BOUNDARY_CLEARANCE (車體內切半徑 0.34 m)。
+           LEAD_IN_BOUNDARY_CLEARANCE (車體內切半徑 = footprint_width / 2)。
            跑道是沿著割草線往**反方向**延伸的，而 F2C 的地頭本來就貼著邊界，
            所以延伸出去的起點很容易落到邊界外。實測 demo_lawn 上
            割草線 2/36 的跑道起點 x=5.51 直接落在牆體 (5.50~5.70) 裡面，

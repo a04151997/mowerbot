@@ -1,4 +1,6 @@
 import os
+
+import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction,
@@ -25,6 +27,11 @@ def generate_launch_description():
     """
     pkg_bringup = get_package_share_directory('mowerbot_bringup')
 
+    # 車輛幾何的單一來源 (階段 30)
+    pkg_description = get_package_share_directory('mowerbot_description')
+    with open(os.path.join(pkg_description, 'config', 'vehicle.yaml')) as fh:
+        vehicle = yaml.safe_load(fh)
+
     use_sim_time = LaunchConfiguration('use_sim_time')
     ticks_per_rev = LaunchConfiguration('encoder_ticks_per_rev')
     driver_type = LaunchConfiguration('driver_type')
@@ -38,9 +45,9 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-            # 車體物理量：與 URDF 一致，不要各填各的
-            'wheel_radius': 0.17,
-            'wheel_separation': 0.58,
+            # 車體物理量：來自 vehicle.yaml，與 URDF 同一個來源，不要各填各的
+            'wheel_radius': vehicle['wheel_radius'],
+            'wheel_separation': vehicle['wheel_separation'],
             # 【必填】每轉的編碼器 tick 數，要查驅動板/編碼器的文件。
             # 預設 0 代表「還沒填」，bridge_node 會拒絕啟動並印出說明 ——
             # 這是刻意的：猜一個值會讓里程計的尺度安靜地錯掉。

@@ -3,11 +3,13 @@
     <xacro:include filename="car_inertia.xacro"/>
     <xacro:property name="PI" value="3.1415926535897931"/>
 
-    <xacro:property name="body_length" value="0.95"/>
-    <xacro:property name="body_width" value="0.46"/>
-    <xacro:property name="body_height" value="0.46"/>
+    <!-- 車體與輪子尺寸來自 vehicle.yaml (car_base.xacro 載入的 vehicle) -->
+    <xacro:property name="body_length" value="${vehicle['body_length']}"/>
+    <xacro:property name="body_width" value="${vehicle['body_width']}"/>
+    <xacro:property name="body_height" value="${vehicle['body_height']}"/>
 
-    <xacro:property name="wheel_radius" value="0.17"/> 
+    <xacro:property name="wheel_radius" value="${vehicle['wheel_radius']}"/>
+    <xacro:property name="wheel_separation" value="${vehicle['wheel_separation']}"/>
     <xacro:property name="wheel_width" value="0.1"/> 
     <xacro:property name="wheel_mass" value="1.0"/> 
     
@@ -34,10 +36,14 @@
 
     <xacro:macro name="add_rear_wheel" params="prefix y_reflect">
         <xacro:visual_wheel prefix="${prefix}_rear" />
+        <!-- y = +-wheel_separation/2；z 讓輪子剛好著地 = wheel_radius - base_link 離地高度。
+             以前 y 是 body_width/2 + wheel_width/2 + 0.01、z 寫死 -0.26 (= 0.17 - 0.43)，
+             量測值一換就會與 diff_drive 的 wheel_separation 對不上 / 輪子懸空或陷地。
+             x = +-0.35 (軸距 0.70) 仍然寫死：vehicle.yaml 的 wheelbase 還是 TBD。 -->
         <joint name="${prefix}_rear_wheel_joint" type="continuous">
             <parent link="base_link"/>
             <child link="${prefix}_rear_wheel"/>
-            <origin xyz="-0.35 ${y_reflect * (body_width/2 + wheel_width/2 + 0.01)} -0.26" rpy="0 0 0"/>
+            <origin xyz="-0.35 ${y_reflect * wheel_separation / 2} ${wheel_radius - (car_height / 2.0 + ground_height)}" rpy="0 0 0"/>
             <axis xyz="0 1 0"/>
         </joint>
 
@@ -53,7 +59,7 @@
         <joint name="${prefix}_front_wheel_joint" type="continuous">
             <parent link="base_link"/>
             <child link="${prefix}_front_wheel"/>
-            <origin xyz="0.35 ${y_reflect * (body_width/2 + wheel_width/2 + 0.01)} -0.26" rpy="0 0 0"/>
+            <origin xyz="0.35 ${y_reflect * wheel_separation / 2} ${wheel_radius - (car_height / 2.0 + ground_height)}" rpy="0 0 0"/>
             <axis xyz="0 1 0"/>
         </joint>
 

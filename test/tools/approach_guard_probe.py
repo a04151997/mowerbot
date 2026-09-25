@@ -44,7 +44,17 @@ def straight_path(x0, y0, n=20, step=0.1):
 
 
 def main():
-    rclpy.init()
+    # mower_manager 的 footprint 與刀盤寬沒有預設值 (階段 30)，
+    # 照 mower_control.launch.py 一樣從 vehicle.yaml 傳進去。
+    import os
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_description'),
+                           'config', 'vehicle.yaml')) as fh:
+        vehicle = yaml.safe_load(fh)
+    rclpy.init(args=['--ros-args'] + [
+        a for k in ('footprint_length', 'footprint_width', 'blade_width')
+        for a in ('-p', '%s:=%r' % (k, vehicle[k]))])
     node = MowerManager()
     node.latest_boundary = big_boundary()
     node.latest_obstacles = []

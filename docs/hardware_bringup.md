@@ -35,6 +35,50 @@
 
 ---
 
+## 車輛幾何：量測之後只改 `vehicle.yaml`（階段 30）
+
+真車是**後兩輪差速驅動 + 前兩輪固定方向從動輪**（滑移轉向）。
+輪徑、輪距、軸距、footprint 的量測值出來之後，**只改一個檔案**：
+
+```
+src/mowerbot_description/config/vehicle.yaml
+```
+
+改完重新 `colcon build`（至少 `mowerbot_description`），所有讀它的地方就會一起更新：
+
+| 讀它的地方 | 用到的項目 |
+|-----------|-----------|
+| URDF（`car_base.xacro` / `car_wheels.xacro`） | 車體方塊 `body_*`、`mass`、輪半徑、輪子的 y（±`wheel_separation`/2）與 z（剛好著地）、diff_drive plugin 的輪距與輪徑 |
+| `navigation.launch.py` | local_costmap 的 footprint（由 `footprint_length` / `footprint_width` 算，`nav2_params.yaml` 裡已經沒有 footprint） |
+| `mower_control.launch.py` → `mower_manager` | 淨空檢查的內切 / 外接半徑、`blade_width` |
+| `bringup_real.launch.py` → `bridge_node` | `wheel_radius`、`wheel_separation` |
+| `test/smoke_test.py`、`test/tools/` | 同上各項（讀**安裝後**的那一份，與節點拿到的一致） |
+
+衍生值一律用算的，不在任何地方寫死：
+
+- 內切半徑 = `footprint_width` / 2
+- 外接半徑 = sqrt((`footprint_length`/2)² + (`footprint_width`/2)²)
+
+`mower_manager` 與 `bridge_node` 的這幾個參數**沒有預設值**：不經過 launch 檔直接
+`ros2 run` 而沒有帶 `-p` 的話，節點會在啟動時以 `ParameterUninitializedException` 失敗，
+而不是安靜地用一個舊數字跑下去。
+
+每一項後面標了「量測值 / 暫定值」，量完一項就改標記。
+
+**改完之後要人工重新檢查的東西**（它們是「由幾何推導、但含有判斷」的值，
+沒有辦法自動跟著算，也不該自動跟著算）：
+
+| 值 | 在哪裡 | 為什麼要重看 |
+|----|--------|-------------|
+| `headland_width` 0.70 | `mower_control.launch.py`、`f2c_server.cpp` | = 外接半徑 + xy_goal_tolerance 0.10 再**進位**。外接半徑變了就要重算、重新決定怎麼進位 |
+| `acc_lim_x` 0.5 / `acc_lim_theta` 1.5 | `nav2_params.yaml` | 由 max_wheel_acceleration × 輪半徑、÷ 輪距推導後**保守取整**。屬於速度 / 加速度上限，由使用者決定 |
+| `inflation_radius` 0.45 | `nav2_params.yaml` | 依內切半徑選的，內切半徑變了要重看 |
+| 前後輪 x = ±0.35 | `car_wheels.xacro` | `wheelbase` 還是 TBD，URDF 暫時沒有讀它。量到之後要改成讀 `vehicle.yaml` |
+| 輪寬 0.1 | `car_wheels.xacro` | 不在 `vehicle.yaml` 裡。目前 `footprint_width` 0.68 = 輪距 0.58 + 輪寬 0.1，兩者是分開填的，改其中一個要確認另一個還對得上 |
+| Phase O 夾具的 `O_FIXTURE_MARGIN` | `smoke_test.py` | 啟動斷言會以「夾具幾何問題」失敗來提醒，不會安靜地錯 |
+
+---
+
 ## 步驟 1：確認驅動板通訊（先不透過 ROS）
 
 **目標：用最土法的方式讓一顆輪子轉起來，證明「電腦講的話板子聽得懂」。**
