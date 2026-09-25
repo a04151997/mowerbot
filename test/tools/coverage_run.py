@@ -15,7 +15,10 @@
 
 <prefix>_traj.csv 的欄位：
 
-    t, x, y, label, odom_vx, odom_wz, cmd_vx, cmd_wz, cmd_age
+    t, x, y, label, odom_vx, odom_wz, cmd_vx, cmd_wz, cmd_age, yaw
+
+  yaw  /odom 的朝向 (rad)（階段 29 新增在最後一欄，原本 9 欄的位置與意義不變）。
+       車子被擋住時 twist 會抖，把 odom_wz 積分回去得不到可靠的朝向，所以直接錄。
 
   odom_vx / odom_wz  /odom 的 twist，車子**實際**的線速度與角速度
   cmd_vx  / cmd_wz   /cmd_vel 最後一筆的 linear.x 與 angular.z，也就是**指令**
@@ -27,11 +30,15 @@
   控制器一直在下轉向指令，或是指令是直線但車子被擋住走不動。
   只錄位置分不出來 —— 階段 23 的那次診斷就是卡在這裡。
   取樣時刻與 x / y / label 完全對齊：全部在同一個 /odom 回呼裡寫進同一列。
+
+<prefix>_plan.csv（階段 29）：manager 發的 /f2c_path（F2C 規劃出來的完整路徑）的航點，
+  欄位 x, y，依原順序。coverage_budget.py 用它算「規劃上涵蓋了哪裡」，
+  讓 E2a 只由計畫決定、不受軌跡影響。多輪規劃時存最後一輪。
 """
 import csv, math, sys, time, numpy as np, rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
-from nav_msgs.msg import Odometry, OccupancyGrid
+from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from geometry_msgs.msg import Twist, PolygonStamped
 from mowerbot_interfaces.msg import MissionStatus
 from mowerbot_interfaces.srv import SetDriveMode
@@ -65,9 +72,13 @@ def on_odom(m):
     now = time.time()
     odom.append((now, pose['x'], pose['y'], state['label'],
                  m.twist.twist.linear.x, m.twist.twist.angular.z,
-                 cmd['vx'], cmd['wz'], now - cmd['t'] if cmd['t'] else 999.0))
+                 cmd['vx'], cmd['wz'], now - cmd['t'] if cmd['t'] else 999.0,
+                 pose['yaw']))
 n.create_subscription(Odometry, '/odom', on_odom, 50)
 n.create_subscription(OccupancyGrid, '/map', lambda m: maps.append(m), qos)
+plans = []
+n.create_subscription(Path, '/f2c_path', lambda m: plans.append(
+    [(p.pose.position.x, p.pose.position.y) for p in m.poses]), qos)
 n.create_subscription(PolygonStamped, '/f2c_boundary',
                       lambda m: bnds.append([(p.x, p.y) for p in m.polygon.points]), 10)
 def on_ms(m):
@@ -150,11 +161,18 @@ mode(2)
 with open(OUT + '_traj.csv', 'w', newline='') as fh:
     w = csv.writer(fh)
     w.writerow(['t', 'x', 'y', 'label',
-                'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz', 'cmd_age'])
+                'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz', 'cmd_age', 'yaw'])
     for r in odom:
         w.writerow(['%.3f' % r[0], '%.4f' % r[1], '%.4f' % r[2], r[3],
                     '%.4f' % r[4], '%.4f' % r[5],
-                    '%.4f' % r[6], '%.4f' % r[7], '%.3f' % r[8]])
+                    '%.4f' % r[6], '%.4f' % r[7], '%.3f' % r[8], '%.4f' % r[9]])
+with open(OUT + '_plan.csv', 'w', newline='') as fh:
+    w = csv.writer(fh)
+    w.writerow(['x', 'y'])
+    for px, py in (plans[-1] if plans else []):
+        w.writerow(['%.4f' % px, '%.4f' % py])
+print('已存 %s_plan.csv (收到 /f2c_path %d 次，最後一次 %d 個航點)'
+      % (OUT, len(plans), len(plans[-1]) if plans else 0))
 m = maps[-1]
 g = np.array(m.data, dtype=np.int8).reshape((m.info.height, m.info.width))
 np.savez(OUT + '_map.npz', grid=g, res=m.info.resolution,

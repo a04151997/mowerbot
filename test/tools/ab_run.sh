@@ -39,6 +39,7 @@
 #
 # 地圖名預設 ab_map，可用環境變數 AB_MAP 改。maps/ 裡的地圖檔不進版控。
 # 世界預設 demo_lawn.world（run_demo.sh 的預設），可用環境變數 AB_WORLD 改（階段 28）。
+# 任務秒數上限預設 1500，可用 AB_LIMIT 改（階段 29：只為了抓規劃路徑時用短的）。
 # ==========================================================================
 set -u
 MODE=${1:?用法: ab_run.sh map|run <輸出目錄>}
@@ -92,7 +93,7 @@ if [ "$MODE" = map ]; then
     python3 -u test/tools/coverage_run.py --map-only > "$OUT/drive.log" 2>&1
     ros2 run mowerbot_bringup save_map.sh "$MAP_NAME" > "$OUT/save.log" 2>&1
 else
-    python3 -u test/tools/coverage_run.py "$OUT/run" 1500 --no-drive > "$OUT/coverage_run.log" 2>&1
+    python3 -u test/tools/coverage_run.py "$OUT/run" "${AB_LIMIT:-1500}" --no-drive > "$OUT/coverage_run.log" 2>&1
 fi
 
 [ -n "$LOC" ] && kill -TERM -- "-$LOC" "-$MS"

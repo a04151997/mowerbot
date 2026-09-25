@@ -27,17 +27,24 @@ C  割草線實際覆蓋面積
 
 D  重疊 = B ∩ C
 
-E  未覆蓋 = A − (B + C − D)，並拆成三類：
-   E1 邊界安全帶：離草坪真實邊界 < 0.19 m 的未覆蓋格。
-      0.19 = (車體半寬 0.34 + 邊界腐蝕 0.10) − 刀盤半徑 0.25。
-      也就是「車心最近只能到 0.44 m，刀盤再往外 0.25 m」之後仍然到不了的帶狀區。
-      **物理上不可能割到**，不是控制或規劃的問題。
-   E3 被跳過的段落：未覆蓋格中，落在「被跳過段落的規劃路徑 ± 0.25 m」內的部分。
-      被跳過的段落與其起訖點由 manager 的 📋 佇列 與 ⏭️ 跳過此段 log 取得。
-   E2 其餘：割草線之間的縫隙，成因是循跡誤差。
+E  未覆蓋 = A − (B + C − D)。階段 29 起分成五類（量法見報告 29.2）：
+   規劃涵蓋 = 計畫裡每一段的刀盤範圍（± 0.25 m）。計畫取自 <prefix>_plan.csv
+   （coverage_run.py 錄的 /f2c_path）：周邊環繞 = 路徑開頭到收尾航點那一段折線，
+   割草線 = 佇列的直線（扣掉跑道）。
 
-   三類互斥，依 E1 -> E3 -> E2 的順序歸屬（先扣掉物理不可能的，
-   再扣掉根本沒去割的，剩下的才算循跡誤差）。
+   E1  邊界安全帶：離真實邊界 < 0.19 m 的草坪。只由幾何決定。
+       0.19 = (車體半寬 0.34 + 邊界腐蝕 0.10) − 刀盤半徑 0.25，物理上割不到。
+   E2a 規劃就沒涵蓋：E1 以外、不在任何一段規劃涵蓋裡的草坪。**只由計畫決定**，
+       同一個計畫下每趟都一樣。軌跡偏出計畫時可能割到其中一部分（「計畫外被割到」），
+       另外列出；E 的分解用扣掉這部分之後的量。
+       （階段 28 以前 E2a = 未覆蓋 ∩ 離牆 < 0.55 m：「未覆蓋」把軌跡混了進來，
+        0.55 m 也只是用 headland 算出來的近似邊線，所以同一個計畫五趟差了 1.38 m²。）
+   E3  規劃涵蓋裡沒割到、屬於「輪到了但沒割」的段落：⏭️ 跳過、
+       階段 26 的「超出局部代價地圖範圍」跳過、送出後失敗而沒有 ⏭️ 的那一段。
+   E4  規劃涵蓋裡沒割到、屬於「任務中止後從未送出」的段落。成因與 E3 完全不同。
+   E2b 規劃涵蓋裡沒割到的其餘部分：循跡誤差。
+
+   歸屬順序 E3 -> E4 -> E2b（相鄰割草線的刀盤範圍重疊，重疊處先算給沒割的段落）。
 
 光柵解析度 0.01 m。
 =====================================================================
@@ -57,6 +64,11 @@ RE_QUEUE = re.compile(
     r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
     r'終點 \(([-\d.]+), ([-\d.]+)\) 長度 ([\d.]+) m')
 RE_SKIP = re.compile(r'⏭️ 跳過此段 (.+?) \(起點 ([-\d.]+), ([-\d.]+)\)')
+RE_SEND = re.compile(r'➡️ 送出任務 \[(.+?)\]')
+RE_DONE = re.compile(r'✅ (.+?) 完成')
+RE_FAILED = re.compile(r'❌ \[(.+?)\] 失敗')
+# 階段 26 的「超出局部代價地圖範圍」：沒有送給 Nav2，直接跳過，訊息格式與 ⏭️ 不同
+RE_OUT_OF_RANGE = re.compile(r'⚠️ \[(.+?)\] approach .*?超出局部代價地圖範圍.*?跳過此段')
 RE_LEADIN = re.compile(
     r'🛬 (割草線 \d+/\d+) 加跑道：長度 ([\d.]+) m，起點 \(([-\d.]+), ([-\d.]+)\)'
     r' -> A \(([-\d.]+), ([-\d.]+)\)')
@@ -162,6 +174,8 @@ def main():
     ap.add_argument('--log', required=True, help='mower_control 的 log 檔')
     ap.add_argument('--heatmap', default=None,
                     help='另外輸出一張覆蓋熱圖 PNG 到這個路徑')
+    ap.add_argument('--plan', default=None,
+                    help='規劃路徑 CSV（預設 <prefix>_plan.csv，coverage_run.py 產生）')
     ap.add_argument('--world', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', '..',
         'src/mowerbot_bringup/worlds/demo_lawn.world'))
@@ -220,7 +234,10 @@ def main():
             queue[q.group(3)] = (float(q.group(4)), float(q.group(5)),
                                  float(q.group(6)), float(q.group(7)),
                                  float(q.group(8)))
-    skipped = [m[0] for m in RE_SKIP.findall(txt)]
+    plan = [(float(r['x']), float(r['y']))
+             for r in csv.DictReader(open(args.plan or args.prefix + '_plan.csv'))]
+    if not plan:
+        sys.exit('計畫檔是空的：沒有收到 /f2c_path，E2a 無法由計畫決定')
 
     def mask_from_points(points):
         m = np.zeros((H, W), np.uint8)
@@ -277,40 +294,84 @@ def main():
     covered = B | C
     uncovered = lawn & ~covered
 
-    E3m = np.zeros((H, W), bool)
-    e3_unmeasurable = []
-    for lbl in set(skipped):
-        # approach 段不割草（刀盤關著），跳過它不會造成「沒割到」
-        if lbl.startswith('approach'):
-            continue
-        if lbl in queue:
-            sx, sy, ex, ey, ln = queue[lbl]
-            # log 只留下起點與終點，這裡用「起點到終點的直線」當成規劃路徑。
-            # 割草線本來就是直線，弦長 == 段長，這個近似是精確的；
-            # 但周邊環繞是沿著邊界多邊形走的折線，弦長會遠小於段長
-            # （demo_lawn 的周邊環繞 4/5：段長 5.21 m，弦長只有 1.70 m）。
-            # 這種段落用直線量出來的 E3 是錯的位置、錯的面積，不能當 0 讀。
-            chord = math.hypot(ex - sx, ey - sy)
-            if ln > chord + 0.20:
-                e3_unmeasurable.append((lbl, ln, chord))
-                continue
-            E3m |= mask_from_points([(sx, sy), (ex, ey)])
-    E1m = uncovered & (dist_wall < E1_BAND)
-    E3m = uncovered & E3m & ~E1m
-    E2m = uncovered & ~E1m & ~E3m
-    # E2 再拆兩半：靠近邊界那一圈**規劃上就沒有涵蓋**，不是循跡誤差。
-    #   外圈刀盤最外緣  = headland 0.70 + tool/2 0.15 − 刀盤半徑 0.25 = 離邊界 0.60 m
-    #   割草線刀盤最外緣 = headland 0.70 − 刀盤半徑 0.25          = 離邊界 0.45 m
-    #   邊界本身又比真實自由區域內縮 0.10 m
-    # -> 離真實牆面 < 0.45 + 0.10 = 0.55 m 的地方，規劃上就不會被割到。
-    NEVER_PLANNED = 0.45 + ERODE
-    E2a = E2m & (dist_wall < NEVER_PLANNED)
-    E2b = E2m & ~E2a
+    # ---- 規劃涵蓋範圍（階段 29）：只由計畫決定，與軌跡無關 ----
+    # 周邊環繞是 /f2c_path 開頭那一段：f2c_server 最後補一個與第 0 點座標完全相同的
+    # 收尾航點，所以「第一個與第 0 點相同的點」就是環繞的結尾。
+    # 被內部障礙物擋掉的地方航點會跳一段（缺口），畫的時候不能把缺口連起來。
+    per = []
+    for i in range(1, len(plan)):
+        if plan[i] == plan[0]:
+            per = plan[:i + 1]
+            break
+
+    def poly_mask(pts):
+        m = np.zeros((H, W), bool)
+        piece = []
+        for p in pts:
+            if piece and math.hypot(p[0] - piece[-1][0], p[1] - piece[-1][1]) > 0.5:
+                m |= mask_from_points(piece); piece = []
+            piece.append(p)
+        if piece:
+            m |= mask_from_points(piece)
+        return m
+
+    def planned_mask(lbl):
+        """單一段落的規劃涵蓋（刀盤寬）。割草線扣掉跑道（跑道上刀盤是關的）。"""
+        sx, sy, ex, ey, _ln = queue[lbl]
+        if lbl.startswith('割草線'):
+            a = lead_a.get(lbl) or (sx, sy)
+            return mask_from_points([a, (ex, ey)])
+        if lbl.startswith('周邊環繞') and per:
+            i0 = min(range(len(per)), key=lambda i: math.hypot(per[i][0] - sx, per[i][1] - sy))
+            rest = range(i0 + 1, len(per))
+            if not rest:
+                return np.zeros((H, W), bool)
+            i1 = min(rest, key=lambda j: math.hypot(per[j][0] - ex, per[j][1] - ey))
+            return poly_mask(per[i0:i1 + 1])
+        return np.zeros((H, W), bool)
+
+    seg_masks = {lbl: planned_mask(lbl) for lbl in queue if not lbl.startswith('approach')}
+    planned = np.zeros((H, W), bool)
+    for m_ in seg_masks.values():
+        planned |= m_
+
+    # ---- 段落狀態（只看最後一輪規劃之後的 log）----
+    #   E3：跳過（⏭️）、超出局部代價地圖範圍而跳過（階段 26）、送出後失敗而沒有 ⏭️ 的
+    #       （任務中止那一段）—— 「有輪到它，但沒割」
+    #   E4：任務中止之後從來沒有送出的段落 —— 「根本沒輪到它」，成因與 E3 完全不同
+    last_round = txt[txt.rfind('📋 佇列 1/'):] if '📋 佇列 1/' in txt else txt
+    sent = set(RE_SEND.findall(last_round))
+    done = set(RE_DONE.findall(last_round))
+    failed = set(RE_FAILED.findall(last_round))
+    skipped_q = set(m[0] for m in RE_SKIP.findall(last_round))
+    out_of_range = set(RE_OUT_OF_RANGE.findall(last_round))
+    e3_set = {l for l in seg_masks
+              if l in skipped_q or l in out_of_range or (l in failed and l not in done)}
+    e4_set = {l for l in seg_masks if l not in sent and l not in e3_set and l not in done}
+    skipped = sorted(e3_set)
+
+    E1m = lawn & (dist_wall < E1_BAND)                 # 物理上割不到（只由幾何決定）
+    E2a = lawn & ~E1m & ~planned                       # 規劃就沒涵蓋（只由計畫決定）
+    P = lawn & ~E1m & planned                          # 規劃上要割的部分
+    E3any = np.zeros((H, W), bool)
+    for l in e3_set:
+        E3any |= seg_masks[l]
+    E4any = np.zeros((H, W), bool)
+    for l in e4_set:
+        E4any |= seg_masks[l]
+    unc_P = uncovered & P
+    E3m = unc_P & E3any
+    E4m = unc_P & E4any & ~E3m
+    E2b = unc_P & ~E3m & ~E4m
+    E1_unc = E1m & uncovered
+    E2a_unc = E2a & uncovered
+    E2a_off = E2a & covered                            # 計畫外被割到（軌跡偏出計畫）
 
     def m2(mask):
         return int(mask.sum()) * CELL * CELL
+    wname = os.path.splitext(os.path.basename(args.world))[0]
     print('=' * 70)
-    print('覆蓋率拆帳  (demo_lawn, headland=0.70, 刀盤 0.50 m, 光柵 %.2f m)' % CELL)
+    print('覆蓋率拆帳  (%s, 刀盤 0.50 m, 光柵 %.2f m, 階段 29 版)' % (wname, CELL))
     print('=' * 70)
     print('A  草坪總面積 (世界檔幾何)            %8.2f m²' % A)
     print('B  外圈 pass 實際覆蓋                 %8.2f m²  (%5.1f%% of A)' % (m2(B), 100*m2(B)/A))
@@ -321,14 +382,16 @@ def main():
     print('E  未覆蓋 = A − (B+C−D)               %8.2f m²  (%5.1f%% of A)'
           % (m2(uncovered), 100*m2(uncovered)/A))
     print('-' * 70)
-    unmeasurable = {l for l, _n, _c in e3_unmeasurable}
-    n_skip_mow = len([l for l in set(skipped)
-                      if not l.startswith('approach') and l not in unmeasurable])
+    print('只由幾何 / 計畫決定的兩塊（同一個計畫下每趟都一樣）：')
+    print('   E1  邊界安全帶 (< %.2f m，物理上割不到) %8.2f m²  (其中被割到 %.2f m²)'
+          % (E1_BAND, m2(E1m), m2(E1m & covered)))
+    print('   E2a 規劃就沒涵蓋 (計畫的刀盤範圍之外) %8.2f m²  (其中計畫外被割到 %.2f m²)'
+          % (m2(E2a), m2(E2a_off)))
+    print('規劃上要割的部分 P = %.2f m²，其中沒割到的：' % m2(P))
     for name, mask, desc in (
-            ('E1 ', E1m, '邊界安全帶 (< %.2f m，物理上割不到)' % E1_BAND),
-            ('E2a', E2a, '邊界環帶 (< %.2f m，規劃就沒涵蓋)' % NEVER_PLANNED),
             ('E2b', E2b, '割草線之間的縫隙 (循跡誤差)'),
-            ('E3 ', E3m, '被跳過的割草段落 (%d 段)' % n_skip_mow)):
+            ('E3 ', E3m, '被跳過 / 失敗的段落 (%d 段)' % len(e3_set)),
+            ('E4 ', E4m, '任務中止後從未送出 (%d 段)' % len(e4_set))):
         a = m2(mask)
         print('   %s %-34s %8.2f m²  (%5.1f%% of A)' % (name, desc, a, 100*a/A))
         n_lab, lab, stats, cent = cv2.connectedComponentsWithStats(
@@ -340,25 +403,26 @@ def main():
             if ar >= 0.05:
                 print('        最大區塊 %.2f m² 於 (%.2f, %.2f)' % (ar, bx, by))
     print('-' * 70)
-    print('   E2 合計 (E2a + E2b)                %8.2f m²  (%5.1f%% of A)'
-          % (m2(E2m), 100*m2(E2m)/A))
-    print('   三類合計                           %8.2f m²' % (m2(E1m)+m2(E2m)+m2(E3m)))
+    tot = m2(E1_unc) + m2(E2a_unc) + m2(E2b) + m2(E3m) + m2(E4m)
+    print('   未覆蓋的分解：E1 %.2f + E2a %.2f (扣掉計畫外被割到) + E2b %.2f + E3 %.2f + E4 %.2f'
+          ' = %.2f m²（E = %.2f）'
+          % (m2(E1_unc), m2(E2a_unc), m2(E2b), m2(E3m), m2(E4m), tot, m2(uncovered)))
     print('   覆蓋率 = (B+C−D)/A                  %7.2f %%' % (100*m2(covered)/A))
     print('   扣掉 E1 之後的覆蓋率                %7.2f %%'
           % (100*m2(covered)/(A-m2(E1m))))
-    print('   扣掉 E1+E2a (規劃上可割的部分) 的覆蓋率 %6.2f %%'
-          % (100*m2(covered)/(A-m2(E1m)-m2(E2a))))
-    if skipped:
-        print('   被跳過的段落：%s' % ', '.join(sorted(set(skipped))))
-    for lbl, ln, chord in e3_unmeasurable:
-        print('   ⚠️ %s 被跳過，但它是折線 (段長 %.2f m、弦長 %.2f m)，'
-              'log 裡沒有中間航點，這一段的 E3 量不出來，沒有計入上面的 E3。'
-              % (lbl, ln, chord))
+    print('   規劃可割範圍的覆蓋率 = 已覆蓋∩P / P  %7.2f %%'
+          % (100*m2(covered & P)/m2(P)))
+    if e3_set:
+        print('   E3 段落：%s' % ', '.join(sorted(e3_set)))
+    if e4_set:
+        print('   E4 段落：%s' % ', '.join(sorted(e4_set, key=lambda l: (l.split()[0], int(l.split()[1].split('/')[0])))))
+    if not per:
+        print('   ⚠️ 計畫裡找不到周邊環繞的收尾航點，周邊環繞的規劃涵蓋沒有算進去')
 
     if args.heatmap:
         draw_heatmap(args.heatmap, occ, lawn, covered, queue, set(skipped), traj,
                      x0, y0, CELL,
-                     dict(A=A, cov=m2(covered), E=m2(uncovered), E1=m2(E1m),
+                     dict(A=A, cov=m2(covered), E=m2(uncovered), E1=m2(E1_unc),
                           E2a=m2(E2a), E2b=m2(E2b)))
         print('\n🖼️  熱圖已寫入 %s' % args.heatmap)
 

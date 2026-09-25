@@ -4,7 +4,7 @@
 用法:
     python3 test/tools/budget_summary.py <run 目錄> [<run 目錄> ...]
 
-每個 run 目錄要有 budget.txt（coverage_budget.py 的輸出）與 coverage_run.log。
+每個 run 目錄要有 budget.txt（coverage_budget.py 的輸出，可用 --file 換檔名）與 coverage_run.log。
 印出每趟的 A/B/C/D/E1/E2a/E2b/E3 面積與三個覆蓋率，以及中位數與全距 (min~max)。
 """
 import re, statistics, sys
@@ -16,19 +16,25 @@ KEYS = [('A', r'^A\s+草坪總面積.*?([\d.]+) m²'),
         ('E', r'^E\s+未覆蓋.*?([\d.]+) m²'),
         ('E1', r'^\s+E1\s.*?([\d.]+) m²'),
         ('E2a', r'^\s+E2a\s.*?([\d.]+) m²'),
+        ('E2a計畫外', r'^\s+E2a\s.*計畫外被割到 ([\d.]+) m²'),
         ('E2b', r'^\s+E2b\s.*?([\d.]+) m²'),
         ('E3', r'^\s+E3\s.*?([\d.]+) m²'),
+        ('E4', r'^\s+E4\s.*?([\d.]+) m²'),
         ('覆蓋率', r'覆蓋率 = \(B\+C−D\)/A\s+([\d.]+) %'),
         ('扣E1', r'扣掉 E1 之後的覆蓋率\s+([\d.]+) %'),
-        ('可割', r'規劃上可割的部分\) 的覆蓋率\s+([\d.]+) %')]
+        ('可割', r'(?:規劃上可割的部分\) 的覆蓋率|規劃可割範圍的覆蓋率 = 已覆蓋∩P / P)\s+([\d.]+) %')]
 RE_END = re.compile(r'任務結束：state=(\d+) 完成 (\d+)/(\d+) 跳過 (\d+)，耗時 (\d+) s')
 
 
 def main():
     rows = []
-    for d in sys.argv[1:]:
+    args = sys.argv[1:]
+    fname = 'budget.txt'
+    if '--file' in args:                     # 同一個目錄裡新舊版拆帳並存時用
+        k = args.index('--file'); fname = args[k + 1]; del args[k:k + 2]
+    for d in args:
         try:
-            txt = open(d + '/budget.txt', encoding='utf-8').read()
+            txt = open(d + '/' + fname, encoding='utf-8').read()
         except OSError:
             print('%s：沒有 budget.txt' % d)
             continue
@@ -36,7 +42,7 @@ def main():
         for k, pat in KEYS:
             m = re.search(pat, txt, re.M)
             r[k] = float(m.group(1)) if m else None
-        m = re.search(r'被跳過的段落：(.*)', txt)
+        m = re.search(r'(?:被跳過的段落|E3 段落)：(.*)', txt)
         r['skipped'] = m.group(1).strip() if m else '-'
         try:
             m = RE_END.search(open(d + '/coverage_run.log', encoding='utf-8').read())
