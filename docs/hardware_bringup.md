@@ -70,11 +70,11 @@ src/mowerbot_description/config/vehicle.yaml
 
 | 值 | 在哪裡 | 為什麼要重看 |
 |----|--------|-------------|
-| `headland_width` 0.70 | `mower_control.launch.py`、`f2c_server.cpp` | = 外接半徑 + xy_goal_tolerance 0.10 再**進位**。外接半徑變了就要重算、重新決定怎麼進位 |
+| `headland_width` 0.70 | `mower_control.launch.py`、`f2c_server.cpp` | = 外接半徑 + xy_goal_tolerance 0.10 再**進位**。外接半徑變了就要重算、重新決定怎麼進位。**有啟動斷言**（階段 31）：headland_width < 外接半徑 + general_goal_checker 的 xy_goal_tolerance 時，`mower_control.launch.py` 在啟動任何節點前以「車輛幾何變更後 headland 未同步更新」失敗 |
 | `acc_lim_x` 0.5 / `acc_lim_theta` 1.5 | `nav2_params.yaml` | 由 max_wheel_acceleration × 輪半徑、÷ 輪距推導後**保守取整**。屬於速度 / 加速度上限，由使用者決定 |
 | `inflation_radius` 0.45 | `nav2_params.yaml` | 依內切半徑選的，內切半徑變了要重看 |
 | 前後輪 x = ±0.35 | `car_wheels.xacro` | `wheelbase` 還是 TBD，URDF 暫時沒有讀它。量到之後要改成讀 `vehicle.yaml` |
-| 輪寬 0.1 | `car_wheels.xacro` | 不在 `vehicle.yaml` 裡。目前 `footprint_width` 0.68 = 輪距 0.58 + 輪寬 0.1，兩者是分開填的，改其中一個要確認另一個還對得上 |
+| 輪寬 0.1 | `car_wheels.xacro` | 不在 `vehicle.yaml` 裡。目前 `footprint_width` 0.68 = 輪距 0.58 + 輪寬 0.1，兩者是分開填的。**有啟動斷言**（階段 31）：`footprint_width` < `wheel_separation` + 輪寬時，`robot_state_publisher.launch.py` 失敗（footprint 沒包住輪子）。比較寬不會觸發 —— 車殼比輪子寬時本來就該比較寬 |
 | Phase O 夾具的 `O_FIXTURE_MARGIN` | `smoke_test.py` | 啟動斷言會以「夾具幾何問題」失敗來提醒，不會安靜地錯 |
 
 ---

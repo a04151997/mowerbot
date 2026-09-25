@@ -1,14 +1,42 @@
+import math
 import os
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 # 注意：SetParameter 位於 launch_ros.actions 之中
 from launch_ros.actions import Node, SetParameter
+
+def check_headland(context, vehicle, nav2_params_path):
+    """斷言 headland_width >= 外接半徑 + xy_goal_tolerance (階段 31)。
+
+    headland 0.70 是階段 21 由「外接半徑 0.5841 + xy_goal_tolerance 0.10，再進位」決定的，
+    沒辦法自動跟著車輛幾何算 (進位是判斷)。所以不自動算，而是在啟動時檢查：
+    vehicle.yaml 改了之後外接半徑變大、headland 沒跟著改，就在這裡直接失敗。
+    xy_goal_tolerance 取 general_goal_checker 的 —— 它決定割草線終點「停在哪裡算到了」。
+    """
+    headland = float(LaunchConfiguration('headland_width').perform(context))
+    with open(nav2_params_path) as fh:
+        nav2 = yaml.safe_load(fh)
+    xy_tol = float(nav2['controller_server']['ros__parameters']
+                   ['general_goal_checker']['xy_goal_tolerance'])
+    circumscribed = math.hypot(vehicle['footprint_length'] / 2.0,
+                               vehicle['footprint_width'] / 2.0)
+    need = circumscribed + xy_tol
+    if headland < need:
+        raise RuntimeError(
+            '車輛幾何變更後 headland 未同步更新：headland_width = %.4f m，'
+            '但外接半徑 %.4f m (vehicle.yaml footprint %.3f x %.3f) + xy_goal_tolerance %.2f m '
+            '= %.4f m。請重新決定 headland_width (mower_control.launch.py 與 f2c_server.cpp '
+            '的預設值)，見 docs/hardware_bringup.md「車輛幾何」一節。'
+            % (headland, circumscribed, vehicle['footprint_length'],
+               vehicle['footprint_width'], xy_tol, need))
+    return []
+
 
 def generate_launch_description():
     # 1. 取得各個套件的路徑
@@ -155,6 +183,11 @@ def generate_launch_description():
             description='Headland width in metres. Swaths are generated on the '
                         'field shrunk by this margin. 0 disables the headland.'
         ),
+
+        # headland 與車輛幾何的一致性斷言 (階段 31)。放在所有節點之前，
+        # 不成立時整個 launch 在啟動任何節點之前就失敗。
+        OpaqueFunction(function=check_headland, args=[
+            vehicle, os.path.join(bringup_dir, 'config', 'nav2_params.yaml')]),
 
         # 【核心修正】全域設定模擬時間參數
         SetParameter(name='use_sim_time', value=use_sim_time),

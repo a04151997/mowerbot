@@ -4287,3 +4287,48 @@ Phase Q 每次自己建圖，所以段數與最小淨空每趟不同；最小淨
   都假設車子可以原地轉。`hardware_bringup.md` 步驟 6 (b) 的原地旋轉 360° 可以直接回答這件事。
 * 建議順序：實車量原地旋轉的實際角速度（在草地上、下 1.2 rad/s）與前後軸重 →
   用它反推前輪摩擦讓模擬重現同樣的角速度 → 那時候再改 URDF、完整前後對照。
+
+## 31. 車輛幾何的兩個啟動斷言（階段 31）
+
+真車的七個數字要重新量；在拿到實機原地旋轉角速度之前，URDF、headland 與掉頭相關的東西都不動
+（`vehicle.yaml` 全部維持「暫定值」）。這一階段只加兩個斷言，讓量測值填進去之後不一致的地方會自己跳出來。
+
+### 31.1 headland_width >= 外接半徑 + xy_goal_tolerance
+
+* 位置：`mower_control.launch.py` 的 `check_headland()`（`OpaqueFunction`，排在所有節點之前）。
+  `bringup_real.launch.py` 也 include 這支，所以模擬與實車都會檢查。
+* 外接半徑由 `vehicle.yaml` 算；xy_goal_tolerance 讀安裝後 `nav2_params.yaml` 的
+  `general_goal_checker`（決定割草線終點停在哪裡算到了，也就是階段 21 推導 0.70 時用的那一個）。
+* 不成立時整個 launch 以 rc=1 結束，一個節點都不起，訊息開頭是「車輛幾何變更後 headland 未同步更新」，
+  列出 headland、外接半徑、footprint、xy_goal_tolerance 與需要的最小值。
+* 現在的值：0.70 >= 0.584145 + 0.10 = 0.684145，成立。
+* **副作用**：`headland_width:=0`（停用地頭）現在也會被這個斷言擋下。目前沒有任何測試或腳本用 0。
+
+### 31.2 footprint_width 與 wheel_separation + 輪寬：用斷言，不用算的
+
+* 位置：`robot_state_publisher.launch.py`（模擬時由 `gazebo.launch.py` 帶起、實車時由 `start_rsp:=true` 帶起）。
+* 判定：`footprint_width >= wheel_separation + 輪寬`（1e-9 只吸收浮點誤差：0.58 + 0.1 = 0.6799999999999999）。
+  輪寬從展開後的 URDF 讀後輪碰撞圓柱的長度。
+* **為什麼選斷言：**
+  1. `footprint_width` 本身是要實測的七個數字之一（輪外緣到輪外緣）。用算的等於丟掉一個直接量測；
+     用斷言則是讓「外緣到外緣」與「輪距 + 輪寬」兩條獨立量測互相核對。
+  2. 真車的車殼或刀盤座可能比輪子寬，那時 footprint 本來就該比輪子外緣寬；用等式算會把它蓋掉。
+     所以判定是「不能比輪子窄」（footprint 沒包住輪子 = costmap 與淨空檢查低估車寬），不是「必須相等」。
+  3. 用算的要把輪寬搬進 `vehicle.yaml`、再讓 `car_wheels.xacro` 讀它 —— 那是改 URDF，這一階段不做。
+* 沒有檢查「比輪子寬很多」：那需要一個量測容忍值，而那是要你決定的數字。
+
+### 31.3 反向驗證
+
+改的是 `src/.../vehicle.yaml`（安裝目錄是它的 symlink，不用重建），每次改完用 `git diff` 確認已還原。
+
+| 情境 | launch | rc | 起了幾個節點 | 訊息 |
+|------|--------|----|------|------|
+| 對照：值都正確 | `mower_control.launch.py` | 124（12 s timeout 收掉） | 7 | 無 |
+| 對照：值都正確 | `robot_state_publisher.launch.py` | 124 | 1 | 無 |
+| `footprint_length` 0.95 → 1.20，headland 維持 0.70 | `mower_control.launch.py` | **1** | **0** | 車輛幾何變更後 headland 未同步更新：headland_width = 0.7000 m，但外接半徑 0.6896 m (vehicle.yaml footprint 1.200 x 0.680) + xy_goal_tolerance 0.10 m = 0.7896 m… |
+| `footprint_width` 0.68 → 0.60 | `robot_state_publisher.launch.py` | **1** | **0** | vehicle.yaml 的 footprint_width = 0.6000 m 比後輪外緣寬度還窄：wheel_separation 0.5800 m + 輪寬 0.1000 m (car_wheels.xacro) = 0.6800 m… |
+
+兩次改壞之後都還原，`git diff vehicle.yaml` 為空。
+
+**完整套件**：**51/51 PASS**（`test/logs/20260926_023627`）。兩個斷言在正常值下都成立，所有 Phase 的 launch 照常啟動。
+這一階段沒有新增或修改任何測試項目與判定。
