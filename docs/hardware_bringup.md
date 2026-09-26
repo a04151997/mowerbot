@@ -496,6 +496,8 @@ ros2 topic echo /joy_status
 
 `test/tools/calibrate_odometry.py` 直接對 `/cmd_vel` 發指令，
 跟 M3 同樣的理由（manager 的 watchdog 零速度會互搶），**不要同時起 `bringup_real.launch.py`**。
+（階段 33 起工具自己也會檢查：啟動時聽到 `/mower_status` 就拒絕執行，印出
+「偵測到 mower_manager 正在執行……請單獨啟動 bridge_node 後再執行。」）
 
 ### 指令
 

@@ -22,6 +22,9 @@
     「開車、記錄、計算、輸出」這條流程本身沒有寫錯。
     真正的校正一定要用捲尺與地面標記，在實車上做。
 
+【單獨啟動 bridge_node】偵測到 mower_manager 在執行（/mower_status 有在發布）時
+        會拒絕執行：manager 的 watchdog 會與本工具搶 /cmd_vel（見 manager_running()）。
+
 【安全】實車第一次跑這支腳本之前，先確認 docs/hardware_bringup.md
         第 5 步的急停 / deadman / watchdog 都測過了。
         本腳本會讓 74 kg 的車子前進 5 公尺並原地旋轉 5 圈，
@@ -37,6 +40,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from mowerbot_interfaces.msg import MowerStatus
 
 
 def yaw_of(q):
@@ -67,6 +71,24 @@ class Calibrator(Node):
             self.unwrapped_yaw += d
         self._last_yaw = yaw
         self.odom = msg
+
+    # ---- 啟動守衛 ----------------------------------------------------
+    def manager_running(self, window=3.0):
+        """聽 /mower_status 一段時間，有收到就代表 mower_manager 活著。
+
+        這支工具直接發 /cmd_vel。manager 在沒有收到手把 / Nav2 指令時，
+        watchdog 會以 20 Hz 對 /cmd_vel 發零速度 —— 兩個發布者搶同一台 74 kg
+        機器的速度指令，車子會一頓一頓地動，量到的也不是里程計的誤差。
+        manager 以 5 Hz 發 /mower_status，3 秒足夠涵蓋 discovery 與好幾筆訊息。
+        """
+        seen = []
+        sub = self.create_subscription(
+            MowerStatus, '/mower_status', lambda msg: seen.append(msg), 10)
+        t0 = time.time()
+        while time.time() - t0 < window and not seen:
+            rclpy.spin_once(self, timeout_sec=0.1)
+        self.destroy_subscription(sub)
+        return bool(seen)
 
     # ---- 基本動作 ----------------------------------------------------
     def wait_for_odom(self, timeout=20.0):
@@ -269,6 +291,14 @@ def main():
     node = Calibrator(args)
     print('mowerbot 里程計校正')
     print('  模式: %s' % ('乾跑 (--auto)' if args.auto else '互動式'))
+    # 啟動守衛：在發出任何 /cmd_vel 之前檢查 (階段 33)
+    print('  檢查 mower_manager 是否在執行（聽 /mower_status 3 秒）...')
+    if node.manager_running():
+        print('  偵測到 mower_manager 正在執行。標定工具會與其安全看門狗'
+              '爭奪 /cmd_vel 控制權。請單獨啟動 bridge_node 後再執行。')
+        node.destroy_node()
+        rclpy.shutdown()
+        return 3
     print('  等待 /odom ...')
     if not node.wait_for_odom():
         print('  20 秒內沒有收到 /odom。確認 bridge_node（實車）或 Gazebo（模擬）在跑。')

@@ -1095,10 +1095,14 @@ def phase_c():
     hdr('C1  節點清單')
     # 節點多的時候 ros2 node list 預設 1 秒的 discovery 有機會漏掉節點，
     # 因此拉長 spin-time 並重試 3 次取聯集，避免把「探索漏抓」誤判成「節點沒起來」。
+    # --no-daemon (階段 33，量測修正)：ros2 cli 的 daemon 會快取圖形資訊，
+    # 階段 32 實測它列出已經結束的節點、漏掉新起的節點 (報告 32.1)。
+    # 誤報失敗之外，同一個機制也能誤報成功 (節點死了但快取還在)。
+    # 本檔其餘查圖形的 ros2 cli 呼叫 (C4 service list、三處 lifecycle get) 同樣處理。
     seen = []
     rsp_count = 0
     for attempt in range(1, 4):
-        rc, out = run(['ros2', 'node', 'list', '--spin-time', '3'], timeout=60)
+        rc, out = run(['ros2', 'node', 'list', '--no-daemon', '--spin-time', '3'], timeout=60)
         nodes = [n.strip() for n in out.split() if n.strip().startswith('/')]
         bare = [n.lstrip('/').split('/')[-1] for n in nodes]
         rsp_count = max(rsp_count, bare.count('robot_state_publisher'))
@@ -1181,7 +1185,7 @@ def phase_c():
 
     # ---- C4 服務 ----
     hdr('C4  服務存在')
-    rc, out = run(['ros2', 'service', 'list'], timeout=60)
+    rc, out = run(['ros2', 'service', 'list', '--no-daemon', '--spin-time', '3'], timeout=60)
     want = ['change_mower_mode', 'generate_coverage_path']
     miss = []
     for s in want:
@@ -2035,7 +2039,8 @@ def phase_n():
     state = None
     t0 = time.time()
     while time.time() - t0 < 30.0:
-        rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server'], timeout=15)
+        rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server',
+                        '--no-daemon', '--spin-time', '3'], timeout=15)
         cur = out.strip().splitlines()[-1].strip() if out.strip() else '(無回應)'
         if cur != state:
             sub('t=%4.1fs  lifecycle state = %s' % (time.time() - t0, cur))
@@ -2910,7 +2915,8 @@ def phase_o():
     state = None
     t0 = time.time()
     while time.time() - t0 < 40.0:
-        rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server'], timeout=15)
+        rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server',
+                        '--no-daemon', '--spin-time', '3'], timeout=15)
         cur = out.strip().splitlines()[-1].strip() if out.strip() else '(無回應)'
         if cur != state:
             sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
@@ -3333,7 +3339,8 @@ def phase_p():
         state = None
         t0 = time.time()
         while time.time() - t0 < 40.0:
-            rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server'], timeout=15)
+            rc, out = run(['ros2', 'lifecycle', 'get', '/controller_server',
+                        '--no-daemon', '--spin-time', '3'], timeout=15)
             cur = out.strip().splitlines()[-1].strip() if out.strip() else '(無回應)'
             if cur != state:
                 sub('t=%4.1fs  controller_server = %s' % (time.time() - t0, cur))
