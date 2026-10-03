@@ -10,6 +10,7 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>mowerbot_interfaces</exec_depend>
+  <exec_depend>mowerbot_action</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <!-- Ubuntu 上是 python3-pyqt5 套件 -->
   <exec_depend>python3-pyqt5</exec_depend>

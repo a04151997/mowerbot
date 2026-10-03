@@ -37,16 +37,19 @@ GUI 急停、手把急停（deadman）、機身實體急停是三層，缺一不
 """
 
 import os
+import signal
 import sys
 
 import rclpy
 from rclpy.node import Node
+from rclpy.signals import SignalHandlerOptions
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from geometry_msgs.msg import PolygonStamped
 from mowerbot_interfaces.msg import MowerStatus, MissionStatus, JoyStatus
 from mowerbot_interfaces.srv import SetDriveMode
+from mowerbot_action.manager import DEFAULT_MIN_BOUNDARY_AREA
 
 # mode 3 留在表裡但沒有按鈕：它是保留值、沒有實作，介面上不提供給使用者。
 # 還是要有名字，因為如果有東西（例如手把、或直接呼叫服務）把模式設成 3，
@@ -80,9 +83,9 @@ CONNECTION_TIMEOUT = 1.0
 # teleop 掛掉時 manager 可能還活著，畫面不能停在最後一筆綠色狀態。
 JOY_STATUS_TIMEOUT = 1.0
 
-# 與 mower_manager 的 min_boundary_area 預設值一致。
+# mower_manager 的 min_boundary_area 預設值 (單一來源：mowerbot_action.manager，階段 38)。
 # 介面上只是拿來提示「這個邊界會被拒絕」，真正的判定在 manager。
-BOUNDARY_MIN_AREA_HINT = 4.0
+BOUNDARY_MIN_AREA_HINT = DEFAULT_MIN_BOUNDARY_AREA
 
 
 class HmiBackend(Node):
@@ -525,15 +528,31 @@ class MainWindow(QtWidgets.QWidget):
 
 
 def main(args=None):
-    rclpy.init(args=args)
+    # 【關閉順序】先停 QTimer，再關 rclpy context。
+    # rclpy 預設自己攔 SIGINT / SIGTERM，收到就直接關 context；但 Qt 的事件迴圈
+    # 還在跑，QTimer 下一拍 tick() 呼叫 spin_once 就丟 RCLError，每 50 ms 一次，
+    # 行程不會結束（launch 最後只能 SIGKILL，或 PyQt 在 slot 例外時 abort 成 -6）。
+    # 所以不讓 rclpy 處理訊號（SignalHandlerOptions.NO），改由下面的 handler：
+    # 停 QTimer → 結束 Qt 事件迴圈 → finally 裡才 destroy_node / shutdown。
+    rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
     backend = HmiBackend()
     app = QtWidgets.QApplication(sys.argv)
     app.setFont(QtGui.QFont('Noto Sans CJK TC', 11))
     win = MainWindow(backend)
     win.show()
+
+    def on_signal(signum, frame):
+        # Python 的訊號 handler 只在直譯器拿回控制權時執行；
+        # 50 ms 一拍的 QTimer 會讓事件迴圈定期回到 Python，所以這裡會及時被叫到。
+        win.timer.stop()
+        app.quit()
+
+    signal.signal(signal.SIGINT, on_signal)
+    signal.signal(signal.SIGTERM, on_signal)
     try:
         code = app.exec_()
     finally:
+        win.timer.stop()
         backend.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

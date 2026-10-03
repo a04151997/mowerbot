@@ -11,3 +11,8 @@ src/mowerbot_bringup/maps/*.pgm
 src/mowerbot_bringup/maps/*.yaml
 src/mowerbot_bringup/maps/*.posegraph
 src/mowerbot_bringup/maps/*.data
+# 例外：maps/reference/ 是基準線用的固定地圖，要進版控（階段 35）。
+# 上面的 maps/*.xxx 本來就不會比對到子資料夾，這裡寫明是為了不讓人以為漏了。
+# 重現階段 32 / 35 的覆蓋率基準線一律用 reference/stage29_lawn，不要重新建圖。
+!src/mowerbot_bringup/maps/reference/
+!src/mowerbot_bringup/maps/reference/**

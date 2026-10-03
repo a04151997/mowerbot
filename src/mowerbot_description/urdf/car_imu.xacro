@@ -16,7 +16,8 @@
     <joint name="imu_joint" type="fixed">
         <parent link="base_link"/>
         <child link="imu_link"/>
-        <origin xyz="0 0 ${car_height / 2.0}" rpy="0 0 0"/>
+        <!-- 車體方塊頂面中央 (階段 38：base_link 在後輪軸，車體中心在 body_center_x) -->
+        <origin xyz="${body_center_x} 0 ${body_top_z}" rpy="0 0 0"/>
     </joint>
 
     <gazebo reference="imu_link">

@@ -28,19 +28,13 @@ from rosidl_runtime_py.utilities import get_message
 OBST = (-2.5, -0.75, 0.5)          # 與 smoke_test.py 的 O_OBSTACLE 相同
 
 
-def _load_vehicle():
-    """車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml（安裝後的那一份）"""
-    import os
-    import yaml
-    from ament_index_python.packages import get_package_share_directory
-    with open(os.path.join(get_package_share_directory('mowerbot_description'),
-                           'config', 'vehicle.yaml')) as fh:
-        return yaml.safe_load(fh)
-
-
-_VEHICLE = _load_vehicle()
-HALF_L = _VEHICLE['footprint_length'] / 2.0    # footprint（vehicle.yaml）
-HALF_W = _VEHICLE['footprint_width'] / 2.0
+# 車輛幾何的單一來源 (階段 38 起經過 vehicle_geometry.load())。
+# base_link 在後輪軸，footprint 前後不對稱：x 從 -REAR 到 +FRONT，y 從 -HALF_W 到 +HALF_W。
+from mowerbot_description import vehicle_geometry as _vg
+_GEOM = _vg.load()
+FRONT = _GEOM.front_extent
+REAR = _GEOM.rear_extent
+HALF_W = _GEOM.lateral_half_extent
 
 TOPICS = ['/rosout', '/tf', '/odom', '/cmd_vel', '/received_global_plan',
           '/local_costmap/costmap', '/local_plan']
@@ -71,7 +65,7 @@ def footprint_box_dist(x, y, th):
         for j in range(41):
             if 0 < i < 40 and 0 < j < 40:
                 continue
-            lx = -HALF_L + 2 * HALF_L * i / 40.0
+            lx = -REAR + (FRONT + REAR) * i / 40.0
             ly = -HALF_W + 2 * HALF_W * j / 40.0
             best = min(best, box_dist(x + c * lx - s * ly, y + s * lx + c * ly))
     return best
@@ -211,12 +205,15 @@ def main():
             if 0 <= i < info.width and 0 <= j < info.height:
                 return cm.data[j * info.width + i]
             return -2
-        inside = [cost_at(-HALF_L + 0.05 * a, -HALF_W + 0.05 * b)
-                  for a in range(20) for b in range(14)]
-        front = [cost_at(HALF_L + 0.05 * a, -HALF_W + 0.05 * b)
-                 for a in range(1, 11) for b in range(14)]
-        left = [cost_at(-HALF_L + 0.05 * a, HALF_W + 0.05 * b)
-                for a in range(20) for b in range(1, 11)]
+        # 取樣格數由 footprint 推導 (階段 38；以前寫死 20 x 14 = 舊車 0.95 x 0.68)
+        nl = int(math.ceil((FRONT + REAR) / 0.05))
+        nw = int(math.ceil(2 * HALF_W / 0.05))
+        inside = [cost_at(-REAR + 0.05 * a, -HALF_W + 0.05 * b)
+                  for a in range(nl) for b in range(nw)]
+        front = [cost_at(FRONT + 0.05 * a, -HALF_W + 0.05 * b)
+                 for a in range(1, 11) for b in range(nw)]
+        left = [cost_at(-REAR + 0.05 * a, HALF_W + 0.05 * b)
+                for a in range(nl) for b in range(1, 11)]
         print('')
         print('結束當下 local costmap（odom frame，%.2f s 的那一張）：' % (
             [a for a, _b in costmaps if a <= t_end][-1]))

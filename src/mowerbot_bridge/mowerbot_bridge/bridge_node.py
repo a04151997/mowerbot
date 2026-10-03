@@ -29,6 +29,8 @@ from tf2_ros import TransformBroadcaster
 
 from mowerbot_interfaces.msg import MotorStatus
 
+from mowerbot_description import vehicle_geometry
+
 from .drivers import create_driver, DriverError
 from .odometry import DifferentialOdometry, body_to_wheel
 
@@ -82,6 +84,25 @@ class MowerBridge(Node):
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
 
+        # 序列埠：只有接真實驅動板的 driver 用得到（loopback 會忽略）。
+        # 固定路徑由 udev 規則提供（deploy/99-mowerbot.rules）。
+        self.declare_parameter('serial_port', '/dev/mowerbot_base')
+        self.declare_parameter('serial_baud', 115200)
+
+        # 唯讀模式（實機階段 0 用）：絕對不送出任何下行封包，
+        # 只解析上行、發布 /odom。
+        self.declare_parameter('read_only', False)
+
+        # 幾何閘門 (階段 38)：read_only=false (會送馬達指令) 時再檢查一次 vehicle.yaml，
+        # 規則與 geometry_guard 相同 (vehicle_geometry.check_gate)。
+        # 預設 false：沒被明確放行就不讓暫定幾何驅動實車。
+        self.declare_parameter('allow_provisional', False)
+        self.declare_parameter('provisional_override_reason', '')
+
+        # /cmd_vel 的等比例縮放（實機階段 2 用 0.2 之類的值）。
+        # 乘在收到的 linear.x 與 angular.z 上；急停送的是零，縮放之後仍然是零。
+        self.declare_parameter('max_vel_scale', 1.0)
+
         p = self.get_parameter
         self.wheel_radius = float(p('wheel_radius').value)
         self.wheel_separation = float(p('wheel_separation').value)
@@ -96,6 +117,23 @@ class MowerBridge(Node):
         self.driver_type = str(p('driver_type').value)
         self.odom_frame = str(p('odom_frame').value)
         self.base_frame = str(p('base_frame').value)
+        self.serial_port = str(p('serial_port').value)
+        self.serial_baud = int(p('serial_baud').value)
+        self.read_only = bool(p('read_only').value)
+        self.max_vel_scale = float(p('max_vel_scale').value)
+
+        if not self.read_only:
+            # 在建立驅動、送出任何下行封包之前檢查。不通過就丟例外，節點不會啟動。
+            geom = vehicle_geometry.load()
+            for level, text in vehicle_geometry.check_gate(
+                    geom, bool(p('allow_provisional').value),
+                    str(p('provisional_override_reason').value)):
+                # rclpy 不允許同一個呼叫點用不同的嚴重度，所以 warn / info 分成兩個呼叫點
+                for line in text.splitlines():
+                    if level == 'warn':
+                        self.get_logger().warn(line)
+                    else:
+                        self.get_logger().info(line)
 
         if self.ticks_per_rev <= 0:
             raise DriverError(
@@ -108,8 +146,15 @@ class MowerBridge(Node):
         # ==============================================================
         # 2. 驅動層
         # ==============================================================
-        self.driver = create_driver(self.driver_type,
-                                    ticks_per_rev=self.ticks_per_rev)
+        # 輪半徑/輪距傳乘過校正的有效值：車體速度層級的驅動 (wheeltec) 要用
+        # 與下行 body_to_wheel、上行里程計同一組幾何量，換算才會來回無損。
+        self.driver = create_driver(
+            self.driver_type,
+            ticks_per_rev=self.ticks_per_rev,
+            wheel_radius=self.wheel_radius * self.radius_correction,
+            wheel_separation=self.wheel_separation * self.separation_correction,
+            serial_port=self.serial_port,
+            serial_baud=self.serial_baud)
         self.driver.connect()
 
         # ==============================================================
@@ -148,6 +193,9 @@ class MowerBridge(Node):
             % (self.driver_type, self.wheel_radius, self.radius_correction,
                self.wheel_separation, self.separation_correction,
                self.ticks_per_rev, self.odom_rate, self.cmd_vel_timeout))
+        self.get_logger().info('max_vel_scale = %.3f' % self.max_vel_scale)
+        if self.read_only:
+            self.get_logger().warn('唯讀模式：不會送出任何馬達指令')
         if abs(self.separation_correction - 1.0) < 1e-9:
             self.get_logger().warn(
                 '⚠️ wheel_separation_correction 還是 1.0（未校正）。'
@@ -164,9 +212,12 @@ class MowerBridge(Node):
         if self._watchdog_tripped:
             self.get_logger().info('✅ 重新收到 /cmd_vel，watchdog 解除')
             self._watchdog_tripped = False
-        self._apply_body_velocity(msg.linear.x, msg.angular.z)
+        self._apply_body_velocity(msg.linear.x * self.max_vel_scale,
+                                  msg.angular.z * self.max_vel_scale)
 
     def _apply_body_velocity(self, v, w):
+        if self.read_only:
+            return
         left, right = body_to_wheel(
             v, w, self.wheel_radius, self.wheel_separation,
             self.radius_correction, self.separation_correction)
@@ -189,7 +240,8 @@ class MowerBridge(Node):
 
         # ---- watchdog ----
         elapsed = (now - self._last_cmd_time).nanoseconds * 1e-9
-        if elapsed > self.cmd_vel_timeout and not self._watchdog_tripped:
+        if (not self.read_only and elapsed > self.cmd_vel_timeout
+                and not self._watchdog_tripped):
             self._watchdog_tripped = True
             self.get_logger().warn(
                 '⏱️ 超過 %.2f 秒沒收到 /cmd_vel（實際 %.2f 秒），送零速度'
@@ -277,7 +329,8 @@ class MowerBridge(Node):
             # 參數檢查失敗時 self.driver 還不存在，關閉路徑不能假設它在
             driver = getattr(self, 'driver', None)
             if driver is not None:
-                driver.stop()
+                if not getattr(self, 'read_only', False):
+                    driver.stop()
                 driver.disconnect()
         except Exception as exc:       # 關閉路徑不要再丟例外出去
             self.get_logger().error('關閉驅動時出錯: %s' % exc)
@@ -294,6 +347,9 @@ def main(args=None):
         # 參數缺失或驅動連不上：印清楚的訊息並以非零狀態結束，
         # 不要退化成「節點起來了但車子不會動」。
         print('[bridge_node] 啟動失敗: %s' % exc)
+        return 1
+    except vehicle_geometry.GeometryError as exc:
+        print('[bridge_node] 幾何閘門不通過，拒絕送出馬達指令:\n%s' % exc)
         return 1
     except KeyboardInterrupt:
         pass

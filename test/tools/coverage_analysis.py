@@ -29,19 +29,31 @@ import sys
 import cv2
 import numpy as np
 
-# --- 與 smoke_test.py 一致的常數，改這裡之前先確認那邊也一樣 ---
-BLADE_WIDTH = 0.5           # 實際刀盤寬 (車體物理屬性)
+# --- 常數一律讀單一來源 (階段 38；以前寫死並註明「與 smoke_test.py 一致」，
+#     結果 HEADLAND_WIDTH 停在 0.5，實際早就是 0.70) ---
+import ast as _ast
+from mowerbot_description import vehicle_geometry as _vg
+from mowerbot_action.manager import MowerManager as _MM
+_GEOM = _vg.load()
+BLADE_WIDTH = _GEOM.blade_width     # 實際刀盤寬 (車體物理屬性)
 BLADE_HALF = BLADE_WIDTH / 2.0
-TEST_BOUNDARY_CENTER = (-1.5, -1.5)
-TEST_BOUNDARY_HALF = 2.5    # 5 m x 5 m 測試邊界
-HEADLAND_WIDTH = 0.5        # f2c_server 的 headland_width 預設值
-TURNING_RADIUS = 1.0        # 迴轉半徑，同時當作「行末區」的寬度
+# Phase N 的測試邊界：直接從 smoke_test.py 的原始碼取值 (import 它會觸發重新 exec 與建 log 目錄)
+_ST = {n.targets[0].id: _ast.literal_eval(n.value)
+       for n in _ast.parse(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             '..', 'smoke_test.py'), encoding='utf-8').read()).body
+       if isinstance(n, _ast.Assign) and len(n.targets) == 1
+       and getattr(n.targets[0], 'id', '') in ('TEST_BOUNDARY_CENTER', 'TEST_BOUNDARY_HALF')}
+TEST_BOUNDARY_CENTER = _ST['TEST_BOUNDARY_CENTER']
+TEST_BOUNDARY_HALF = _ST['TEST_BOUNDARY_HALF']
+HEADLAND_WIDTH = _GEOM.headland_width   # f2c_server 的 headland_width (由車輛幾何推導)
+TURNING_RADIUS = 1.0        # 「行末區」的寬度 (分析用的分區寬度，不是車輛參數)
+GAP_CUT_DISTANCE = _MM.GAP_CUT_DISTANCE
 CELL = 0.01                 # 光柵化解析度，公尺
 
 
 def load_xy(path, skip_cols=0):
     with open(path) as fh:
-        rows = list(csv.reader(fh))[1:]
+        rows = [r for r in csv.reader(l for l in fh if not l.startswith('#'))][1:]
     return [(float(r[-2]), float(r[-1])) for r in rows]
 
 
@@ -74,8 +86,8 @@ def split_swaths(pts):
         if n < 1e-9:
             continue
         # 跳接 (階段 11)：被內部障礙物切開的兩段割草線是共線的，
-        # 只靠 90 度規則切不開。0.3 m 與 mower_manager.GAP_CUT_DISTANCE 一致。
-        if n > 0.3:
+        # 只靠 90 度規則切不開。門檻直接讀 mower_manager.GAP_CUT_DISTANCE。
+        if n > GAP_CUT_DISTANCE:
             cuts.add(i)
             cuts.add(min(i + 1, len(pts) - 1))
         cur = (dx / n, dy / n)

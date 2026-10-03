@@ -59,7 +59,7 @@ def load(run):
         if mf and mf.group(1) not in result:
             result[mf.group(1)] = '失敗'
     traj = [(float(r['t']), float(r['x']), float(r['y']), r['label'])
-            for r in csv.DictReader(open(run + '/run_traj.csv'))]
+            for r in csv.DictReader(l for l in open(run + '/run_traj.csv') if not l.startswith('#'))]
     # 依 label 切成連續段，保留順序
     segs = []
     for t, x, y, lb in traj:

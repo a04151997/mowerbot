@@ -20,7 +20,7 @@ from collections import Counter
 
 traj_path, log_path = sys.argv[1], sys.argv[2]
 T, X, Y = [], [], []
-for r in csv.DictReader(open(traj_path)):
+for r in csv.DictReader(l for l in open(traj_path) if not l.startswith('#')):
     T.append(float(r['t'])); X.append(float(r['x'])); Y.append(float(r['y']))
 
 RE_TS = re.compile(r'\[(\d+\.\d+)\] \[mower_manager\]: (.*)$')

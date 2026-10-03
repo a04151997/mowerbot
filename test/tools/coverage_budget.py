@@ -32,8 +32,10 @@ E  未覆蓋 = A − (B + C − D)。階段 29 起分成五類（量法見報告
    （coverage_run.py 錄的 /f2c_path）：周邊環繞 = 路徑開頭到收尾航點那一段折線，
    割草線 = 佇列的直線（扣掉跑道）。
 
-   E1  邊界安全帶：離真實邊界 < 0.19 m 的草坪。只由幾何決定。
-       0.19 = (車體半寬 0.34 + 邊界腐蝕 0.10) − 刀盤半徑 0.25，物理上割不到。
+   E1  邊界安全帶：離真實邊界 < E1 帶寬的草坪。只由幾何決定。
+       E1 帶寬 = (車體半寬 + 邊界腐蝕) − 刀盤半徑，物理上割不到。
+       階段 37 以前 = (0.34 + 0.10) − 0.25 = 0.19 m；階段 38 = (0.42 + 0.10) − 0.25 = 0.27 m
+       (車體半寬改用 lateral_half_extent = body_width_total / 2)。
    E2a 規劃就沒涵蓋：E1 以外、不在任何一段規劃涵蓋裡的草坪。**只由計畫決定**，
        同一個計畫下每趟都一樣。軌跡偏出計畫時可能割到其中一部分（「計畫外被割到」），
        另外列出；E 的分解用扣掉這部分之後的量。
@@ -57,20 +59,23 @@ import xml.etree.ElementTree as ET
 CELL = 0.01
 
 
-def _load_vehicle():
-    """車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml（安裝後的那一份）"""
-    import yaml
-    from ament_index_python.packages import get_package_share_directory
-    with open(os.path.join(get_package_share_directory('mowerbot_description'),
-                           'config', 'vehicle.yaml')) as fh:
-        return yaml.safe_load(fh)
+# 車輛幾何的單一來源 (階段 38 起經過 vehicle_geometry.load())
+from mowerbot_description import vehicle_geometry
+GEOM = vehicle_geometry.load()
+BLADE_HALF = GEOM.blade_width / 2.0                # 刀盤半徑
+# 車體半寬 = 側向半寬 lateral_half_extent (階段 38：0.42；以前 footprint_width/2 = 0.34)。
+# 不是 costmap 的內接半徑 0.155：E1 是「車身側面貼牆時刀盤還碰不到的那一帶」。
+BODY_HALF = GEOM.lateral_half_extent
+# map_to_boundary 的邊界腐蝕量 = BOUNDARY_ERODE_CELLS x 地圖解析度 (階段 38 起直接讀它的常數，
+# 以前寫死 0.10 並註明一致)。地圖解析度在 main() 從 _map.npz 取得。
+from mowerbot_action.map_to_boundary import MapToBoundaryNode as _MapToBoundary
+ERODE_CELLS = _MapToBoundary.BOUNDARY_ERODE_CELLS
 
 
-VEHICLE = _load_vehicle()
-BLADE_HALF = VEHICLE['blade_width'] / 2.0          # 刀盤半徑 (目前 0.50 / 2)
-BODY_HALF = VEHICLE['footprint_width'] / 2.0       # 車體半寬 = 內切半徑 (目前 0.68 / 2)
-ERODE = 0.10               # map_to_boundary 的邊界腐蝕量
-E1_BAND = BODY_HALF + ERODE - BLADE_HALF      # 0.19 m
+def _csv_rows(path):
+    """讀 CSV，濾掉 # 開頭的註解行 (coverage_run.py 第一行的 PROVISIONAL 蓋章，階段 38)"""
+    with open(path) as fh:
+        return list(csv.DictReader(l for l in fh if not l.startswith('#')))
 
 RE_QUEUE = re.compile(
     r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
@@ -191,7 +196,19 @@ def main():
     ap.add_argument('--world', default=os.path.join(
         os.path.dirname(os.path.abspath(__file__)), '..', '..',
         'src/mowerbot_bringup/worlds/demo_lawn.world'))
+    ap.add_argument('--traj', choices=('base', 'blade'), default='base',
+                    help='用哪一條軌跡算覆蓋：base = base_footprint (x, y)，'
+                         'blade = 刀片 blade_link (blade_x, blade_y)，階段 38')
+    ap.add_argument('--body-half', type=float, default=None,
+                    help='覆寫 E1 用的車體半寬 (只供跟舊基線對照拆帳，預設 vehicle_geometry 的 '
+                         'lateral_half_extent)')
     args = ap.parse_args()
+    if GEOM.stamp():
+        print(GEOM.stamp())
+    mp = np.load(args.prefix + '_map.npz')
+    erode = ERODE_CELLS * float(mp['res'])
+    body_half = args.body_half if args.body_half is not None else BODY_HALF
+    E1_BAND = body_half + erode - BLADE_HALF
 
     # ---- A：從世界檔建出草坪 ----
     boxes = world_boxes(args.world)
@@ -219,8 +236,11 @@ def main():
                                       cv2.DIST_L2, cv2.DIST_MASK_PRECISE) * CELL
 
     # ---- 軌跡 ----
-    rows = list(csv.DictReader(open(args.prefix + '_traj.csv')))
-    traj = [(float(r['t']), float(r['x']), float(r['y']), r['label']) for r in rows]
+    rows = _csv_rows(args.prefix + '_traj.csv')
+    kx, ky = ('blade_x', 'blade_y') if args.traj == 'blade' else ('x', 'y')
+    if kx not in rows[0]:
+        sys.exit('%s_traj.csv 沒有 %s 欄 (階段 38 以前的 coverage_run.py 產生的)' % (args.prefix, kx))
+    traj = [(float(r['t']), float(r[kx]), float(r[ky]), r['label']) for r in rows]
 
     txt = open(args.log, encoding='utf-8', errors='replace').read()
     # 一份 log 可能含多輪規劃（失敗後重新切 mode 1 會再規劃一次）。
@@ -247,7 +267,7 @@ def main():
                                  float(q.group(6)), float(q.group(7)),
                                  float(q.group(8)))
     plan = [(float(r['x']), float(r['y']))
-             for r in csv.DictReader(open(args.plan or args.prefix + '_plan.csv'))]
+             for r in _csv_rows(args.plan or args.prefix + '_plan.csv')]
     if not plan:
         sys.exit('計畫檔是空的：沒有收到 /f2c_path，E2a 無法由計畫決定')
 
@@ -383,7 +403,10 @@ def main():
         return int(mask.sum()) * CELL * CELL
     wname = os.path.splitext(os.path.basename(args.world))[0]
     print('=' * 70)
-    print('覆蓋率拆帳  (%s, 刀盤 0.50 m, 光柵 %.2f m, 階段 29 版)' % (wname, CELL))
+    print('覆蓋率拆帳  (%s, 刀盤 %.2f m, 軌跡 %s, 光柵 %.2f m, 階段 38 版)'
+          % (wname, 2 * BLADE_HALF, args.traj, CELL))
+    print('E1 帶寬 = 車體半寬 %.3f + 邊界腐蝕 %.2f (%d 格 x %.3f) - 刀盤半徑 %.3f = %.3f m'
+          % (body_half, erode, ERODE_CELLS, float(mp['res']), BLADE_HALF, E1_BAND))
     print('=' * 70)
     print('A  草坪總面積 (世界檔幾何)            %8.2f m²' % A)
     print('B  外圈 pass 實際覆蓋                 %8.2f m²  (%5.1f%% of A)' % (m2(B), 100*m2(B)/A))

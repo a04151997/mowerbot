@@ -1,0 +1,33 @@
+# mowerbot 序列埠固定名稱（階段 34）
+#
+# 讓 C30D 驅動板不管插哪個 USB 孔、開機順序如何，都固定出現在 /dev/mowerbot_base。
+#
+# 安裝：
+#   sudo cp ~/mowerbot/deploy/99-mowerbot.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   ls -l /dev/mowerbot_base          # 應該指向 ttyUSB* 或 ttyACM*
+#
+# 【比對條件還沒經過實機確認】
+# 下面的 VID:PID 與序號是照輪趣自己的慣例寫的（wheeltec_robot_ros2 的
+# turn_on_wheeltec_robot/wheeltec_udev.sh）：
+#   - 驅動板的 USB 轉序列晶片是 CP2102（10c4:ea60）或 CH9102（1a86:55d4）
+#   - 出廠時把晶片序號燒成 "0002"（光達是 "0001"）
+# 只比對 VID:PID 不夠：LD19、RPLidar 也用 CP2102，會跟驅動板搶同一個名字，
+# 所以一定要加序號。這張 C30D 的實際 VID:PID 與序號看 deploy/hw_probe.sh
+# 第 3 節的「VID:PID」「序號」兩欄；跟下面不一樣就改這裡。
+#
+# ENV{ID_MM_DEVICE_IGNORE}="1"：叫 ModemManager 不要去探測這個序列埠。
+# ModemManager 會對新插上的序列埠送 AT 指令找數據機，對驅動板來說那是一串不明位元組。
+#
+# 權限用 dialout 群組（setup_new_machine.sh 已把使用者加進去），不開 0777。
+
+# ---- 驅動板 C30D ---------------------------------------------------------
+# CP2102（核心內建 cp210x 驅動 → ttyUSB*）
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="0002", SYMLINK+="mowerbot_base", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+# CH9102（Ubuntu 22.04 走核心內建 cdc_acm → ttyACM*；裝了沁恆的 ch343 驅動則是 ttyCH343USB*）
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", ATTRS{serial}=="0002", SYMLINK+="mowerbot_base", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+
+# ---- 光達（TODO：型號待 hw_probe 確認） ------------------------------------
+# 型號確認之後，照驅動板的寫法加一行，SYMLINK+="mowerbot_lidar"。
+# 輪趣慣例裡光達的序號是 "0001"，但光達不一定是跟輪趣買的，以 hw_probe 的結果為準。
+# SUBSYSTEM=="tty", ATTRS{idVendor}=="<VID>", ATTRS{idProduct}=="<PID>", ATTRS{serial}=="<序號>", SYMLINK+="mowerbot_lidar", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

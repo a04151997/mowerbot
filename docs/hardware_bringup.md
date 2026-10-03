@@ -22,9 +22,49 @@ source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一�
 | 模擬端（SLAM / F2C / Nav2 / 安全機制） | 完成，自動化測試 51 項全過，見 `simulation_results.md` |
 | `bridge_node`（ROS ↔ 驅動板） | 骨架完成，用 loopback 假驅動測過（Phase H） |
 | 里程計數學 | 完成，單元測試在 `mowerbot_bridge/test/test_odometry.py` |
-| C30D 驅動實作（`drivers/` 下） | **空白**，要等 C30D 的通訊協定文件 |
-| 光達驅動 | **空白**，要等光達型號 |
-| 車輛幾何 `vehicle.yaml` | 全部是**暫定值**，等 M2 的實測 |
+| 馬達驅動（`drivers/wheeltec.py`） | 依輪趣 C30D 協定寫的，**待驗證**：新控制板 STM32F407 的協定待學長 ROS 1 原始碼比對 |
+| 光達驅動 | **空白**：RPLIDAR，型號細節待確認 |
+| 車輛幾何 `vehicle.yaml` | 階段 38：實測 / 粗略實測 / 暫定三類並存，見下面「實機資訊」與 `measurement_worklist.md` |
+
+---
+
+## 實機資訊（階段 38，2026-10-02）
+
+| 項目 | 內容 |
+|------|------|
+| 車輛 | **XLK X2RS**，Honda GCVxe200 汽油引擎驅動刀盤。前輪萬向腳輪 / 後輪加裝減速馬達（附編碼器）。電池 XLK 24V |
+| 原廠規格 | 98 × 73 × 46 cm，57.2 kg + 電池 16.2 kg，割幅約 50 cm，圓盤 4 支刀組，割草高度 1 ~ 8 cm 無段可調，最高車速 4.5 km/h |
+| | ⚠ 最高車速是原廠值，**本機已更換驅動馬達，不適用**，實際上限待實測。⚠ 本機加裝鋁架，實測外形 1.13 × 0.84 m（`vehicle.yaml` 一律用實測值） |
+| 控制板 | **STM32F407**。OLED 顯示 DIFF / GYRO / ROS / 左右輪數值 / BIAS；板上有 MotorA ~ D 四個馬達通道（目前用兩個）、USB-C、Power 滑動開關、USER / RESET 按鍵。具體型號未確認，但目錄結構（`turn_on_mini3_robot`）與 OLED 格式高度符合輪趣（Wheeltec）系控制板 |
+| 光達 | **RPLIDAR**，裝於引擎與電池之間的鋁架上，位於後輪軸前方。現場目視確認**未**被引擎遮擋 |
+| 深度相機 | **無**。學長 workspace 裡的 `ros_astra_camera` / `rtabmap` / `3d_navigation` 全是原「mini3」平台遺留，與割草機無關，忽略 |
+| 上位機 | Intel N100 四核 / 約 16 GB RAM |
+| 上位機 OS | **Ubuntu 18.04.6 LTS**，核心 `5.16.0-051600rc7-generic`（手動安裝的 mainline RC 核心，為支援 N100 硬體）。⚠ **不要執行 `apt upgrade`**，會動到這顆核心，換回舊核心可能導致顯示異常 |
+| 原有系統 | ROS Melodic，workspace 在 `/home/dreamworker/catkin_ws`，驅動節點 `turn_on_mini3_robot`（`mini3_robot.cpp / .h`）。⚠ **原系統已完整備份，不得覆蓋或重裝** |
+
+**原系統的用途：已知可用的參照系統。** 我方驅動不動輪子時，先停掉我方節點、開原系統看輪子會不會動，
+就能立刻區分是程式問題還是硬體問題。
+
+**⚠ ROS 1 與 ROS 2 的驅動節點不可同時執行**（`CLAUDE.md` 硬性規則）：兩者會搶同一個序列埠。
+每次測試前先跑：
+
+```bash
+ps aux | grep -E "mini3|bridge_node|roslaunch|ros2" | grep -v grep     # 必須沒有輸出才能開始
+```
+
+**ROS 2 的執行環境：chroot（已決定，2026-10-02）。** 上位機是 Ubuntu 18.04，ROS 2 Humble 需要 22.04，做法如下：
+
+| 項目 | 做法 |
+|------|------|
+| rootfs | 在家的 VM 用 `debootstrap` 做一套 Ubuntu 22.04 rootfs，裝好 ROS 2 Humble 與本專案套件，打包帶到實驗室解壓 |
+| 執行 | `chroot` 進去跑。22.04 使用者空間跑在 5.16 核心上（比 22.04 原廠的 5.15 還新） |
+| 學長的系統 | 18.04 / Melodic / mainline 5.16 核心**完全不動** |
+| 序列埠 | `mount --rbind /dev <rootfs>/dev` |
+| GUI | bind mount `/tmp/.X11-unix` |
+| 網路 | 實驗室有網路，現場可以在 chroot 裡 `apt install`、重新編譯 |
+
+rootfs 的建置步驟另外提供（不在本輪）。M0 的「N150 + 22.04 安裝流程」在這台上位機上改由 chroot 取代。
+chroot 裡外的驅動節點仍然**不可同時執行**（上面的硬性規則）。
 
 ---
 
@@ -126,47 +166,42 @@ ros2 bag record -o spin_grass_$(date +%H%M) /cmd_vel /odom /motor_status
 
 ---
 
-## 車輛幾何：量測之後只改 `vehicle.yaml`（階段 30）
+## 車輛幾何：量測之後只改 `vehicle.yaml`（階段 30；階段 38 改寫）
 
-真車是**後兩輪差速驅動 + 前兩輪固定方向從動輪**（滑移轉向）。
-輪徑、輪距、軸距、footprint 的量測值出來之後，**只改一個檔案**：
+真車是 **XLK X2RS：後兩輪差速驅動 + 前兩個腳輪（可自由轉向）**。
+`base_link` = **後輪軸中心**（純差速的瞬時旋轉中心），`base_footprint` 是它在地面的投影。
+量測值出來之後**只改一個檔案**，並把該項的 `provenance` 改成 `measured`：
 
 ```
 src/mowerbot_description/config/vehicle.yaml
 ```
 
-改完重新 `colcon build`（至少 `mowerbot_description`），所有讀它的地方就會一起更新：
+讀它的唯一入口是 `mowerbot_description/vehicle_geometry.py` 的 `load()`（啟動時檢查
+provenance 是否完整、算出所有衍生量、做斷言）。改完重新 `colcon build`，所有讀它的地方會一起更新：
 
 | 讀它的地方 | 用到的項目 |
 |-----------|-----------|
-| URDF（`car_base.xacro` / `car_wheels.xacro`） | 車體方塊 `body_*`、`mass`、輪半徑、輪子的 y（±`wheel_separation`/2）與 z（剛好著地）、diff_drive plugin 的輪距與輪徑 |
-| `navigation.launch.py` | local_costmap 的 footprint（由 `footprint_length` / `footprint_width` 算，`nav2_params.yaml` 裡已經沒有 footprint） |
-| `mower_control.launch.py` → `mower_manager` | 淨空檢查的內切 / 外接半徑、`blade_width` |
-| `bringup_real.launch.py` → `bridge_node` | `wheel_radius`、`wheel_separation` |
-| `test/smoke_test.py`、`test/tools/` | 同上各項（讀**安裝後**的那一份，與節點拿到的一致） |
+| URDF（`car_base.xacro` / `car_wheels.xacro` / `car_engine.xacro` / `car_radar.xacro`） | 車體方塊、質心、後輪、腳輪、引擎遮擋方塊、光達位置、`blade_link`、diff_drive plugin 的輪距與輪徑 |
+| `navigation.launch.py` | local_costmap 的 footprint（真實四角）與 `inflation_radius` |
+| `mower_control.launch.py` → `mower_manager` / `f2c_server` | 兩種淨空門檻、`blade_width`、`headland_width` |
+| `bringup_real.launch.py` → `bridge_node` | `rear_wheel_radius`、`wheel_separation`；幾何閘門 |
+| `test/smoke_test.py`、`test/tools/` | 同上各項（讀**安裝後**的那一份） |
 
-衍生值一律用算的，不在任何地方寫死：
+衍生值只在 `vehicle_geometry.py` 算一次，不在任何地方寫死：
 
-- 內切半徑 = `footprint_width` / 2
-- 外接半徑 = sqrt((`footprint_length`/2)² + (`footprint_width`/2)²)
+- 軸距 = `body_length_total` − `rear_wheel_radius` − `front_wheel_radius`（0.875）
+- footprint = 前 `wheelbase + front_wheel_radius`（0.975）/ 後 `rear_wheel_radius`（0.155）/ 側 `body_width_total`/2（0.42）
+- `rotation_swept_radius` = √(0.975² + 0.42²) = 1.0616（掉頭門檻）；`lateral_half_extent` = 0.42（通過門檻）；
+  `costmap_inscribed_radius` = 0.155（只給 Nav2 inflation）
+- `headland_width` = ceil((1.0616 + 0.12) / 0.05) × 0.05 = 1.20
 
-`mower_manager` 與 `bridge_node` 的這幾個參數**沒有預設值**：不經過 launch 檔直接
-`ros2 run` 而沒有帶 `-p` 的話，節點會在啟動時以 `ParameterUninitializedException` 失敗，
-而不是安靜地用一個舊數字跑下去。
+**幾何閘門**：`vehicle.yaml` 還有任何 `provisional` 項目時，`bringup_real.launch.py`
+（`allow_provisional` 預設 false）第一個節點 `geometry_guard` 就拒絕，整個 launch 以非零結束；
+`bridge_node` 以 `read_only:=false` 啟動時也會再查一次。暫定值的清單與量法見
+`docs/measurement_worklist.md`。真的要先用暫定值上車時（例如架高測極性），要同時給
+`provisional_override_reason:="<理由>"`，理由會寫進 log。
 
-每一項後面標了「量測值 / 暫定值」，量完一項就改標記。
-
-**改完之後要人工重新檢查的東西**（它們是「由幾何推導、但含有判斷」的值，
-沒有辦法自動跟著算，也不該自動跟著算）：
-
-| 值 | 在哪裡 | 為什麼要重看 |
-|----|--------|-------------|
-| `headland_width` 0.70 | `mower_control.launch.py`、`f2c_server.cpp` | = 外接半徑 + xy_goal_tolerance 0.10 再**進位**。外接半徑變了就要重算、重新決定怎麼進位。**有啟動斷言**（階段 31）：headland_width < 外接半徑 + general_goal_checker 的 xy_goal_tolerance 時，`mower_control.launch.py` 在啟動任何節點前以「車輛幾何變更後 headland 未同步更新」失敗 |
-| `acc_lim_x` 0.5 / `acc_lim_theta` 1.5 | `nav2_params.yaml` | 由 max_wheel_acceleration × 輪半徑、÷ 輪距推導後**保守取整**。屬於速度 / 加速度上限，由使用者決定 |
-| `inflation_radius` 0.45 | `nav2_params.yaml` | 依內切半徑選的，內切半徑變了要重看 |
-| 前後輪 x = ±0.35 | `car_wheels.xacro` | `wheelbase` 還是 TBD，URDF 暫時沒有讀它。量到之後要改成讀 `vehicle.yaml` |
-| 輪寬 0.1 | `car_wheels.xacro` | 不在 `vehicle.yaml` 裡。目前 `footprint_width` 0.68 = 輪距 0.58 + 輪寬 0.1，兩者是分開填的。**有啟動斷言**（階段 31）：`footprint_width` < `wheel_separation` + 輪寬時，`robot_state_publisher.launch.py` 失敗（footprint 沒包住輪子）。比較寬不會觸發 —— 車殼比輪子寬時本來就該比較寬 |
-| Phase O 夾具的 `O_FIXTURE_MARGIN` | `smoke_test.py` | 啟動斷言會以「夾具幾何問題」失敗來提醒，不會安靜地錯 |
+**改完之後要人工重新檢查的東西**：見 `docs/stage38_decisions.md` 的「待重新推導清單」。
 
 ---
 
@@ -177,56 +212,29 @@ src/mowerbot_description/config/vehicle.yaml
 ### 指令
 
 1. 用 Ubuntu 22.04 LTS Desktop 的 USB 開機碟裝系統（N150 的 BIOS 開機順序選 USB）。
-   裝完之後：
+   **一定要 22.04**：安裝腳本在其他版本上會拒絕執行（ROS 2 Humble 只有 22.04 的套件）。
+
+2. 插上 mowerbot 隨身碟（`deploy/make_usb.sh` 做的那一支），在隨身碟根目錄執行：
 
 ```bash
-sudo apt update && sudo apt upgrade -y
-sudo apt install -y git curl software-properties-common build-essential cmake
+cd /media/$USER/<隨身碟名稱>
+bash setup_new_machine.sh
 ```
 
-2. 裝 ROS 2 Humble（官方 apt 來源）：
+   **要打 `bash`**，不要 `./setup_new_machine.sh`：FAT 格式的隨身碟掛載後檔案沒有執行權限，`./` 會 `Permission denied`。
 
-```bash
-sudo add-apt-repository universe -y
-sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
-     -o /usr/share/keyrings/ros-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
-http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
-     | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
-sudo apt update
-sudo apt install -y ros-humble-ros-base ros-dev-tools python3-colcon-common-extensions
-sudo apt install -y ros-humble-navigation2 ros-humble-nav2-bringup ros-humble-slam-toolbox \
-     ros-humble-robot-state-publisher ros-humble-joint-state-publisher ros-humble-joy \
-     ros-humble-xacro ros-humble-tf2-tools python3-serial python3-opencv python3-pyqt5
-```
+   開頭會問一次 sudo 密碼。它會依序做：ROS 2 apt 來源 → ROS 2 Humble desktop + colcon + rosdep →
+   專案需要的其他套件 → 從隨身碟的 git bundle 還原到 `~/mowerbot` → `rosdep install` → `colcon build` →
+   寫 `~/.bashrc` → 把使用者加進 `dialout`。隨身碟上有 `debs/` 快取時幾乎不用下載（階段 34 實測 3 分半、51 MiB），
+   沒有快取要下載約 0.9 ~ 1.1 GB。可以重複執行，做過的步驟會跳過；失敗時會印出是哪一步、哪一行。
 
-（實車上**不需要 Gazebo**。要在 N150 上跑 `test/smoke_test.py` 的模擬 Phase 才需要
-`ros-humble-gazebo-ros-pkgs`，那不是上線必要條件。）
+   Fields2Cover（F2C，割草線規劃）用 apt 的 `ros-humble-fields2cover` **2.1.0**，腳本會用 `apt-mark hold`
+   鎖住版本，之後 `apt upgrade` 不會把它升級（覆蓋率基準線是用 2.1.0 量的，見 `simulation_results.md` 35 節）。
+   **不需要**再從原始碼編 F2C。
 
-3. 裝 Fields2Cover（F2C，割草線規劃用；開發機上用的是 **2.0.0**，裝在 `/usr/local`）。
-   下面的相依套件清單是參考，**以 Fields2Cover 該版本 README 列的為準**（N150 上第一次編譯可能要 20 分鐘以上）：
+3. **登出再登入**（`dialout` 群組才會生效）。
 
-```bash
-sudo apt install -y libgeos-dev libgdal-dev libeigen3-dev libtbb-dev libboost-all-dev \
-     libtinyxml2-dev nlohmann-json3-dev swig python3-matplotlib
-cd ~ && git clone -b v2.0.0 https://github.com/Fields2Cover/Fields2Cover.git
-cd Fields2Cover && mkdir -p build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_PYTHON=OFF .. && make -j$(nproc) && sudo make install
-sudo ldconfig
-```
-
-4. 拿 workspace 並編譯：
-
-```bash
-cd ~ && git clone <workspace 的 git 位址> mowerbot
-cd ~/mowerbot
-source /opt/ros/humble/setup.bash
-sudo rosdep init 2>/dev/null; rosdep update
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install
-echo 'source /opt/ros/humble/setup.bash'  >> ~/.bashrc
-echo 'source ~/mowerbot/install/setup.bash' >> ~/.bashrc
-```
+（實車上其實不需要 Gazebo，但腳本會一起裝，這樣 N150 上也能跑 `./run_demo.sh` 與 smoke test 的模擬 Phase。）
 
 ### 預期看到什麼
 
@@ -243,8 +251,10 @@ python3 test/smoke_test.py --phases=AH   # A（編譯與解析）與 H（loopbac
 
 | 徵狀 | 原因 | 處理 |
 |------|------|------|
-| `mowerbot_planner` 編譯失敗：`Could not find a package configuration file provided by "Fields2Cover"` | F2C 沒裝好或沒 `sudo make install` | 回第 3 步；確認 `/usr/local/lib/cmake/Fields2Cover/` 存在 |
-| `rosdep install` 說某個 key 找不到（例如 `fields2cover`） | F2C 不在 rosdep 資料庫裡，是從原始碼裝的 | 正常，`-r` 會跳過；只要第 3 步裝好就能編 |
+| 腳本在第 1 步拒絕執行 | 不是 Ubuntu 22.04，或用了 `sudo bash setup_new_machine.sh` | 重灌 22.04；用一般使用者執行，不要加 sudo |
+| `./setup_new_machine.sh: Permission denied` | 隨身碟是 FAT 格式，檔案沒有執行權限 | 改打 `bash setup_new_machine.sh` |
+| 腳本在 `apt-get update` 或 `rosdep update` 失敗 | 網路不通，或實驗室網路擋了 GitHub（`rosdep update` 要連 raw.githubusercontent.com） | 換網路後重跑，做過的步驟會跳過 |
+| `mowerbot_planner` 編譯失敗：`Could not find a package configuration file provided by "Fields2Cover"` | `ros-humble-fields2cover` 沒裝 | `dpkg -l ros-humble-fields2cover` 應該是 2.1.0；重跑腳本 |
 | `smoke_test.py --phases=A` 的 A5（xacro）失敗 | `vehicle.yaml` 沒被安裝，或 xacro 沒裝 | `colcon build --packages-select mowerbot_description` 再試；`sudo apt install ros-humble-xacro` |
 
 ---
@@ -273,15 +283,16 @@ sudo usermod -aG dialout $USER
 groups                                   # 登入後確認有 dialout
 ```
 
-3. udev 規則：把裝置固定成 `/dev/c30d`，重開機或換 USB 孔都不會跑掉：
+3. udev 規則：把裝置固定成 `/dev/mowerbot_base`，重開機或換 USB 孔都不會跑掉。
+   規則檔已經寫好（`deploy/99-mowerbot.rules`），但裡面的 VID:PID 與序號是照輪趣的慣例填的，
+   **先對照 `deploy/hw_probe.sh` 第 3 節的「VID:PID」「序號」**，不一樣就改規則檔：
 
 ```bash
-udevadm info -a -n /dev/ttyUSB0 | grep -m3 -E 'idVendor|idProduct|serial'
-# 把上面看到的三個值填進去：
-echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="<idVendor>", ATTRS{idProduct}=="<idProduct>", ATTRS{serial}=="<serial>", SYMLINK+="c30d", MODE="0666"' \
-     | sudo tee /etc/udev/rules.d/99-c30d.rules
+bash ~/mowerbot/deploy/hw_probe.sh                           # 看第 3 節 C30D 那一個序列埠
+nano ~/mowerbot/deploy/99-mowerbot.rules                     # 需要時改 idVendor / idProduct / serial
+sudo cp ~/mowerbot/deploy/99-mowerbot.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
-ls -l /dev/c30d                          # 應該指向 ttyUSB0（或 ACM0）
+ls -l /dev/mowerbot_base                 # 應該指向 ttyUSB0（或 ACM0）
 ```
 
 4. 先**不透過 ROS**，用最土法的方式讓一顆輪子轉起來（證明「電腦講的話板子聽得懂」）：
@@ -289,7 +300,7 @@ ls -l /dev/c30d                          # 應該指向 ttyUSB0（或 ACM0）
 ```bash
 python3 - <<'EOF'
 import serial, time
-s = serial.Serial('/dev/c30d', <C30D 文件上的波特率>, timeout=0.5)
+s = serial.Serial('/dev/mowerbot_base', <C30D 文件上的波特率>, timeout=0.5)
 s.write(<C30D 文件上「左輪最低速正轉」的指令位元組>)
 time.sleep(1.0)
 print('回應:', s.read(64))
@@ -319,13 +330,14 @@ d.disconnect()
 
 - 第 4 步：左輪轉約 1 秒後停；`回應:` 後面不是空的 `b''`
 - 第 5 步：左輪轉、右輪不轉；兩次 `encoders` 的左輪數值有變、右輪沒變；`stop()` 之後輪子停住
-- 拔掉 USB 再插回去，`ls -l /dev/c30d` 仍然存在
+- 拔掉 USB 再插回去，`ls -l /dev/mowerbot_base` 仍然存在
 
 ### 不正常時
 
 | 徵狀 | 原因 | 處理 |
 |------|------|------|
-| `Permission denied: '/dev/ttyUSB0'` | 還沒登出再登入，`dialout` 沒生效 | 登出再登入；或暫時用 udev 規則裡的 `MODE="0666"` |
+| `Permission denied: '/dev/mowerbot_base'` | 還沒登出再登入，`dialout` 沒生效 | 登出再登入（規則檔給的是 `dialout` 群組讀寫，刻意不開 0666）；`groups` 裡要有 `dialout` |
+| `/dev/mowerbot_base` 不存在 | 規則檔的 VID:PID 或序號跟這塊板子不符 | 對照 `hw_probe.sh` 第 3 節改規則檔，再 reload + trigger |
 | 送了指令，`回應: b''`，輪子不動 | 波特率錯、TX/RX 接反、或板子要先送「致能（enable）」指令（`drivers/README.md` D5） | 依序確認這三項；用 C30D 附的原廠工具先確認板子本身能動 |
 | 回應是亂碼 | 波特率、資料位元、同位、停止位元其中一項不對（A2） | 對照文件逐項改 |
 
@@ -558,32 +570,31 @@ python3 test/tools/calibrate_odometry.py --only=b --turns=1 --turn-speed=0.5    
 
 ### 要量的東西
 
-以 `base_link`（車體方塊的中心）為原點，右手座標：x 往車頭、y 往左、z 往上。
+以 `base_link`（**後輪軸中心**，階段 38 起）為原點，右手座標：x 往車頭、y 往左、z 往上。
+**捲尺注意**：現場捲尺同時印有公分與台寸（1 台寸 ≈ 3.03 cm），大數字是台寸，讀之前確認單位。
 
-| 量什麼 | 怎麼量 |
-|--------|--------|
-| 光達掃描中心的 x | 從車體中心沿車頭方向量到光達的旋轉中心 |
-| 光達掃描中心的 y | 往左為正 |
-| 光達掃描中心的 z | 從 `base_link` 的高度（車體方塊中心）往上量到光達的掃描平面 |
-| 光達的 0° 朝向 | 看光達外殼上的箭頭或纜線出口，對照型號文件的 0° 方向 |
+| 量什麼 | 怎麼量 | 填到哪裡 |
+|--------|--------|---------|
+| 光達掃描中心的 x | 鉛錘從光達旋轉中心垂到地面做記號，捲尺量到後輪軸中心在地面的投影（車頭方向為正） | `vehicle.yaml` 的 `lidar_x` |
+| 光達掃描中心的 y | 同上，往左為正（目前模型假設 0） | `car_radar.xacro` 的 `radar_joint_y` |
+| 光達掃描平面離地高度 | **從側面**拍或量：地面 → 光達開口中線（不是外殼頂）。現有兩次都是俯視，量不到高度 | `vehicle.yaml` 的 `lidar_z_ground`（直接填離地高度，base_link 相對高度由載入器減 `rear_wheel_radius`） |
+| 光達的 0° 朝向 | 看光達外殼上的箭頭或纜線出口，對照型號文件的 0° 方向 | `car_radar.xacro` 的 joint `rpy` |
+| **引擎 / 車體遮擋** | 光達照常掃描、車停在空曠處，`python3 test/tools/scan_fov.py 4` 直接列出被遮擋的角度範圍 | 現場目視「未被遮擋」；跑一次確認，結果交回來 |
+
+目前 `lidar_x = 0.30 ± 0.08`（measured_coarse，**量測基準點未確認**）、`lidar_z_ground = 0.55`（provisional，照片目測）。
+實機由 `allow_provisional` 閘門擋住（因為 lidar_z_ground 是 provisional），模擬放行。
 
 ### 指令
 
-目前 URDF 裡雷達在 `car_radar.xacro`：`radar_joint_x = 0.0`、`radar_joint_y = 0.0`、`radar_joint_z = 0.45`。
-**這是 URDF 的修改 —— 在 M-1 的結果交回來、凍結解除、使用者同意之前不要改**（見 `CLAUDE.md`）。
-量好的數字先記錄下來交回來。
-
-凍結解除之後：
-
 ```bash
-nano ~/mowerbot/src/mowerbot_description/urdf/car_radar.xacro      # 改 radar_joint_x / y / z
+nano ~/mowerbot/src/mowerbot_description/config/vehicle.yaml       # 改 lidar_x / lidar_z_ground，provenance 改 measured
 cd ~/mowerbot && colcon build --packages-select mowerbot_description
 ros2 launch mowerbot_description robot_state_publisher.launch.py use_sim_time:=false &
 ros2 run tf2_ros tf2_echo base_link radar                          # 印出來的平移要等於量到的值
 ```
 
 光達驅動節點填在 `bringup_real.launch.py` 的 TODO（型號確定之後），
-`frame_id` 必須是 `radar`，裝置用 udev 固定成 `/dev/lidar`（做法同 M1 第 3 步）。
+`frame_id` 必須是 `radar`，裝置用 udev 固定成 `/dev/mowerbot_lidar`（在 `deploy/99-mowerbot.rules` 的光達 TODO 那一行填好，做法同 M1 第 3 步）。
 
 ### 預期看到什麼
 
@@ -597,7 +608,7 @@ ros2 run tf2_ros tf2_echo base_link radar                          # 印出來�
 |------|------|------|
 | RViz 裡牆面在車子側面或後面 | 光達 0° 方向與車頭不一致 | 在 xacro 的 radar joint 加 yaw（`rpy="0 0 <角度>"`） |
 | 車子原地轉時掃到的牆也跟著「甩」 | 光達的 x/y 偏移量錯，旋轉時掃描中心不在填的位置 | 重量 x、y |
-| `/scan` 裡有一圈固定的近距離點 | 光達掃到車體自己（支架、相機） | 抬高光達或在驅動設定裡遮掉那個角度範圍 |
+| `/scan` 裡有一圈固定的近距離點 | 光達掃到車體自己（引擎、支架、相機）。X2RS 的引擎就在光達正前方、高度相近，**預期會發生** | 記錄被遮擋的角度範圍交回來（報告 38 節有模擬預估）；要不要抬高光達或在驅動設定遮掉那段角度由使用者決定 |
 
 ---
 

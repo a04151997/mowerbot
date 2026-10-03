@@ -16,8 +16,11 @@ from .base import MotorDriver
 
 class LoopbackDriver(MotorDriver):
 
-    def __init__(self, ticks_per_rev, clock=None):
-        """clock 可以注入（單元測試用），預設是單調時鐘。"""
+    def __init__(self, ticks_per_rev, clock=None, **_unused):
+        """clock 可以注入（單元測試用），預設是單調時鐘。
+
+        bridge_node 對所有驅動傳同一組參數（輪半徑、輪距、序列埠...），
+        假驅動用不到的就忽略。"""
         if ticks_per_rev is None or ticks_per_rev <= 0:
             raise ValueError('ticks_per_rev 必須是正數')
         self.ticks_per_rev = float(ticks_per_rev)

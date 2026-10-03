@@ -1,12 +1,23 @@
 import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import (DeclareLaunchArgument, GroupAction,
-                            IncludeLaunchDescription, LogInfo, TimerAction)
+from launch.actions import (DeclareLaunchArgument, GroupAction, OpaqueFunction,
+                            IncludeLaunchDescription, LogInfo, RegisterEventHandler,
+                            TimerAction)
 from launch.conditions import IfCondition
+from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
+
+from mowerbot_action.manager import DEFAULT_OVERLAP_RATIO
+
+
+def _geometry_gate_failed(_context):
+    # 丟例外讓 ros2 launch 以非零結束碼收掉整個 launch (只送 Shutdown 事件的話結束碼是 0，
+    # 腳本會以為啟動成功)。原因 geometry_guard 已經印在上面。
+    raise RuntimeError('幾何閘門 (geometry_guard) 不通過，launch 中止。原因見上方 geometry_guard 的 FATAL 訊息。')
 
 
 def generate_launch_description():
@@ -26,6 +37,20 @@ def generate_launch_description():
     hmi = LaunchConfiguration('hmi')
     nav = LaunchConfiguration('nav')
     overlap_ratio = LaunchConfiguration('overlap_ratio')
+    allow_provisional = LaunchConfiguration('allow_provisional')
+
+    # ---- 幾何閘門 (階段 38) ------------------------------------------------
+    # 第一個啟動，其餘各階段等它以 exit code 0 結束才開始計時。
+    # 模擬預設 allow_provisional=true：印出暫定值橫幅後放行。
+    geometry_guard = Node(
+        package='mowerbot_description',
+        executable='geometry_guard',
+        name='geometry_guard',
+        output='screen',
+        parameters=[{
+            'allow_provisional': ParameterValue(allow_provisional, value_type=bool),
+        }]
+    )
 
     # ---- 各階段要啟動的東西 ----------------------------------------------
     # 用 GroupAction 包起來 (scoped=True 是預設值) 把 Gazebo 的 launch 參數關在
@@ -180,18 +205,25 @@ def generate_launch_description():
             description='Start the HMI window (mode buttons + status). '
                         'Set false for headless runs or when driving from the CLI.'),
 
-        # 割草線重疊率，沿用 mower_control.launch.py 的預設值 0.4
-        # (選定理由見 docs/simulation_results.md 4.6.5 節)。
-        # 兩邊的預設值要一起改，不要只改一邊。
+        # 割草線重疊率，預設值來自 mowerbot_action.manager.DEFAULT_OVERLAP_RATIO
+        # (選定理由見 docs/simulation_results.md 4.6.5 節；階段 38 起單一來源)。
         DeclareLaunchArgument(
             'overlap_ratio',
-            default_value='0.4',
+            default_value=str(DEFAULT_OVERLAP_RATIO),
             description='Swath overlap ratio, passed through to '
                         'mower_control.launch.py (same default: 0.4).'),
 
-        stage_gazebo,
-        stage_control,
-        stage_nav,
-        stage_rviz,
-        stage_hmi,
+        DeclareLaunchArgument(
+            'allow_provisional',
+            default_value='true',
+            description='車輛幾何含 provisional (暫定) 值時是否放行。模擬預設 true '
+                        '(印橫幅警告)；實車 bringup_real.launch.py 預設 false。'),
+
+        geometry_guard,
+        RegisterEventHandler(OnProcessExit(
+            target_action=geometry_guard,
+            on_exit=lambda event, _ctx: (
+                [stage_gazebo, stage_control, stage_nav, stage_rviz, stage_hmi]
+                if event.returncode == 0 else
+                [OpaqueFunction(function=_geometry_gate_failed)]))),
     ])

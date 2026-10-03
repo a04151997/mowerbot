@@ -4,8 +4,9 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/L/N/O/P
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/R/L/N/O/P/Q
     python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
+    python3 test/smoke_test.py --phases=R   # 只跑硬體迴路 (假 C30D，不需要 Gazebo)
     python3 test/smoke_test.py --phases=O   # 只跑臨時障礙物容錯 (固定用 demo_lawn_obstacle.world)
     python3 test/smoke_test.py --phases AB  # 只跑指定 Phase
     python3 test/smoke_test.py --overlap=0.3           # 覆寫割草線重疊率
@@ -26,6 +27,7 @@ import time
 import bisect
 import signal
 import shlex
+import struct
 import subprocess
 from datetime import datetime
 
@@ -87,28 +89,26 @@ for _a in sys.argv[1:]:
         OVERLAP = _a.split('=', 1)[1] if '=' in _a else None
 OVERLAP = float(OVERLAP) if OVERLAP not in (None, '') else None
 # mower_control.launch.py 的 overlap_ratio 預設值。沒有覆寫時，測試自己呼叫 F2C
-# 拿參考路徑也要用這個值，否則量到的是別條路徑的落差。兩邊必須同步修改。
-DEFAULT_OVERLAP = 0.4
+# 拿參考路徑也要用這個值，否則量到的是別條路徑的落差。
+# 階段 38 起單一來源：mowerbot_action.manager.DEFAULT_OVERLAP_RATIO (launch 檔也讀它)。
+from mowerbot_action.manager import (DEFAULT_OVERLAP_RATIO as DEFAULT_OVERLAP,
+                                     MowerManager as _MowerManager)
 
-# 車輛幾何的單一來源 (階段 30)：mowerbot_description/config/vehicle.yaml。
-# 讀安裝後的那一份 —— 與 launch 檔給節點的是同一份，改了 src 沒重建時兩邊才不會各用各的。
-def _load_vehicle():
-    import yaml
-    from ament_index_python.packages import get_package_share_directory
-    with open(os.path.join(get_package_share_directory('mowerbot_description'),
-                           'config', 'vehicle.yaml')) as fh:
-        return yaml.safe_load(fh)
-
-
-VEHICLE = _load_vehicle()
-# 衍生值用算的，不寫死
-VEHICLE_INSCRIBED = VEHICLE['footprint_width'] / 2.0
-VEHICLE_CIRCUMSCRIBED = math.hypot(VEHICLE['footprint_length'] / 2.0,
-                                   VEHICLE['footprint_width'] / 2.0)
+# 車輛幾何的單一來源 (階段 30)：mowerbot_description/config/vehicle.yaml，
+# 階段 38 起一律經過 mowerbot_description.vehicle_geometry.load() (讀安裝後的那一份 ——
+# 與 launch 檔給節點的是同一份，改了 src 沒重建時兩邊才不會各用各的)。
+from mowerbot_description import vehicle_geometry as _vehicle_geometry
+GEOM = _vehicle_geometry.load()
+# 三個半徑的用途固定 (階段 38 原則 2)：
+#   VEHICLE_LATERAL_HALF  直線通過的門檻 (body_width_total / 2)
+#   VEHICLE_ROT_SWEPT     原地旋轉的門檻 (繞後輪軸，車頭角掃出的半徑)
+#   GEOM.costmap_inscribed_radius 只給 Nav2 inflation，測試不拿它當淨空門檻
+VEHICLE_LATERAL_HALF = GEOM.lateral_half_extent
+VEHICLE_ROT_SWEPT = GEOM.rotation_swept_radius
 
 # 實際刀盤寬，單位公尺。這是車體的物理屬性，不隨重疊率改變，
 # 覆蓋落差的判定基準固定是它的一半 (COVERAGE_TOL)。
-BLADE_WIDTH = VEHICLE['blade_width']
+BLADE_WIDTH = GEOM.blade_width
 COVERAGE_TOL = BLADE_WIDTH / 2.0
 # 割草線間距 = 刀盤寬 x (1 - 重疊率)，要與 mower_manager 算出來的一致，
 # 測試自己呼叫 F2C 拿參考路徑時必須用同一個值，否則量到的是別條路徑的落差。
@@ -121,6 +121,36 @@ for _a in sys.argv[1:]:
     if _a.startswith('--world'):
         WORLD = _a.split('=', 1)[1] if '=' in _a else None
 WORLD = WORLD or None
+
+
+def _manager_geometry_args():
+    """直接 ros2 run mower_manager 時要帶的參數 (與 mower_control.launch.py 同一個來源)"""
+    return ['-p', 'lateral_half_extent:=%r' % GEOM.lateral_half_extent,
+            '-p', 'rotation_swept_radius:=%r' % GEOM.rotation_swept_radius,
+            '-p', 'soft_inflation_radius:=%r' % GEOM.soft_inflation_radius,
+            '-p', 'blade_width:=%r' % GEOM.blade_width,
+            '-p', 'perimeter_corner_window:=%r' % GEOM.perimeter_corner_window,
+            '-p', 'perimeter_corner_angle:=%r' % GEOM.perimeter_corner_angle,
+            '-p', 'goal_xy_tolerance:=%r' % _nav2_goal_xy_tolerance()]
+
+
+def _nav2_goal_xy_tolerance():
+    """nav2 general_goal_checker 的 xy_goal_tolerance (與 mower_control.launch.py 同一個來源)"""
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_bringup'), 'config',
+                           'nav2_params.yaml')) as fh:
+        return float(yaml.safe_load(fh)['controller_server']['ros__parameters']
+                     ['general_goal_checker']['xy_goal_tolerance'])
+
+
+def _f2c_geometry_args():
+    """直接 ros2 run f2c_server 時要帶的參數 (與 mower_control.launch.py 同一個來源)"""
+    from mowerbot_action.manager import WAYPOINT_SPACING
+    return ['-p', 'headland_width:=%r' % GEOM.headland_width,
+            '-p', 'rotation_swept_radius:=%r' % GEOM.rotation_swept_radius,
+            '-p', 'headland_min_margin:=%r' % _vehicle_geometry.HEADLAND_MIN_MARGIN,
+            '-p', 'waypoint_spacing:=%r' % WAYPOINT_SPACING]
 
 
 def mower_control_cmd():
@@ -169,6 +199,7 @@ PHASES = [
     ('C', '模擬整合'),
     ('D', '安全機制'),
     ('H', '底盤橋接'),
+    ('R', '硬體迴路'),
     ('L', '存圖與定位'),
     ('N', 'Nav2 路徑跟隨'),
     ('O', '障礙物容錯'),
@@ -636,6 +667,48 @@ def a4_interfaces():
            ('' if not bad else ', 問題=%s' % bad))
 
 
+# A6 (階段 38)：淨空比較不得引用 costmap_inscribed_radius。
+# 它只給 Nav2 inflation 用 (costmap 自己從 footprint 算)，直線通過要用 lateral_half_extent、
+# 原地旋轉要用 rotation_swept_radius。內接半徑是「保證碰撞」的下界，拿來當通過門檻方向錯誤。
+# 規則：除了定義它的 vehicle_geometry.py 之外，任何 .py / .cpp 的程式碼行 (非註解) 出現這個名字就算違規。
+A6_TOKEN = 'costmap_' + 'inscribed_radius'      # 拆開寫，免得這一行自己被掃到
+A6_ALLOWED = ('mowerbot_description/mowerbot_description/vehicle_geometry.py',)
+
+
+def a6_scan(paths):
+    bad = []
+    for path in paths:
+        if path.replace(os.sep, '/').endswith(A6_ALLOWED):
+            continue
+        with open(path, encoding='utf-8', errors='replace') as fh:
+            for no, line in enumerate(fh, 1):
+                code = line.split('#', 1)[0] if path.endswith('.py') else line.split('//', 1)[0]
+                if A6_TOKEN in code:
+                    bad.append('%s:%d: %s' % (os.path.relpath(path, WS), no, line.strip()))
+    return bad
+
+
+def a6_source_files():
+    out = []
+    for top in (os.path.join(WS, 'src'), os.path.join(WS, 'test')):
+        for root, dirs, files in os.walk(top):
+            dirs[:] = [d for d in dirs if d not in ('logs', '__pycache__', 'build', 'install')]
+            out += [os.path.join(root, f) for f in files if f.endswith(('.py', '.cpp'))]
+    return out
+
+
+def a6_inscribed_not_used():
+    hdr('A6  淨空比較不引用 %s' % A6_TOKEN)
+    files = a6_source_files()
+    bad = a6_scan(files)
+    sub('掃描 %d 個 .py / .cpp (src/ 與 test/，排除 test/logs)' % len(files))
+    for b in bad:
+        sub('  違規：%s' % b)
+    record('A', 'A6', '淨空比較不引用 %s (只允許 vehicle_geometry.py 定義它)' % A6_TOKEN,
+           'PASS' if not bad else 'FAIL',
+           '違規 %d 處%s' % (len(bad), ('：' + bad[0]) if bad else ''))
+
+
 def a5_xacro():
     hdr('A5  xacro 解析 car.xacro')
     cands = [os.path.join(WS, 'install', 'mowerbot_description', 'share',
@@ -646,7 +719,9 @@ def a5_xacro():
         record('A', 'A5', 'xacro 解析 car.xacro', 'SKIP', '找不到 car.xacro')
         return
     sub('使用: %s' % path)
-    rc, out = run(['xacro', path], timeout=120)
+    # 衍生幾何量由 vehicle_geometry 當 xacro 參數傳入 (階段 38)，與 robot_state_publisher.launch.py 相同
+    rc, out = run(['xacro', path] + ['%s:=%s' % kv for kv in GEOM.xacro_mappings().items()],
+                  timeout=120)
     if rc != 0:
         print(out.strip()[-2000:])
         record('A', 'A5', 'xacro 解析 car.xacro', 'FAIL',
@@ -682,7 +757,7 @@ def b1_f2c():
 
     srv = bg_start('B1_f2c_server',
                    ['ros2', 'run', 'mowerbot_planner', 'f2c_server',
-                    '--ros-args', '-p', 'use_sim_time:=false'])
+                    '--ros-args', '-p', 'use_sim_time:=false'] + _f2c_geometry_args())
     rclpy.init()
     node = Node('smoke_b1')
     cli = node.create_client(GenerateCoveragePath, 'generate_coverage_path')
@@ -788,7 +863,7 @@ def b3_f2c_obstacle():
 
     srv = bg_start('B3_f2c_server',
                    ['ros2', 'run', 'mowerbot_planner', 'f2c_server',
-                    '--ros-args', '-p', 'use_sim_time:=false'])
+                    '--ros-args', '-p', 'use_sim_time:=false'] + _f2c_geometry_args())
     rclpy.init()
     node = Node('smoke_b3')
     cli = node.create_client(GenerateCoveragePath, 'generate_coverage_path')
@@ -938,6 +1013,68 @@ def b2_boundary():
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+
+# B5 (階段 38)：周邊環繞「實際會開的長度」。
+# 以前的測試只看「周邊環繞有沒有完成」—— 整圈被切成一段、起點 = 終點時，goal checker 在送出的當下
+# 就判定到達，0 秒「完成」、邊緣一公尺都沒割，測試照樣綠。這一項用存檔地圖 (stage29_lawn，進版控)
+# 跑 map_to_boundary -> F2C -> manager 自己的切段函式，量：
+#   有效環繞長度 = 各段長度總和，起點與終點距離 <= xy_goal_tolerance 的段落算 0
+# 判準：規劃的環繞長度 > 0、且 >= 邊界周長 x B5_MIN_PLANNED_RATIO (環繞在邊界往內 headland + 間距/2，必然比邊界短)；
+#       有效長度 >= 規劃長度 x B5_MIN_EFFECTIVE_RATIO (切段只會在轉角丟掉幾個航點)。
+# 對照：headland 0.70 (階段 32) 時 3 段、有效 39.27 / 規劃 39.27 m；headland 1.20 時 1 段、有效 0 / 35.38 m。
+B5_MAP = os.path.join(WS, 'src', 'mowerbot_bringup', 'maps', 'reference', 'stage29_lawn.yaml')
+B5_MIN_PLANNED_RATIO = 0.5
+B5_MIN_EFFECTIVE_RATIO = 0.9
+
+
+def b5_perimeter_effective_length():
+    hdr('B5  周邊環繞實際會開的長度 (不能是「0 秒完成」)')
+    rc, out = run(['bash', os.path.join(WS, 'test', 'tools', 'perimeter_probe.sh'), B5_MAP, LOGDIR],
+                  timeout=240)
+    kv = dict(l.split('=', 1) for l in out.splitlines() if re.match(r'^[A-Z_]+=', l))
+    for k in ('BOUNDARY_PERIMETER', 'PLANNED_PERIMETER', 'EDGES', 'CLOSED_EDGES',
+              'EFFECTIVE_PERIMETER', 'XY_TOL', 'ERROR'):
+        if k in kv:
+            sub('%-20s = %s' % (k, kv[k]))
+    try:
+        bp, pl, ef = (float(kv[k]) for k in ('BOUNDARY_PERIMETER', 'PLANNED_PERIMETER',
+                                             'EFFECTIVE_PERIMETER'))
+    except (KeyError, ValueError):
+        record('B', 'B5', '周邊環繞有效長度', 'FAIL', 'probe rc=%d，沒有輸出 (%s)'
+               % (rc, kv.get('ERROR', out.strip()[-200:])))
+        return
+    ok = pl > 0 and pl >= B5_MIN_PLANNED_RATIO * bp and ef >= B5_MIN_EFFECTIVE_RATIO * pl
+    record('B', 'B5',
+           '周邊環繞有效長度 >= 規劃長度 x %.1f，規劃長度 > 0 且 >= 邊界周長 x %.1f'
+           % (B5_MIN_EFFECTIVE_RATIO, B5_MIN_PLANNED_RATIO),
+           'PASS' if ok else 'FAIL',
+           '邊界周長 %.2f m，規劃 %.2f m，切出 %s 段 (其中起點 = 終點 %s 段)，有效 %.2f m (%.0f%%)'
+           % (bp, pl, kv.get('EDGES'), kv.get('CLOSED_EDGES'), ef, 100.0 * ef / pl if pl else 0.0))
+
+
+# B6 / B7 (階段 38 決定 3-A)：兩條正確性不變量。每一項都同時跑「正常」與「植入違規的對照組」
+# (把 goal_xy_tolerance 設成 −1 = 關掉不變量)，正常組乾淨、對照組被抓到，兩者都成立才 PASS ——
+# 不然一個什麼都不檢查、永遠回傳乾淨的實作也會讓它變綠。細節見 test/tools/invariant_probe.py。
+def b6_b7_perimeter_invariants():
+    hdr('B6 / B7  周邊環繞不變量：閉合迴圈不整段送出、起點 = 終點的段落不送出')
+    rc, out = run(['python3', os.path.join(WS, 'test', 'tools', 'invariant_probe.py')], timeout=60)
+    kv = dict(l.split('=', 1) for l in out.splitlines() if re.match(r'^[A-Z0-9_]+=', l))
+    for k in sorted(kv):
+        sub('%-20s = %s' % (k, kv[k]))
+    b6_ok = (rc == 0 and kv.get('B6_CLOSED') == '0' and int(kv.get('B6_EDGES', '0')) >= 2
+             and kv.get('B6_CONTROL_CLOSED', '0') != '0')
+    record('B', 'B6', '不變量 ①：閉合迴圈 (圓形環繞) 不會整段送出；關掉不變量的對照組會被抓到',
+           'PASS' if b6_ok else 'FAIL',
+           'rc=%d，正常：切出 %s 段、起點 = 終點 %s 段；對照：切出 %s 段、起點 = 終點 %s 段'
+           % (rc, kv.get('B6_EDGES'), kv.get('B6_CLOSED'),
+              kv.get('B6_CONTROL_EDGES'), kv.get('B6_CONTROL_CLOSED')))
+    kept, kept_bad = kv.get('B7_KEPT', ''), kv.get('B7_CONTROL_KEPT', '')
+    b7_ok = (rc == 0 and '起點 = 終點' not in kept and '割草線 1/2' in kept
+             and '起點 = 終點' in kept_bad)
+    record('B', 'B7', '不變量 ②：起點 = 終點的段落不送出；關掉不變量的對照組會被抓到',
+           'PASS' if b7_ok else 'FAIL',
+           '正常保留 [%s]；對照保留 [%s]' % (kept, kept_bad))
 
 
 def b4_obstacle_extraction():
@@ -1176,9 +1313,12 @@ def phase_c():
         z_ok = False
         sub('base_link -> radar 的 z: 查不到')
     else:
-        z_ok = abs(radar_z - 0.45) < 0.01
-        sub('base_link -> radar 的 z = %.4f (預期 0.45) -> %s' % (radar_z, 'OK' if z_ok else '不符'))
-    record('C', 'C3', 'TF 鏈路完整且 base_link->radar z==0.45',
+        # 預期值來自 vehicle.yaml 的 lidar_z (階段 38：暫定值 0.70；以前寫死 0.45)。
+        # 量測方式修正：判定仍是「TF 的 z 與 URDF 設定相差 < 0.01 m」，只是預期值改讀單一來源。
+        z_ok = abs(radar_z - GEOM.lidar_z) < 0.01
+        sub('base_link -> radar 的 z = %.4f (預期 %.2f，vehicle.yaml lidar_z) -> %s'
+            % (radar_z, GEOM.lidar_z, 'OK' if z_ok else '不符'))
+    record('C', 'C3', 'TF 鏈路完整且 base_link->radar z==lidar_z (%.2f)' % GEOM.lidar_z,
            'PASS' if (not bad and z_ok) else 'FAIL',
            '斷鏈=%s, radar_z=%s' % (bad if bad else '無',
                                     ('%.4f' % radar_z) if radar_z is not None else 'N/A'))
@@ -1235,11 +1375,9 @@ class SafetyRig(object):
         self.manager = bg_start('D_mower_manager',
                                 ['ros2', 'run', 'mowerbot_action', 'mower_manager',
                                  '--ros-args', '-p', 'use_sim_time:=false',
-                                 # footprint 與刀盤寬沒有預設值 (階段 30)，
-                                 # 照 mower_control.launch.py 一樣從 vehicle.yaml 傳
-                                 '-p', 'footprint_length:=%r' % VEHICLE['footprint_length'],
-                                 '-p', 'footprint_width:=%r' % VEHICLE['footprint_width'],
-                                 '-p', 'blade_width:=%r' % VEHICLE['blade_width']])
+                                 # 淨空門檻與刀盤寬沒有預設值 (階段 30 / 38)，
+                                 # 照 mower_control.launch.py 一樣從 vehicle_geometry 傳
+                                 ] + _manager_geometry_args())
         self.teleop = bg_start('D_mower_teleop',
                                ['ros2', 'run', 'mowerbot_bridge', 'teleop_node',
                                 '--ros-args', '--params-file', yaml,
@@ -1460,8 +1598,8 @@ def strip_perimeter(pts):
     return 0, list(pts)
 
 
-# 與 mower_manager.GAP_CUT_DISTANCE 一致：相鄰航點超過這個距離視為跳接。
-GAP_CUT_DISTANCE = 0.3
+# 相鄰航點超過這個距離視為跳接。階段 38 起直接讀 mower_manager 的常數 (單一來源)。
+GAP_CUT_DISTANCE = _MowerManager.GAP_CUT_DISTANCE
 
 
 def split_swaths_like_manager(pts):
@@ -1700,6 +1838,33 @@ class NavRig(object):
         self.odom.append((time.time(),
                           msg.pose.pose.position.x,
                           msg.pose.pose.position.y))
+        q = msg.pose.pose.orientation
+        self.yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+
+    def send_align(self, x, y, yaw, goal_checker_id, timeout=30.0):
+        """送一個對正 goal (AlignController，原地轉到 yaw)，等結果。回傳 (status, 結果當下的 odom)"""
+        import rclpy
+        from nav_msgs.msg import Path
+        from geometry_msgs.msg import PoseStamped
+        if not self.ac.wait_for_server(timeout_sec=15.0):
+            return None, None
+        p = PoseStamped(); p.header.frame_id = 'odom'
+        p.pose.position.x, p.pose.position.y = x, y
+        p.pose.orientation.z, p.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+        path = Path(); path.header.frame_id = 'odom'; path.poses = [p]
+        goal = self.FollowPath.Goal()
+        goal.path = path
+        goal.controller_id = 'AlignController'
+        goal.goal_checker_id = goal_checker_id
+        fut = self.ac.send_goal_async(goal)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        gh = fut.result() if fut.done() else None
+        if gh is None or not gh.accepted:
+            return 'REJECTED', None
+        rf = gh.get_result_async()
+        rclpy.spin_until_future_complete(self.node, rf, timeout_sec=timeout)
+        st = rf.result().status if rf.done() and rf.result() else None
+        return st, (self.odom[-1], self.yaw)
 
     def spin(self, seconds):
         import rclpy
@@ -1852,14 +2017,97 @@ def classify_world_models(models, touch_tol=0.05):
     inner = [models[i] for i in range(len(models)) if i not in wall]
     return inner, walls
 
-# N2 的測試邊界：5m x 5m，中心 (-1.5, -1.5)。
+# N7 / N8 (階段 38 決定 1)：對正控制器。直接對 AlignController 送一個「原地轉 171°」的 goal
+# (171° = 階段 32 每段開始時的航向差中位數)，用 mode 3 讓 manager 轉發 /cmd_vel_nav。
+#   N7  結果當下的朝向誤差 <= align_goal_checker.yaw_goal_tolerance
+#   N8  對正期間後輪軸的平移 <= align_goal_checker 的 xy 容忍 (= approach_goal_checker 的)
+# 對照組 (植入違規)：同一個 goal 改用 approach_goal_checker (yaw 容忍 3.15 = 不檢查朝向)。
+#   它必須「送出當下就成功、誤差遠大於容忍值」—— 也就是 N7 的檢查要能抓到它；抓不到就是測試本身失效。
+# 容忍值一律讀 nav2_params.yaml (單一來源)。
+N_ALIGN_TURN_DEG = 171.0
+
+
+def _nav2_cs():
+    import yaml
+    from ament_index_python.packages import get_package_share_directory
+    with open(os.path.join(get_package_share_directory('mowerbot_bringup'), 'config',
+                           'nav2_params.yaml')) as fh:
+        return yaml.safe_load(fh)['controller_server']['ros__parameters']
+
+
+def n_align_checks(rig):
+    hdr('N7 / N8  對正控制器：原地轉 %.0f°，結束時的朝向誤差與平移' % N_ALIGN_TURN_DEG)
+    cs = _nav2_cs()
+    yaw_tol = float(cs['align_goal_checker']['yaw_goal_tolerance'])
+    xy_tol = float(cs['approach_goal_checker']['xy_goal_tolerance'])
+    rig.wait_odom(20.0)
+    rig.spin(1.0)
+
+    def wrap(a):
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def one(checker):
+        (_t, x0, y0), th0 = rig.odom[-1], rig.yaw
+        target = wrap(th0 + math.radians(N_ALIGN_TURN_DEG))
+        t0 = time.time()
+        st, end = rig.send_align(x0, y0, target, checker)
+        dt = time.time() - t0
+        if end is None:
+            return st, dt, None, None
+        (_t1, x1, y1), th1 = end
+        move = max([math.hypot(o[1] - x0, o[2] - y0) for o in rig.odom if o[0] >= t0] or [0.0])
+        return st, dt, abs(wrap(th1 - target)), move
+
+    rig.set_mode(3)            # mode 3：manager 轉發 /cmd_vel_nav，但不規劃任務
+    rig.spin(1.0)
+    c_st, c_dt, c_err, c_move = one('approach_goal_checker')      # 對照組 (植入違規)
+    sub('對照組 (approach_goal_checker, yaw 容忍 3.15)：status=%s，%.2f s，結果當下誤差 %s rad'
+        % (c_st, c_dt, ('%.3f' % c_err) if c_err is not None else 'n/a'))
+    rig.spin(1.0)
+    st, dt, err, move = one('align_goal_checker')
+    sub('對正 (align_goal_checker, yaw 容忍 %.2f)：status=%s，%.2f s，結果當下誤差 %s rad，平移 %s m'
+        % (yaw_tol, st, dt, ('%.3f' % err) if err is not None else 'n/a',
+           ('%.3f' % move) if move is not None else 'n/a'))
+    rig.spin(1.5)
+    rig.set_mode(2)
+    rig.spin(1.0)
+    control_caught = c_err is not None and c_err > yaw_tol
+    ok7 = (st == 4 and err is not None and err <= yaw_tol and control_caught)   # 4 = SUCCEEDED
+    record('N', 'N7', '對正結束時朝向誤差 <= align 容忍 %.2f rad；容忍 3.15 的對照組會被抓到' % yaw_tol,
+           'PASS' if ok7 else 'FAIL',
+           'status=%s 誤差=%s rad (%.2f s)；對照組誤差=%s rad (%s)'
+           % (st, ('%.3f' % err) if err is not None else 'n/a', dt,
+              ('%.3f' % c_err) if c_err is not None else 'n/a',
+              '抓到' if control_caught else '沒抓到 -> 檢查失效'))
+    ok8 = st == 4 and move is not None and move <= xy_tol
+    record('N', 'N8', '對正期間後輪軸平移 <= xy 容忍 %.2f m (真的沒有前進)' % xy_tol,
+           'PASS' if ok8 else 'FAIL',
+           'status=%s 平移=%s m' % (st, ('%.3f' % move) if move is not None else 'n/a'))
+
+
+# N2 的測試邊界：5m x 5m，中心 (-1.2, -1.2)。
 # 這是掃過 mow_field.world 之後挑的——它包含車子起始位置 (0, 0)，
-# 而且離每一個障礙物與牆面都超過 1.5 m (實際最小 2.05 m)。
+# 而且離每一個障礙物與牆面都超過 1.5 m (實際最小 1.81 m)。
 # 障礙物情境要另外單獨測，而且正解是讓 F2C 把障礙物當成 Cell 的內環(hole)
 # 排除掉，讓路徑根本不經過，不是靠 costmap 硬閃。
-TEST_BOUNDARY_CENTER = (-1.5, -1.5)
+#
+# 【階段 38：中心 (-1.5, -1.5) -> (-1.2, -1.2)，大小不變】
+# manager 的 start_pose_blocked() 要求起始位置離邊界 >= rotation_swept_radius
+# (階段 38 為 1.0616 m，以前 0.5841)。舊中心下起點 (0, 0) 離東、北邊只有 1.00 m，
+# 任務會在開始前就被拒絕 —— 不是產品錯，是夾具依賴了產品參數。
+# 改成往東北挪 0.3 m：起點淨空 1.30 m，障礙物淨空 2.05 -> 1.81 m (仍 >= 1.5)。
+# 不放大邊界：面積不變，N3 的割草線數只受 headland 影響，不再多一個變數。
+# 依賴關係由 n_start_clearance_need() 在 N3 開始前斷言，不成立記為 FIXTURE。
+TEST_BOUNDARY_CENTER = (-1.2, -1.2)
 TEST_BOUNDARY_HALF = 2.5
 MIN_OBSTACLE_CLEARANCE = 1.5
+# 起點淨空的夾具餘裕：與 Phase O 的 O_FIXTURE_MARGIN 同一個理由 (costmap 2 格 + 0.10 循跡 / spawn 偏差)
+N_START_MARGIN = 0.20
+
+
+def n_start_clearance_need():
+    """N3 起點 (車子當下位置) 離測試邊界至少要多遠：rotation_swept_radius + N_START_MARGIN"""
+    return VEHICLE_ROT_SWEPT + N_START_MARGIN
 
 
 def _rot_box_corners(cx, cy, sx, sy, yaw):
@@ -2061,6 +2309,7 @@ def phase_n():
 
     rig = NavRig()
     try:
+        n_align_checks(rig)
         # ---- N2 真實 F2C 路徑 ----
         hdr('N2  取得真實的 F2C 覆蓋路徑 (驗證航點內插)')
         cur = rig.wait_odom(20.0)
@@ -2188,6 +2437,20 @@ def phase_n():
 
         # ---- N3 端到端覆蓋任務 ----
         hdr('N3  端到端覆蓋任務 (manager 逐條割草線循序執行)')
+        # 夾具前提 (階段 38)：起點離邊界 >= rotation_swept_radius + 餘裕，否則 manager 會
+        # 在開始前拒絕任務 (start_pose_blocked)，N3 測到的就不是它宣稱的東西。
+        n_clear = min(x0 - (bcx - half), (bcx + half) - x0, y0 - (bcy - half), (bcy + half) - y0)
+        n_need = n_start_clearance_need()
+        sub('夾具前提：起點 (%.2f, %.2f) 離測試邊界 %.3f m，要求 >= rotation_swept_radius %.4f + %.2f = %.4f m -> %s'
+            % (x0, y0, n_clear, VEHICLE_ROT_SWEPT, N_START_MARGIN, n_need,
+               'OK' if n_clear >= n_need else '不足'))
+        if n_clear < n_need:
+            why = ('起點離測試邊界 %.3f m < %.4f m，manager 會拒絕開始 (TEST_BOUNDARY_* 要調整)'
+                   % (n_clear, n_need))
+            record('N', 'N3', '所有割草線 SUCCEEDED 且完成數 == 總數', 'FIXTURE',
+                   '夾具失效 (不是產品失敗)：%s' % why)
+            skip_rest('N3 夾具失效', 'N4')
+            return
         sub('說明：manager 的 call_f2c_planner() 綁在 mode 1 (F2C)，mode 3（保留值）不會觸發規劃，')
         sub('      因此這裡用 mode 1 啟動任務；nav_vel_cb 在 mode 1 與 3 都會轉發速度。')
         sub('先對 /f2c_boundary 發布同一個 5m x 5m 邊界給 manager')
@@ -2495,8 +2758,8 @@ def phase_n():
 H_TICKS_PER_REV = 4096      # 測試用的假值（真值要查驅動板文件）
 # bridge_node 的輪半徑與輪距不再有預設值 (階段 30)，這裡照 bringup_real.launch.py
 # 一樣從 vehicle.yaml 傳進去。
-H_WHEEL_RADIUS = VEHICLE['wheel_radius']
-H_WHEEL_SEPARATION = VEHICLE['wheel_separation']
+H_WHEEL_RADIUS = GEOM.rear_wheel_radius
+H_WHEEL_SEPARATION = GEOM.wheel_separation
 
 
 class BridgeRig(object):
@@ -2581,7 +2844,9 @@ def phase_h():
                        '-p', 'wheel_radius:=%r' % H_WHEEL_RADIUS,
                        '-p', 'wheel_separation:=%r' % H_WHEEL_SEPARATION,
                        '-p', 'odom_rate:=30.0',
-                       '-p', 'cmd_vel_timeout:=0.5'])
+                       '-p', 'cmd_vel_timeout:=0.5',
+                       # 幾何閘門 (階段 38)：loopback 假驅動，等同模擬，放行暫定幾何
+                       '-p', 'allow_provisional:=true'])
     sub('啟動參數: driver_type=loopback, encoder_ticks_per_rev=%d, '
         'odom_rate=30, cmd_vel_timeout=0.5' % H_TICKS_PER_REV)
 
@@ -2727,6 +2992,666 @@ def phase_h():
 
 
 # --------------------------------------------------------------------------
+# 6.42 Phase R：硬體迴路測試（對著假 C30D，階段 36）
+#
+# 目標：真車第一次通電之前，軟體端該驗的都驗過。
+# 假 C30D (test/tools/fake_c30d.py) 在這個行程裡開一個執行緒，建立 pty，
+# 對 slave 端表現得像下位機：20 Hz 送上行封包、記錄每一個下行封包。
+# bridge_node 用 driver_type:=wheeltec、serial_port:=<pty> 接上去。
+#
+# 四段：
+#   R-1  整套 bringup_real.launch.py (max_vel_scale 預設 1.0)：R1 R2 R4 R8 R5 R6 R7
+#        指令走真實路徑 /cmd_vel_joy -> mower_manager (手動模式) -> /cmd_vel -> bridge
+#   R-2  整套 bringup_real.launch.py，max_vel_scale:=0.2：R10
+#   R-3  單獨 bridge_node：R3 (watchdog 要「沒有人發 /cmd_vel」，
+#        但 mower_manager 在手動模式閒置時會一直補零速度，整套系統裡 /cmd_vel 停不下來)
+#   R-4  單獨 bridge_node，read_only:=true：R9 (read_only 只是節點參數，launch 沒有開放)
+#
+# 它證明的是「我們的軟體照 drivers/README.md 那份協定講話，而且出錯時不會亂動」，
+# 不是「C30D 真的這樣回」—— 那份協定本身未經實機確認。
+# --------------------------------------------------------------------------
+R_TICKS_PER_REV = 4096      # wheeltec 驅動的等效 tick 解析度（沒有物理意義，見 wheeltec.py）
+# 單獨跑 bridge_node 時給的 watchdog 參數。R3 的判準由它們推導，不另外寫死 (階段 38)：
+#   bridge 的 watchdog 在 odom_rate 的 timer 裡檢查「距離上一筆 /cmd_vel 是否超過 cmd_vel_timeout」，
+#   所以最晚在 cmd_vel_timeout + 1 個檢查週期 (1 / odom_rate) 時送出零速度 —— 0.500 ~ 0.533 s。
+R_CMD_VEL_TIMEOUT = 0.5
+R_ODOM_RATE = 30.0
+R3_DEADLINE = R_CMD_VEL_TIMEOUT + 1.0 / R_ODOM_RATE
+
+
+def _r_fake_class():
+    tools = os.path.join(WS, 'test', 'tools')
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    from fake_c30d import FakeC30D
+    return FakeC30D
+
+
+class RRig(object):
+    """Phase R 的測試夾具：發速度指令、收 /odom、切換 manager 模式"""
+
+    def __init__(self, cmd_topic):
+        import rclpy
+        from rclpy.node import Node
+        from geometry_msgs.msg import Twist
+        from nav_msgs.msg import Odometry
+        from mowerbot_interfaces.srv import SetDriveMode
+
+        rclpy.init()
+        self.rclpy = rclpy
+        self.node = Node('smoke_r')
+        self.Twist = Twist
+        self.SetDriveMode = SetDriveMode
+        self.odom = []          # (t, x, y, theta, v, w)
+        self.cmd_pub = self.node.create_publisher(Twist, cmd_topic, 10)
+        self.mode_cli = self.node.create_client(SetDriveMode, '/change_mower_mode')
+
+        def on_odom(m):
+            q = m.pose.pose.orientation
+            theta = math.atan2(2.0 * (q.w * q.z), 1.0 - 2.0 * (q.z * q.z))
+            self.odom.append((time.time(), m.pose.pose.position.x,
+                              m.pose.pose.position.y, theta,
+                              m.twist.twist.linear.x, m.twist.twist.angular.z))
+
+        self.node.create_subscription(Odometry, '/odom', on_odom, 10)
+
+    def spin(self, seconds):
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            self.rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def publish(self, v, w):
+        msg = self.Twist()
+        msg.linear.x = float(v)
+        msg.angular.z = float(w)
+        self.cmd_pub.publish(msg)
+        return time.time()
+
+    def drive(self, v, w, seconds, rate=20.0, stop_after=True,
+              switch_at=None, switch_mode=None):
+        """持續以 rate 發布 (v, w) seconds 秒，回傳最後一次發布的時間。
+
+        switch_at 不是 None 時，在第 switch_at 秒非同步呼叫 change_mower_mode，
+        並且照常繼續發布（急停測試要的就是「指令一直來，還是要停」）。
+        模式切換的 (送出時間, 收到回應時間, success) 放在 self.last_switch。
+        """
+        t0 = time.time()
+        t_last = t0
+        future = None
+        t_sent = None
+        self.last_switch = (None, None, False)
+        period = 1.0 / rate
+        next_pub = t0
+        while time.time() - t0 < seconds:
+            now = time.time()
+            if now >= next_pub:
+                t_last = self.publish(v, w)
+                next_pub += period
+            if (switch_at is not None and future is None
+                    and now - t0 >= switch_at):
+                req = self.SetDriveMode.Request()
+                req.mode = int(switch_mode)
+                t_sent = time.time()
+                future = self.mode_cli.call_async(req)
+            self.rclpy.spin_once(self.node, timeout_sec=0.005)
+            if future is not None and future.done() and self.last_switch[1] is None:
+                res = future.result()
+                self.last_switch = (t_sent, time.time(),
+                                    bool(res is not None and res.success))
+        if stop_after:
+            self.publish(0.0, 0.0)
+            self.rclpy.spin_once(self.node, timeout_sec=0.05)
+        return t_last
+
+    def set_mode(self, mode, timeout=10.0):
+        req = self.SetDriveMode.Request()
+        req.mode = int(mode)
+        future = self.mode_cli.call_async(req)
+        t0 = time.time()
+        while time.time() - t0 < timeout and not future.done():
+            self.rclpy.spin_once(self.node, timeout_sec=0.05)
+        return future.done() and future.result() is not None and future.result().success
+
+    def odom_after(self, t):
+        return [o for o in self.odom if o[0] >= t]
+
+    def wait_odom(self, timeout):
+        t0 = time.time()
+        while time.time() - t0 < timeout and not self.odom:
+            self.spin(0.2)
+        return bool(self.odom)
+
+    def close(self):
+        self.node.destroy_node()
+        self.rclpy.shutdown()
+
+
+def _r_frames(fake, t0, t1=None):
+    """[t0, t1] 之間假裝置收到的「長度正確」的下行框"""
+    return [d for d in fake.downlink_since(t0, t1) if d.get('len_ok')]
+
+
+def _r_hist(frames):
+    h = {}
+    for d in frames:
+        k = (d['vx'], d['wz'])
+        h[k] = h.get(k, 0) + 1
+    return ', '.join('(vx=%d, wz=%d)x%d' % (k[0], k[1], n)
+                     for k, n in sorted(h.items(), key=lambda kv: -kv[1]))
+
+
+def _r_bridge_pids():
+    return [pid for pid, _c in workspace_pids(contains='lib/mowerbot_bridge/bridge_node')]
+
+
+RE_R_READFAIL = re.compile(r'\[WARN\] \[(\d+\.\d+)\] \[mower_bridge\]: ⚠️ 讀不到編碼器')
+
+
+def _r_readfail_times(bg):
+    out = []
+    for line in bg.log_grep(r'讀不到編碼器', 1000):
+        m = RE_R_READFAIL.search(line)
+        if m:
+            out.append(float(m.group(1)))
+    return out
+
+
+def _r_bridge_cmd(port, extra):
+    cmd = ['ros2', 'run', 'mowerbot_bridge', 'bridge_node', '--ros-args',
+           '-p', 'use_sim_time:=false',
+           '-p', 'driver_type:=wheeltec',
+           '-p', 'serial_port:=%s' % port,
+           '-p', 'encoder_ticks_per_rev:=%d' % R_TICKS_PER_REV,
+           '-p', 'wheel_radius:=%r' % GEOM.rear_wheel_radius,
+           '-p', 'wheel_separation:=%r' % GEOM.wheel_separation,
+           '-p', 'odom_rate:=%r' % R_ODOM_RATE,
+           '-p', 'cmd_vel_timeout:=%r' % R_CMD_VEL_TIMEOUT,
+           # 幾何閘門 (階段 38)：對著假 C30D，放行暫定幾何
+           '-p', 'allow_provisional:=true']
+    for e in extra:
+        cmd += ['-p', e]
+    return cmd
+
+
+def _r_estop_check(rig, fake, v, expect_before, label):
+    """持續發布 v，第 1 秒觸發急停 (mode 4)，再發 3 秒。回傳 (ok, detail)。
+
+    判定（三項都要成立）：
+      (a) 觸發後第一包零速度之後，下行沒有任何一包非零
+          【量測修正，階段 36】原本寫成「測試收到服務回應之後沒有非零」，
+          但那是拿假裝置的收包時間去比測試行程的收回應時間，跨行程有競態：
+          manager 在處理服務之前已經轉發出去的最後一筆指令，可能跟第一包零
+          在同一次 read 裡抵達假裝置、時間戳晚於回應（完整套件 R10 實測 1 包，
+          順序是 100 -> 0，之後全零）。改成看封包順序：零出現之後不可以再有非零。
+          「回應後非零幾包」仍然照印，當作趨勢數字。
+      (b) 觸發後 0.1 s 內出現第一包零速度（「立刻」）
+      (c) 回應之後到結束的 3 秒內零速度持續在送：相鄰兩包最大間隔 <= 0.1 s
+          （manager 急停時每 50 ms 送一次零，0.1 s = 兩個週期）
+    另外要求觸發前的下行是 expect_before（正向對照：不是本來就在送零）。
+    """
+    rig.drive(0.0, 0.0, 0.5)
+    t_start = time.time()
+    rig.drive(v, 0.0, 4.0, stop_after=False, switch_at=1.0, switch_mode=4)
+    t_end = time.time()
+    t_sent, t_resp, success = rig.last_switch
+    if t_sent is None or t_resp is None:
+        rig.set_mode(2)
+        return False, '%s：change_mower_mode(4) 沒有回應' % label
+    rig.spin(0.3)
+    before = _r_frames(fake, t_start + 0.3, t_sent)
+    before_ok = bool(before) and all(d['vx'] == expect_before for d in before)
+    after_resp = _r_frames(fake, t_resp, t_end)
+    nonzero_after = [d for d in after_resp if d['vx'] != 0 or d['wz'] != 0]
+    since = _r_frames(fake, t_sent, t_end)
+    zi = [i for i, d in enumerate(since) if d['vx'] == 0 and d['wz'] == 0]
+    zeros = [since[i] for i in zi]
+    first_zero = (zeros[0]['t'] - t_sent) if zeros else float('inf')
+    nonzero_after_zero = ([d for d in since[zi[0]:] if d['vx'] != 0 or d['wz'] != 0]
+                          if zi else [])
+    # 零速度的「空窗」：回應 -> 第一包、相鄰兩包、最後一包 -> 結束，取最大
+    zt = [t_resp] + [d['t'] for d in zeros if d['t'] >= t_resp] + [t_end]
+    max_gap = max(b - a for a, b in zip(zt, zt[1:]))
+    sub('%s 觸發前下行: %s' % (label, _r_hist(before)))
+    sub('%s 服務 success=%s，送出到回應 %.3f s' % (label, success, t_resp - t_sent))
+    sub('%s 第一包零速度在觸發後 %.3f s' % (label, first_zero))
+    sub('%s 回應後 %.1f s 內下行 %d 包，其中非零 %d 包（趨勢數字，不是判定）；'
+        '零速度相鄰最大間隔 %.3f s'
+        % (label, t_end - t_resp, len(after_resp), len(nonzero_after), max_gap))
+    if nonzero_after:
+        sub('%s 回應後的非零包: %s（與第一包零的收包時間差 %s s）'
+            % (label, _r_hist(nonzero_after),
+               ', '.join('%+.4f' % (d['t'] - zeros[0]['t']) for d in nonzero_after)
+               if zeros else '-'))
+    sub('%s 第一包零之後的非零包 = %d（判定用）' % (label, len(nonzero_after_zero)))
+    ok = (success and before_ok and not nonzero_after_zero
+          and first_zero <= 0.1 and max_gap <= 0.1)
+    detail = ('觸發前=%s, 零之後非零 %d 包 (回應後非零 %d), 第一包零 %.3fs, '
+              '零速度最大間隔 %.3fs'
+              % ('%d' % expect_before if before_ok else '不符', len(nonzero_after_zero),
+                 len(nonzero_after), first_zero, max_gap))
+    if not rig.set_mode(2):
+        sub('%s ⚠️ 切回手動模式 (2) 失敗' % label)
+    rig.spin(0.5)
+    return ok, detail
+
+
+def _r_wait_system(rig, timeout=40.0):
+    """等 bridge 開始發 /odom、manager 的模式服務上線"""
+    got = rig.wait_odom(timeout)
+    svc = rig.mode_cli.wait_for_service(timeout_sec=20.0)
+    return got, svc
+
+
+def _r_launch(fake, extra_args):
+    cmd = ['ros2', 'launch', 'mowerbot_bringup', 'bringup_real.launch.py',
+           'driver_type:=wheeltec',
+           'encoder_ticks_per_rev:=%d' % R_TICKS_PER_REV,
+           'serial_port:=%s' % fake.port,
+           # 幾何閘門 (階段 38)：實車 launch 預設 false；這裡是假 C30D，放行暫定幾何
+           'allow_provisional:=true'] + list(extra_args)
+    return cmd
+
+
+def _r_session1(FakeC30D):
+    """整套 bringup_real，max_vel_scale 預設：R1 R2 R4 R8 R5 R6 R7"""
+    names = [('R1', '下行封包格式'), ('R2', 'vx=0.5 -> 500 mm/s'),
+             ('R4', '急停'), ('R8', '/odom 數值'),
+             ('R5', 'silent 偵測'), ('R6', 'corrupt 丟棄'), ('R7', 'garbage 不崩潰')]
+    fake = FakeC30D().start()
+    sub('假 C30D pty = %s' % fake.port)
+    launch = bg_start('R1_bringup_real', _r_launch(fake, []))
+    rig = None
+    try:
+        rig = RRig('/cmd_vel_joy')
+        got, svc = _r_wait_system(rig)
+        stop_joy_node()
+        bridge_ok = bool(_r_bridge_pids())
+        sub('bridge_node 行程存活=%s, /odom 有收到=%s, change_mower_mode 服務=%s'
+            % (bridge_ok, got, svc))
+        if not (got and svc and bridge_ok):
+            print(launch.log_tail(40))
+            for cid, name in names:
+                record('R', cid, name, 'SKIP',
+                       '系統沒起來 (/odom=%s, 服務=%s, bridge=%s)' % (got, svc, bridge_ok))
+            return
+        rig.spin(1.0)
+
+        # ---- R1 / R2：指令段 --------------------------------------------
+        hdr('R1/R2  經 /cmd_vel_joy -> mower_manager -> /cmd_vel -> bridge -> 序列埠')
+        segs = [(0.5, 0.0), (0.3, -0.5), (-0.2, 0.25)]
+        seg_frames = []
+        for v, w in segs:
+            rig.drive(0.0, 0.0, 0.5)
+            t0 = time.time()
+            rig.drive(v, w, 2.0)
+            seg_frames.append((v, w, _r_frames(fake, t0 + 0.3, t0 + 2.0)))
+        rig.spin(0.3)
+
+        # ---- R1 格式 ----
+        hdr('R1  下行封包格式：框頭/框尾、XOR、旗標、位元組順序、單位')
+        allrecs = fake.downlink_since(0.0)
+        bad_len = [d for d in allrecs if not d.get('len_ok')]
+        frames = [d for d in allrecs if d.get('len_ok')]
+        bad = [d for d in frames if not (d['head_ok'] and d['tail_ok'] and d['bcc_ok']
+                                         and d['flag'] == 0 and d['reserved'] == 0
+                                         and d['vy'] == 0)]
+        sub('到目前為止收到下行 %d 包；框/XOR/旗標/保留位元/vy 有問題 %d 包；'
+            '不成框的雜訊 %d 段' % (len(frames), len(bad), len(bad_len)))
+        for d in (bad + bad_len)[:5]:
+            sub('  問題封包: %s' % d)
+        enc_ok = True
+        for v, w, fr in seg_frames:
+            ev, ew = int(round(v * 1000)), int(round(w * 1000))
+            exp_raw = struct.pack('>hh', ev, ew)
+            raws = set(d['raw'] for d in fr)
+            match = bool(fr) and all(
+                bytes.fromhex(d['raw'])[3:5] == exp_raw[0:2]
+                and bytes.fromhex(d['raw'])[7:9] == exp_raw[2:4] for d in fr)
+            enc_ok = enc_ok and match
+            sub('指令 v=%+.2f m/s w=%+.2f rad/s -> 預期 vx=%d (%s) wz=%d (%s)；'
+                '穩態 %d 包，原始位元組 %s -> %s'
+                % (v, w, ev, exp_raw[0:2].hex(), ew, exp_raw[2:4].hex(), len(fr),
+                   sorted(raws)[:3], '符合' if match else '不符'))
+        r1_ok = bool(frames) and not bad and not bad_len and enc_ok
+        record('R', 'R1', '下行封包格式正確（XOR、大端、mm/s 與 mrad/s）',
+               'PASS' if r1_ok else 'FAIL',
+               '下行 %d 包，格式錯 %d、雜訊 %d，三段指令編碼%s'
+               % (len(frames), len(bad), len(bad_len), '全部符合' if enc_ok else '有不符'))
+
+        # ---- R2 ----
+        hdr('R2  送 vx=0.5 m/s，假裝置收到 500 (mm/s)')
+        fr = seg_frames[0][2]
+        sub('穩態窗口 (開始後 0.3 ~ 2.0 s) 收到 %d 包：%s' % (len(fr), _r_hist(fr)))
+        r2_ok = len(fr) >= 10 and all(d['vx'] == 500 and d['wz'] == 0 for d in fr)
+        record('R', 'R2', 'vx=0.5 m/s -> 下行 vx=500',
+               'PASS' if r2_ok else 'FAIL',
+               '%d 包: %s' % (len(fr), _r_hist(fr)))
+
+        # ---- R4 急停 ----
+        hdr('R4  急停：觸發後下行立刻變零，且持續送零（指令照發不停）')
+        r4_ok, r4_detail = _r_estop_check(rig, fake, 0.5, 500, '[R4]')
+        record('R', 'R4', '急停後下行立刻變零且持續送零',
+               'PASS' if r4_ok else 'FAIL', r4_detail)
+
+        # ---- R8 /odom 數值 ----
+        hdr('R8  /odom 數值：餵入已知速度封包，積分出的位置與朝向')
+        sub('vehicle.yaml: rear_wheel_radius=%.3f, wheel_separation=%.3f（bridge 與驅動都用這組）'
+            % (GEOM.rear_wheel_radius, GEOM.wheel_separation))
+        # manager 閒置時會送零，假裝置改成回報固定值，不看下行
+        script = [(400, 0, 2.0), (0, 500, 3.0), (400, 0, 2.0)]
+        fake.set_reported_velocity(0, 0)
+        rig.spin(0.6)
+        start = rig.odom[-1]
+        t_begin = time.time()
+        for vx, wz, dur in script:
+            fake.set_reported_velocity(vx, wz)
+            rig.spin(dur)
+        fake.set_reported_velocity(0, 0)
+        rig.spin(0.6)
+        end = rig.odom[-1]
+        # 預期值用假裝置自己記錄的送出時間算：每一段的長度 =
+        # 「這一段最後一包」減「上一段最後一包」（驅動積分每一包時用的就是這個區間）
+        ups = fake.uplink_since(t_begin - 1.0)
+        x, y, th = start[1], start[2], start[3]
+        prev_t = None
+        seg_log = []
+        for (t, _m, vx, wz) in ups:
+            if prev_t is not None and t > t_begin - 0.2:
+                dt = t - prev_t
+                v = vx / 1000.0
+                w = wz / 1000.0
+                mid = th + 0.5 * w * dt
+                x += v * dt * math.cos(mid)
+                y += v * dt * math.sin(mid)
+                th += w * dt
+            prev_t = t
+        for vx, wz, dur in script:
+            n = sum(1 for u in ups if u[2] == vx and u[3] == wz and u[0] > t_begin)
+            seg_log.append('(vx=%d, wz=%d) %d 包' % (vx, wz, n))
+        dpos = math.hypot(end[1] - x, end[2] - y)
+        dth = abs(math.atan2(math.sin(end[3] - th), math.cos(end[3] - th)))
+        path = sum(abs(vx) / 1000.0 * dur for vx, wz, dur in script)
+        rot = sum(abs(wz) / 1000.0 * dur for vx, wz, dur in script)
+        sub('腳本: 直行 0.4 m/s 2 s -> 左轉 0.5 rad/s 3 s -> 直行 0.4 m/s 2 s'
+            '（路徑 %.2f m、轉 %.2f rad）' % (path, rot))
+        sub('假裝置實際送出: %s' % ', '.join(seg_log))
+        sub('起點 /odom (%.4f, %.4f, %.4f rad)' % (start[1], start[2], start[3]))
+        sub('預期終點 (%.4f, %.4f, %.4f rad)' % (x, y, th))
+        sub('實際終點 (%.4f, %.4f, %.4f rad)' % (end[1], end[2], end[3]))
+        sub('位置誤差 %.4f m、朝向誤差 %.4f rad (%.2f 度)'
+            % (dpos, dth, math.degrees(dth)))
+        # 容許值：驅動以 30 Hz 批次讀取，每個速度轉換點最多差一個讀取週期
+        # (0.033 s)；4 個轉換點 x 0.4 m/s x 0.033 s ≈ 0.05 m、2 個 x 0.5 rad/s x 0.033 s
+        # ≈ 0.03 rad。0.05 m / 0.05 rad 約是路徑與轉角的 3%，輪半徑或輪距用錯
+        # (差 10% 以上) 一定抓得到。
+        r8_ok = dpos <= 0.05 and dth <= 0.05
+        record('R', 'R8', '/odom 積分位置與朝向（容許 0.05 m / 0.05 rad）',
+               'PASS' if r8_ok else 'FAIL',
+               '位置誤差 %.4fm, 朝向誤差 %.4frad' % (dpos, dth))
+
+        # ---- R5 / R6 / R7：真實世界會發生、模擬不會的事 ----
+        def fault_window(mode, report_v, seconds):
+            """先 normal 1.5 s（正向對照：/odom 要會動），再切到 mode seconds 秒"""
+            fake.set_mode('normal')
+            fake.set_reported_velocity(report_v, 0)
+            rig.spin(0.3)
+            c0 = rig.odom[-1]
+            rig.spin(1.5)
+            c1 = rig.odom[-1]
+            control = math.hypot(c1[1] - c0[1], c1[2] - c0[2])
+            fails_before = len(_r_readfail_times(launch))
+            ups_before = len(fake.uplink_since(0.0))
+            t_f = time.time()
+            fake.set_mode(mode)
+            rig.spin(seconds)
+            t_e = time.time()
+            win = [o for o in rig.odom if t_f + 0.3 <= o[0] <= t_e]
+            sent = len(fake.uplink_since(t_f)) if mode != 'silent' else 0
+            fake.set_mode('normal')
+            fake.set_reported_velocity(None)
+            fail_times = _r_readfail_times(launch)
+            new_fail = [t for t in fail_times[fails_before:] if t >= t_f - 0.1]
+            return {
+                'control': control, 't_f': t_f, 'win': win, 'sent': sent,
+                'new_fail': new_fail,
+                'detect': (new_fail[0] - t_f) if new_fail else float('inf'),
+                'alive': bool(_r_bridge_pids()),
+                'ups_before': ups_before,
+            }
+
+        def win_stats(win):
+            if len(win) < 2:
+                return float('inf'), float('inf'), float('inf'), False
+            moved = math.hypot(win[-1][1] - win[0][1], win[-1][2] - win[0][2])
+            turned = abs(win[-1][3] - win[0][3])
+            vmax = max(max(abs(o[4]), abs(o[5])) for o in win)
+            finite = all(all(math.isfinite(v) for v in o[1:]) for o in win)
+            return moved, turned, vmax, finite
+
+        hdr('R5  假裝置 silent（線鬆了）：要偵測並回報，不可以當作正常')
+        f5 = fault_window('silent', 300, 3.0)
+        moved, turned, vmax, finite = win_stats(f5['win'])
+        sub('正向對照：切換前 normal 1.5 s（回報 0.3 m/s）/odom 移動 %.3f m' % f5['control'])
+        sub('silent 3 s：bridge 行程存活=%s；/odom 仍在發布 %d 筆（窗口 0.3 s 之後）'
+            % (f5['alive'], len(f5['win'])))
+        sub('  bridge 回報「讀不到編碼器」%d 則，第一則在切換後 %.3f s'
+            % (len(f5['new_fail']), f5['detect']))
+        sub('  窗口內位置變化 %.5f m、朝向變化 %.5f rad、|v|,|w| 最大 %.4f（不外插 = 全部 0）'
+            % (moved, turned, vmax))
+        sub('  ⚠️ 這段期間 /odom 仍以 30 Hz 發布（位姿凍結、速度 0），訊息本身沒有標記失效')
+        r5_ok = (f5['control'] > 0.2 and f5['alive'] and f5['new_fail']
+                 and f5['detect'] <= 1.0 and moved < 0.005 and turned < 0.005
+                 and vmax < 1e-6)
+        record('R', 'R5', 'silent：1 s 內偵測並回報，位姿不外插',
+               'PASS' if r5_ok else 'FAIL',
+               '對照移動 %.3fm, 回報 %d 則 (%.3fs), 窗口移動 %.5fm, 存活=%s'
+               % (f5['control'], len(f5['new_fail']), f5['detect'], moved, f5['alive']))
+
+        hdr('R6  假裝置 corrupt（XOR 錯誤）：封包要被丟棄，不可以拿來更新 /odom')
+        f6 = fault_window('corrupt', 500, 3.0)
+        moved, turned, vmax, finite = win_stats(f6['win'])
+        sub('正向對照：切換前 normal 1.5 s（回報 0.5 m/s）/odom 移動 %.3f m' % f6['control'])
+        sub('corrupt 3 s：假裝置送出 %d 包內容 = 0.5 m/s、XOR 錯誤的封包' % f6['sent'])
+        sub('  窗口內位置變化 %.5f m、朝向變化 %.5f rad、|v|,|w| 最大 %.4f'
+            % (moved, turned, vmax))
+        sub('  bridge 回報「讀不到編碼器」%d 則（第一則在切換後 %.3f s）；行程存活=%s'
+            % (len(f6['new_fail']), f6['detect'], f6['alive']))
+        r6_ok = (f6['control'] > 0.3 and f6['sent'] >= 40 and f6['alive']
+                 and moved < 0.005 and turned < 0.005 and vmax < 1e-6)
+        record('R', 'R6', 'corrupt：XOR 錯誤的封包不更新 /odom',
+               'PASS' if r6_ok else 'FAIL',
+               '對照移動 %.3fm, 壞包 %d 包, 窗口移動 %.5fm, 存活=%s'
+               % (f6['control'], f6['sent'], moved, f6['alive']))
+
+        hdr('R7  假裝置 garbage（隨機位元組）：不可以崩潰，不可以解析出荒謬的 /odom')
+        f7 = fault_window('garbage', 300, 5.0)
+        moved, turned, vmax, finite = win_stats(f7['win'])
+        sub('正向對照：切換前 normal 1.5 s /odom 移動 %.3f m' % f7['control'])
+        sub('garbage 5 s：假裝置送出 %d 段 x 24 bytes 隨機資料（固定種子）' % f7['sent'])
+        sub('  bridge 行程存活=%s；/odom 仍在發布 %d 筆；數值全部有限=%s'
+            % (f7['alive'], len(f7['win']), finite))
+        sub('  窗口內位置變化 %.5f m、朝向變化 %.5f rad、|v|,|w| 最大 %.4f'
+            % (moved, turned, vmax))
+        rig.spin(1.5)
+        rec = rig.odom[-1]
+        sub('  切回 normal 1.5 s 後 /odom 仍在更新 (最後一筆 %.2f s 前)'
+            % (time.time() - rec[0]))
+        r7_ok = (f7['control'] > 0.2 and f7['alive'] and len(f7['win']) > 50
+                 and finite and moved < 0.005 and turned < 0.005 and vmax < 1e-6)
+        record('R', 'R7', 'garbage：不崩潰、/odom 不出現荒謬值',
+               'PASS' if r7_ok else 'FAIL',
+               '存活=%s, /odom %d 筆, 有限=%s, 窗口移動 %.5fm, |v|max %.4f'
+               % (f7['alive'], len(f7['win']), finite, moved, vmax))
+    finally:
+        if rig is not None:
+            rig.close()
+        launch.stop()
+        n = fake.write_csv(os.path.join(LOGDIR, 'R1_downlink.csv'))
+        sub('下行封包 %d 筆 -> %s' % (n, os.path.join(LOGDIR, 'R1_downlink.csv')))
+        fake.stop()
+
+
+def _r_session2(FakeC30D):
+    """整套 bringup_real，max_vel_scale:=0.2：R10"""
+    fake = FakeC30D().start()
+    sub('假 C30D pty = %s' % fake.port)
+    launch = bg_start('R2_bringup_real_scale', _r_launch(fake, ['max_vel_scale:=0.2']))
+    rig = None
+    try:
+        rig = RRig('/cmd_vel_joy')
+        got, svc = _r_wait_system(rig)
+        stop_joy_node()
+        if not (got and svc):
+            print(launch.log_tail(40))
+            record('R', 'R10', 'max_vel_scale=0.2', 'SKIP',
+                   '系統沒起來 (/odom=%s, 服務=%s)' % (got, svc))
+            return
+        rig.spin(1.0)
+        hdr('R10  bringup_real max_vel_scale:=0.2：縮放正確，急停仍是零')
+        log_line = launch.log_grep(r'max_vel_scale = ', 1)
+        sub('bridge 啟動 log: %s' % (log_line[-1].strip() if log_line else '(沒有)'))
+        results = []
+        for v, w in [(0.5, 0.5), (-0.5, 0.0), (0.35, -1.0)]:
+            rig.drive(0.0, 0.0, 0.5)
+            t0 = time.time()
+            rig.drive(v, w, 2.0)
+            fr = _r_frames(fake, t0 + 0.3, t0 + 2.0)
+            ev, ew = int(round(v * 0.2 * 1000)), int(round(w * 0.2 * 1000))
+            ok = len(fr) >= 10 and all(d['vx'] == ev and d['wz'] == ew for d in fr)
+            results.append(ok)
+            sub('指令 v=%+.2f w=%+.2f -> 預期 vx=%d wz=%d；收到 %d 包：%s -> %s'
+                % (v, w, ev, ew, len(fr), _r_hist(fr), '符合' if ok else '不符'))
+        e_ok, e_detail = _r_estop_check(rig, fake, 0.5, 100, '[R10 急停]')
+        ok = all(results) and e_ok and bool(log_line) and '0.200' in log_line[-1]
+        record('R', 'R10', 'max_vel_scale=0.2：下行等比例縮小、急停仍是零',
+               'PASS' if ok else 'FAIL',
+               '縮放三段 %s；急停: %s'
+               % ('全部符合' if all(results) else '有不符', e_detail))
+    finally:
+        if rig is not None:
+            rig.close()
+        launch.stop()
+        fake.write_csv(os.path.join(LOGDIR, 'R2_downlink.csv'))
+        fake.stop()
+
+
+def _r_session3(FakeC30D):
+    """單獨 bridge_node：R3。回傳假裝置收到的位元組數（給 R9 當正向對照）"""
+    fake = FakeC30D().start()
+    sub('假 C30D pty = %s' % fake.port)
+    bridge = bg_start('R3_bridge_node', _r_bridge_cmd(fake.port, []))
+    rig = None
+    try:
+        rig = RRig('/cmd_vel')
+        if not rig.wait_odom(20.0):
+            print(bridge.log_tail(30))
+            record('R', 'R3', 'watchdog', 'SKIP', 'bridge_node 沒有發布 /odom')
+            return fake.rx_bytes
+        rig.spin(1.0)
+        hdr('R3  watchdog：停止發布 /cmd_vel 後 cmd_vel_timeout + 1 個檢查週期內，下行變成零')
+        sub('（單獨跑 bridge_node：整套系統裡 manager 閒置時會一直補零，/cmd_vel 停不下來）')
+        t0 = time.time()
+        t_last = rig.drive(0.3, 0.0, 1.5, stop_after=False)
+        rig.spin(1.5)
+        before = _r_frames(fake, t0 + 0.3, t_last)
+        after = _r_frames(fake, t_last + 1e-6)
+        zeros = [d for d in after if d['vx'] == 0 and d['wz'] == 0]
+        first_zero = (zeros[0]['t'] - t_last) if zeros else float('inf')
+        nonzero_late = [d for d in after if zeros and d['t'] > zeros[0]['t']
+                        and (d['vx'] != 0 or d['wz'] != 0)]
+        sub('停止前下行: %s' % _r_hist(before))
+        sub('最後一次發布之後收到 %d 包：%s' % (len(after), _r_hist(after)))
+        # 判準 (階段 38 修正)：以前寫死 0.5 s，但 watchdog 是以 odom_rate 的週期檢查的，
+        # 0.5 s 剛好過期時要等下一個 timer tick 才會送零 —— 合法的最晚時間是 0.5 + 1/30 = 0.533 s。
+        # 階段 36 起實測一直是 0.51 ~ 0.53 s，寫死 0.5 會把正常行為判成失敗。
+        sub('第一包零速度在最後一次發布後 %.3f s（判準 <= cmd_vel_timeout %.3f + 1/odom_rate %.3f = %.3f s）'
+            % (first_zero, R_CMD_VEL_TIMEOUT, 1.0 / R_ODOM_RATE, R3_DEADLINE))
+        r3_ok = (bool(before) and all(d['vx'] == 300 for d in before)
+                 and first_zero <= R3_DEADLINE and not nonzero_late)
+        record('R', 'R3', 'watchdog：停止發布 /cmd_vel 後 %.3f s (timeout + 1 個檢查週期) 內下行變零'
+               % R3_DEADLINE,
+               'PASS' if r3_ok else 'FAIL',
+               '第一包零在 %.3fs, 之後非零 %d 包' % (first_zero, len(nonzero_late)))
+        return fake.rx_bytes
+    finally:
+        if rig is not None:
+            rig.close()
+        bridge.stop()
+        fake.write_csv(os.path.join(LOGDIR, 'R3_downlink.csv'))
+        fake.stop()
+
+
+def _r_session4(FakeC30D, control_bytes):
+    """單獨 bridge_node，read_only:=true：R9"""
+    fake = FakeC30D().start()
+    fake.set_reported_velocity(200, 0)
+    sub('假 C30D pty = %s（回報固定 vx=200 mm/s，驗證上行照常解析）' % fake.port)
+    bridge = bg_start('R4_bridge_node_readonly',
+                      _r_bridge_cmd(fake.port, ['read_only:=true']))
+    rig = None
+    moved = float('nan')
+    got = False
+    try:
+        hdr('R9  read_only：一個位元組都不送，只解析上行、發布 /odom')
+        rig = RRig('/cmd_vel')
+        got = rig.wait_odom(20.0)
+        if got:
+            rig.spin(0.5)
+            o0 = rig.odom[-1]
+            rig.drive(0.5, 0.3, 2.0, stop_after=False)   # 照發速度指令
+            rig.spin(1.0)                               # 讓 watchdog 時間過去
+            o1 = rig.odom[-1]
+            moved = math.hypot(o1[1] - o0[1], o1[2] - o0[2])
+    finally:
+        if rig is not None:
+            rig.close()
+        bridge.stop()        # SIGINT -> destroy_node：一般模式這裡會送一包 stop
+        time.sleep(0.5)
+    rx = fake.rx_bytes
+    n_down = len(fake.downlink)
+    fake.write_csv(os.path.join(LOGDIR, 'R4_downlink.csv'))
+    fake.stop()
+    log_line = bridge.log_grep(r'唯讀模式：不會送出任何馬達指令', 1)
+    sub('啟動 log: %s' % (log_line[-1].strip() if log_line else '(沒有)'))
+    sub('/odom 有收到=%s；3 s 內（回報 0.2 m/s）/odom 移動 %.3f m' % (got, moved))
+    sub('從 pty 建立到 bridge 結束，假裝置收到 %d bytes、%d 筆下行紀錄' % (rx, n_down))
+    sub('正向對照：R3 同樣設定但 read_only=false 時收到 %d bytes' % control_bytes)
+    ok = (bool(log_line) and got and moved > 0.4 and rx == 0 and n_down == 0
+          and control_bytes > 0)
+    record('R', 'R9', 'read_only：下行 0 byte、上行照常發布 /odom',
+           'PASS' if ok else 'FAIL',
+           '下行 %d bytes (對照 %d), /odom 移動 %.3fm, log=%s'
+           % (rx, control_bytes, moved, bool(log_line)))
+
+
+def phase_r():
+    hdr('Phase R  硬體迴路：整套系統對著假 C30D (不需要 Gazebo)')
+    sub('假 C30D = test/tools/fake_c30d.py（pty，協定照 drivers/README.md，未經實機確認）')
+    FakeC30D = _r_fake_class()
+    try:
+        _r_session1(FakeC30D)
+    finally:
+        bg_stop_all()
+        sweep()
+    try:
+        _r_session2(FakeC30D)
+    finally:
+        bg_stop_all()
+        sweep()
+    control = 0
+    try:
+        control = _r_session3(FakeC30D) or 0
+    finally:
+        bg_stop_all()
+        sweep()
+    try:
+        _r_session4(FakeC30D, control)
+    finally:
+        bg_stop_all()
+        sweep()
+
+
+# --------------------------------------------------------------------------
 # 6.45 Phase O：臨時障礙物容錯
 #
 # 場景：草坪上臨時多了一個東西（椅子被搬出來、樹枝掉下來、有人站在那裡）。
@@ -2754,10 +3679,15 @@ O_WORLD = 'demo_lawn_obstacle.world'
 # approach 對角線的距離不變，世界檔（11 節的示範也在用）也不用改。
 # 依賴 headland 的部分由 O_FIXTURE_MARGIN 的啟動斷言顯性化 ——
 # headland 超過 0.81 m 時斷言就會以「夾具幾何問題」失敗。
-O_BOUNDARY = (-1.5, -1.5, 3.0)
+# 【階段 38：6 m -> 7.3 m】headland 0.70 -> 1.20 (車輛幾何推導)，環繞往內再移 0.50 m，
+# 舊的 6 m 場地淨空又變成負值 (階段 21 踩過同一個坑)。這次把場地下限寫成公式 (o_min_half())，
+# Phase O 一開始就斷言 O_BOUNDARY 的半邊長 >= 公式值，不滿足直接記為 FIXTURE (夾具失效)，
+# 不跑任務、也不算產品失敗。箱子與世界檔都不動，只放大邊界。
+O_BOUNDARY = (-1.5, -1.5, 3.65)
 O_OBSTACLE = (-2.5, -0.75, 0.5)     # 世界檔裡那個箱子的中心與半邊長
-# 車體半寬 = footprint 寬 / 2（vehicle.yaml 的 footprint_width，車體物理尺寸；目前 0.68 m / 2）
-O_BODY_HALF_WIDTH = VEHICLE_INSCRIBED
+# 車體半寬 = 側向半寬 lateral_half_extent (vehicle.yaml 的 body_width_total / 2，階段 38 為 0.42)。
+# 不是 costmap 的內接半徑 (0.155)：環繞是從箱子旁邊直線通過，看的是側面。
+O_BODY_HALF_WIDTH = VEHICLE_LATERAL_HALF
 # 夾具餘裕：周邊環繞離箱子至少要「車體半寬 + 這個值」。
 #   0.10 = local costmap 2 格 (resolution 0.05)：箱子表面被標成佔據格時
 #          最多往外多 1 格，車體 footprint 光柵化時最多再多 1 格
@@ -2765,6 +3695,52 @@ O_BODY_HALF_WIDTH = VEHICLE_INSCRIBED
 # 舊的 0.01 m 連一格都不到。也不能太大：箱子要還能擋住割草線，
 # 所以另外斷言「至少一條割草線穿過箱子」（離箱子 < 車體半寬）。
 O_FIXTURE_MARGIN = 0.20
+
+
+def o_min_half():
+    """Phase O 邊界 (正方形，中心固定 O_BOUNDARY[:2]) 的最小半邊長。
+
+    記號：(cx, cy) 邊界中心、H 半邊長、(ox, oy, oh) 箱子中心與半邊長、
+          d_p = 周邊環繞離邊界的距離 = headland_width + 割草線間距 / 2 (f2c_server 的定義)、
+          need = O_BODY_HALF_WIDTH + O_FIXTURE_MARGIN、
+          rot  = rotation_swept_radius + O_FIXTURE_MARGIN。
+    1. 環繞的四條直線段離箱子對應那一面至少 need (直線通過)：
+         西 H >= need + d_p - (ox - oh - cx)      北 H >= need + d_p + (oy + oh - cy)
+         東 H >= need + d_p + (ox + oh - cx)      南 H >= need + d_p - (oy - oh - cy)
+    2. 環繞的四個轉角 (manager 依 90 度規則切段，每段開頭原地轉 90 度) 離箱子至少 rot：
+         corner = (cx ± (H - d_p), cy ± (H - d_p))，|corner - 箱子| >= rot
+    3. (只能在執行時檢查，見 phase_o 的夾具幾何斷言) 第一段 approach 的直線離箱子 >= need：
+       approach 的起點是前面 Phase 把車子留下的位置，事先不知道。
+    回傳 (H_min, 明細字串)。條件 2 用 0.01 m 步進往上找。
+    """
+    cx, cy, _h = O_BOUNDARY
+    ox, oy, oh = O_OBSTACLE
+    d_p = GEOM.headland_width + SWATH_SPACING / 2.0
+    need = O_BODY_HALF_WIDTH + O_FIXTURE_MARGIN
+    rot = GEOM.rotation_swept_radius + O_FIXTURE_MARGIN
+    sides = {
+        '西': need + d_p - (ox - oh - cx), '北': need + d_p + (oy + oh - cy),
+        '東': need + d_p + (ox + oh - cx), '南': need + d_p - (oy - oh - cy)}
+    h = max(sides.values())
+
+    def corner_ok(hh):
+        r = hh - d_p
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                px, py = cx + sx * r, cy + sy * r
+                dx = max(abs(px - ox) - oh, 0.0)
+                dy = max(abs(py - oy) - oh, 0.0)
+                if math.hypot(dx, dy) < rot:
+                    return False
+        return True
+    h_side = h
+    while not corner_ok(h):
+        h += 0.01
+    detail = ('d_p = headland %.2f + 間距/2 %.3f = %.3f；直線條件 %s -> %.3f；'
+              '轉角條件 (rot %.3f) -> %.3f' % (
+                  GEOM.headland_width, SWATH_SPACING / 2.0, d_p,
+                  ' '.join('%s %.3f' % kv for kv in sides.items()), h_side, rot, h))
+    return h, detail
 RE_O_QUEUE = re.compile(
     r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
     r'終點 \(([-\d.]+), ([-\d.]+)\)')
@@ -2900,6 +3876,20 @@ def phase_o():
               kv.get('D_warned_out_of_range'), kv.get('E_skipped'),
               kv.get('E_warned_send')))
 
+    # ---- 場地尺寸 >= 公式值 (階段 38)，不滿足就是夾具失效，不跑 ----
+    h_min, h_detail = o_min_half()
+    sub('場地下限公式：%s' % h_detail)
+    sub('O_BOUNDARY 半邊長 %.2f m，公式下限 %.3f m -> %s'
+        % (O_BOUNDARY[2], h_min, 'OK' if O_BOUNDARY[2] >= h_min else '不足'))
+    if O_BOUNDARY[2] < h_min:
+        why = ('O_BOUNDARY 半邊長 %.2f m < 公式下限 %.3f m (%s)'
+               % (O_BOUNDARY[2], h_min, h_detail))
+        # O3 / O4 不需要這塊場地 (上面已經跑完)，只有 O1 / O2 受影響
+        for cid, name in (('O1', '割草線被臨時障礙物擋住時：跳過該段並繼續割其餘割草線'),
+                          ('O2', '跳過某一段之後會重新產生 approach，不會因為 0 poses 而失敗')):
+            record('O', cid, name, 'FIXTURE', '夾具失效 (不是產品失敗)：%s' % why)
+        return
+
     gz = bg_start('O_gazebo',
                   ['ros2', 'launch', 'mowerbot_bringup', 'gazebo.launch.py',
                    'gui:=false', 'world:=%s' % O_WORLD])
@@ -2952,11 +3942,17 @@ def phase_o():
             obs_pub.publish(empty)
             rig.spin(0.3)
 
+        # 任務開始時車子的位置：第一段 approach 的直線從這裡出發 (夾具條件 3 用)
+        o_start_xy = (rig.odom[-1][1], rig.odom[-1][2]) if rig.odom else None
         del rig.odom[:]
         ok_mode = rig.set_mode(1)
         sub('change_mower_mode(mode=1) 回傳 success = %s' % ok_mode)
 
-        # ---- 夾具幾何斷言（階段 26）----
+        # ---- 夾具幾何斷言（階段 26；條件 3 為階段 38 補上）----
+        # 3. 第一段 approach (車子當下位置 -> 佇列第 1 段起點) 的直線離箱子 >= 車體半寬 + O_FIXTURE_MARGIN。
+        #    manager 的 approach 只檢查終點、不檢查整條線的側向淨空 (產品缺陷，報告 38.15)；
+        #    夾具若讓 approach 擦過箱子，O1 量到的是那個缺陷，而不是它宣稱的「割草線被擋住」。
+        #    approach 的起點取決於前面 Phase 把車子留在哪裡，所以只能在這裡依實際位置檢查。
         # 用 manager 實際規劃出來的佇列（不是自己重算一次 F2C 的公式）檢查兩件事：
         #   1. 周邊環繞離箱子 >= 車體半寬 + O_FIXTURE_MARGIN
         #      否則周邊環繞會先撞箱子，O1 的情境根本不會發生
@@ -3001,12 +3997,21 @@ def phase_o():
                            % (per_min[0], per_min[1], need))
         elif not blocked:
             fixture_err = '沒有任何割草線會被箱子擋住，O1 的情境不會發生'
+        if fixture_err is None and o_start_xy is not None and queue.get(1):
+            _l1, ax2, ay2 = queue[1][0], queue[1][1], queue[1][2]
+            app_d = _seg_box_dist(o_start_xy[0], o_start_xy[1], ax2, ay2, ox, oy, oh)
+            sub('  第一段 approach (%.2f, %.2f) -> (%.2f, %.2f) 離箱子 = %.3f m，要求 >= %.2f m'
+                % (o_start_xy[0], o_start_xy[1], ax2, ay2, app_d, need))
+            if app_d < need:
+                fixture_err = ('第一段 approach 直線 (%.2f, %.2f) -> (%.2f, %.2f) 離箱子只有 %.3f m < %.2f m，'
+                               '車身側面會先擦到箱子 (approach 不檢查整條線的淨空)'
+                               % (o_start_xy[0], o_start_xy[1], ax2, ay2, app_d, need))
         if fixture_err:
             sub('❌ 夾具幾何問題（不是產品問題）：%s。' % fixture_err)
             sub('   多半是產品參數（headland 等）改了，要調整 O_BOUNDARY / 箱子位置。')
             rig.set_mode(2)
             record('O', 'O1', '割草線被臨時障礙物擋住時：跳過該段並繼續割其餘割草線',
-                   'FAIL', '夾具幾何問題（不是產品問題）：%s' % fixture_err)
+                   'FIXTURE', '夾具幾何問題（不是產品問題）：%s' % fixture_err)
             record('O', 'O2', '跳過某一段之後會重新產生 approach，不會因為 0 poses 而失敗',
                    'SKIP', '夾具幾何不成立，任務沒有跑')
             return
@@ -3199,6 +4204,12 @@ class StatusRig(object):
                 (time.time(), m.connected, m.deadman_held,
                  m.stop_pressed, m.last_msg_age)), 20)
         self.mission = []      # (wall_t, state, total, completed, skipped, label, skipped_labels)
+        # 車子目前位置 (/odom)：P3 的夾具前提要用 (階段 38，起點離測試邊界夠不夠原地掉頭)
+        from nav_msgs.msg import Odometry
+        self.odom_xy = None
+        self.node.create_subscription(
+            Odometry, '/odom',
+            lambda m: setattr(self, 'odom_xy', (m.pose.pose.position.x, m.pose.pose.position.y)), 10)
         self.node.create_subscription(
             MowerStatus, '/mower_status',
             lambda m: self.mower.append((time.time(), m.mode, m.stop_active)), 20)
@@ -3358,76 +4369,101 @@ def phase_p():
             record('P', 'P4', '急停（有任務）：mission state 轉成 ABORTED', 'SKIP',
                    'controller_server 沒進入 active，無法啟動任務')
         else:
-            rig.publish_boundary(-1.5, -1.5, 2.5, seconds=3.0)
-            del rig.mission[:]
-            rig.set_mode(1)
-            sub('切到 mode 1，監聽最多 150 秒，等 completed >= 2 段...')
-            t0 = time.time()
-            labels_seen = []
-            while time.time() - t0 < 150.0:
-                rig.spin(0.5)
-                if not rig.mission:
-                    continue
-                cur = rig.mission[-1]
-                if cur[5] and cur[5] not in labels_seen:
-                    labels_seen.append(cur[5])
-                    sub('  t=%3.0fs  state=%d total=%d completed=%d label=%r'
-                        % (time.time() - t0, cur[1], cur[2], cur[3], cur[5]))
-                if cur[3] >= 2:
-                    break
-            states = sorted(set(m[1] for m in rig.mission))
-            totals = sorted(set(m[2] for m in rig.mission if m[2] > 0))
-            completed_max = max((m[3] for m in rig.mission), default=0)
-            print('')
-            sub('觀察到的 state 值 = %s (1=規劃中 2=執行中)' % states)
-            sub('觀察到的 total_segments = %s' % totals)
-            sub('completed_segments 最大值 = %d' % completed_max)
-            sub('看到的 current_label = %s' % labels_seen[:8])
-            p3_ok = (bool(totals) and completed_max >= 2 and len(labels_seen) >= 2
-                     and ST.STATE_EXECUTING in states)
-            record('P', 'P3',
-                   '/mission_status 的 state / total / completed / current_label 會更新',
-                   'PASS' if p3_ok else 'FAIL',
-                   'state值=%s, total=%s, completed最大=%d, 看到 %d 種 label'
-                   % (states, totals, completed_max, len(labels_seen)))
-
-            # ---- P4 任務執行中急停 ----
-            hdr('P4  急停（任務執行中）：mission state 要轉成 ABORTED')
-            running = rig.mission[-1] if rig.mission else None
-            sub('急停前 mission state = %s (預期 %d=EXECUTING)'
-                % (running[1] if running else None, ST.STATE_EXECUTING))
-            del rig.mower[:]
-            del rig.mission[:]
-            rig.set_mode(4)
-            rig.spin(2.5)
-            m_after = rig.mower[-1] if rig.mower else None
-            s_after = rig.mission[-1] if rig.mission else None
-            sub('急停後 /mower_status: mode=%s, stop_active=%s'
-                % (m_after[1] if m_after else None, m_after[2] if m_after else None))
-            sub('急停後 mission state = %s (預期 %d=ABORTED)'
-                % (s_after[1] if s_after else None, ST.STATE_ABORTED))
-            p4_ok = (running is not None and running[1] == ST.STATE_EXECUTING
-                     and m_after is not None and m_after[1] == 4 and m_after[2] is True
-                     and s_after is not None and s_after[1] == ST.STATE_ABORTED)
-            record('P', 'P4',
-                   '急停（任務執行中）：stop_active=true 且 mission state=ABORTED',
-                   'PASS' if p4_ok else 'FAIL',
-                   '急停前 state=%s, 急停後 mode=%s stop_active=%s state=%s'
-                   % (running[1] if running else None,
-                      m_after[1] if m_after else None,
-                      m_after[2] if m_after else None,
-                      s_after[1] if s_after else None))
-            rig.set_mode(2)
+            # 測試邊界與 Phase N 同一個來源 (階段 38：以前這裡另外寫死 (-1.5, -1.5, 2.5)，
+            # 起點離東邊只有 1.00 m < rotation_swept_radius 1.06，manager 拒絕開始，P3 / P4 因此 FAIL)
+            bcx, bcy = TEST_BOUNDARY_CENTER
+            half = TEST_BOUNDARY_HALF
             rig.spin(1.0)
+            xy = rig.odom_xy
+            p_need = n_start_clearance_need()
+            p_clear = (min(xy[0] - (bcx - half), (bcx + half) - xy[0],
+                           xy[1] - (bcy - half), (bcy + half) - xy[1]) if xy else None)
+            sub('夾具前提：起點 %s 離測試邊界 %s m，要求 >= rotation_swept_radius %.4f + %.2f = %.4f m'
+                % (('(%.2f, %.2f)' % xy) if xy else '(收不到 /odom)',
+                   ('%.3f' % p_clear) if p_clear is not None else 'n/a',
+                   VEHICLE_ROT_SWEPT, N_START_MARGIN, p_need))
+            p_fixture_ok = p_clear is not None and p_clear >= p_need
+            rig.publish_boundary(bcx, bcy, half, seconds=3.0)
+            del rig.mission[:]
+            if not p_fixture_ok:
+                why = ('起點離測試邊界 %s m < %.4f m，manager 會拒絕開始 (TEST_BOUNDARY_* 要調整)'
+                       % (('%.3f' % p_clear) if p_clear is not None else 'n/a', p_need))
+                record('P', 'P3', '/mission_status 的 state / total / completed / current_label 會更新',
+                       'FIXTURE', '夾具失效 (不是產品失敗)：%s' % why)
+                record('P', 'P4', '急停（任務執行中）：stop_active=true 且 mission state=ABORTED',
+                       'FIXTURE', '夾具失效 (不是產品失敗)：%s' % why)
+            else:
+                rig.set_mode(1)
+                sub('切到 mode 1，監聽最多 150 秒，等 completed >= 2 段...')
+                t0 = time.time()
+                labels_seen = []
+                while time.time() - t0 < 150.0:
+                    rig.spin(0.5)
+                    if not rig.mission:
+                        continue
+                    cur = rig.mission[-1]
+                    if cur[5] and cur[5] not in labels_seen:
+                        labels_seen.append(cur[5])
+                        sub('  t=%3.0fs  state=%d total=%d completed=%d label=%r'
+                            % (time.time() - t0, cur[1], cur[2], cur[3], cur[5]))
+                    if cur[3] >= 2:
+                        break
+                states = sorted(set(m[1] for m in rig.mission))
+                totals = sorted(set(m[2] for m in rig.mission if m[2] > 0))
+                completed_max = max((m[3] for m in rig.mission), default=0)
+                print('')
+                sub('觀察到的 state 值 = %s (1=規劃中 2=執行中)' % states)
+                sub('觀察到的 total_segments = %s' % totals)
+                sub('completed_segments 最大值 = %d' % completed_max)
+                sub('看到的 current_label = %s' % labels_seen[:8])
+                p3_ok = (bool(totals) and completed_max >= 2 and len(labels_seen) >= 2
+                         and ST.STATE_EXECUTING in states)
+                record('P', 'P3',
+                       '/mission_status 的 state / total / completed / current_label 會更新',
+                       'PASS' if p3_ok else 'FAIL',
+                       'state值=%s, total=%s, completed最大=%d, 看到 %d 種 label'
+                       % (states, totals, completed_max, len(labels_seen)))
+
+                # ---- P4 任務執行中急停 ----
+                hdr('P4  急停（任務執行中）：mission state 要轉成 ABORTED')
+                running = rig.mission[-1] if rig.mission else None
+                sub('急停前 mission state = %s (預期 %d=EXECUTING)'
+                    % (running[1] if running else None, ST.STATE_EXECUTING))
+                del rig.mower[:]
+                del rig.mission[:]
+                rig.set_mode(4)
+                rig.spin(2.5)
+                m_after = rig.mower[-1] if rig.mower else None
+                s_after = rig.mission[-1] if rig.mission else None
+                sub('急停後 /mower_status: mode=%s, stop_active=%s'
+                    % (m_after[1] if m_after else None, m_after[2] if m_after else None))
+                sub('急停後 mission state = %s (預期 %d=ABORTED)'
+                    % (s_after[1] if s_after else None, ST.STATE_ABORTED))
+                p4_ok = (running is not None and running[1] == ST.STATE_EXECUTING
+                         and m_after is not None and m_after[1] == 4 and m_after[2] is True
+                         and s_after is not None and s_after[1] == ST.STATE_ABORTED)
+                record('P', 'P4',
+                       '急停（任務執行中）：stop_active=true 且 mission state=ABORTED',
+                       'PASS' if p4_ok else 'FAIL',
+                       '急停前 state=%s, 急停後 mode=%s stop_active=%s state=%s'
+                       % (running[1] if running else None,
+                          m_after[1] if m_after else None,
+                          m_after[2] if m_after else None,
+                          s_after[1] if s_after else None))
+                rig.set_mode(2)
+                rig.spin(1.0)
 
         # ---- P5 邊界合理性檢查 ----
         hdr('P5  太小的邊界要被拒絕，而且不能覆蓋掉上一個有效邊界')
         sub('背景：map_to_boundary 在建圖未完成時會送出很小的邊界 (報告 11.4)，')
         sub('實測有 25% 的執行會在那個瞬間拿到 2~3 m² 的邊界而規劃失敗 (12.3)。')
         rig.set_mode(2)
-        rig.publish_boundary(-1.5, -1.5, 2.5, seconds=2.0)      # 有效：5x5 = 25 m²
+        # 有效邊界與 P3 / Phase N 同一個來源 (階段 38)；太小的那個放在同一個中心、半邊長 0.5 (1 m²)
+        rig.publish_boundary(TEST_BOUNDARY_CENTER[0], TEST_BOUNDARY_CENTER[1],
+                             TEST_BOUNDARY_HALF, seconds=2.0)      # 有效：5x5 = 25 m²
         rig.spin(0.5)
-        rig.publish_boundary(-1.5, -1.5, 0.5, seconds=2.0)      # 太小：1x1 = 1 m²
+        rig.publish_boundary(TEST_BOUNDARY_CENTER[0], TEST_BOUNDARY_CENTER[1],
+                             0.5, seconds=2.0)                     # 太小：1x1 = 1 m²
         rig.spin(1.0)
         rejects = ctl.log_grep(r'拒絕邊界', 5)
         sub('manager 的拒絕訊息 = %s' % (rejects[-1] if rejects else '(沒有)'))
@@ -3644,16 +4680,18 @@ def phase_p():
 # 在車子動之前就攔下來，這是最便宜的一道檢查。
 # --------------------------------------------------------------------------
 Q_WORLD = 'demo_lawn.world'
-Q_INSCRIBED = VEHICLE_INSCRIBED        # 車體內切半徑 (vehicle.yaml 的 footprint)
-Q_INFLATION = 0.45        # 與 nav2_params.yaml 的 inflation_radius 一致
+# 直線通過的門檻 = 側向半寬 (階段 38：以前是 footprint_width/2，舊車剛好等於內切半徑)
+Q_INSCRIBED = VEHICLE_LATERAL_HALF
+# local_costmap 的 inflation_radius：單一來源 vehicle_geometry.SOFT_INFLATION_RADIUS (階段 38)
+Q_INFLATION = GEOM.soft_inflation_radius
 RE_Q_LEADIN = re.compile(
     r'割草線 (\d+)/(\d+) 加跑道：長度 ([\d.]+) m，起點 \(([-\d.]+), ([-\d.]+)\)')
 RE_Q_LEADIN_SHORT = re.compile(r'割草線 (\d+)/(\d+) 跑道縮短為 ([\d.]+) m')
 RE_Q_LEADIN_NONE = re.compile(r'割草線 (\d+)/(\d+) 不加跑道')
 RE_Q_HIST = re.compile(r'跑道長度分布：(.+)')
-# 車體外接半徑 sqrt((L/2)^2 + (W/2)^2)，原地掉頭需要。
-# 階段 30 以前寫死成 0.5841 (精確值 0.584145 四捨五入)，改用算的之後門檻大 4.4e-5 m。
-Q_CIRCUM = VEHICLE_CIRCUMSCRIBED
+# 原地掉頭的門檻 = rotation_swept_radius (階段 38：繞後輪軸，1.0616 m；
+# 階段 30 以前寫死成舊車外接半徑 0.5841)。
+Q_CIRCUM = VEHICLE_ROT_SWEPT
 RE_Q_QUEUE = re.compile(
     r'📋 佇列 (\d+)/(\d+) \[(.+?)\] 起點 \(([-\d.]+), ([-\d.]+)\) '
     r'終點 \(([-\d.]+), ([-\d.]+)\) 長度 ([\d.]+) m')
@@ -3873,9 +4911,17 @@ def phase_q():
                        '沒有邊界或查不到 map -> base_footprint 的 TF')
                 raise _Q3Done()
 
-            # 1. 轉向最近的邊界，往前開到淨空 < 0.45 m (遠低於 0.5841 才不會誤判)
+            # 1. 背對最近的邊界，倒車開到淨空 < target_clear。
+            #
+            # 【階段 38 夾具修正，判定不變】base_link 移到後輪軸之後車頭在前方 0.975 m，
+            # 「往前開到淨空 0.45 m」車頭會先撞牆 (邊界只在牆內約 0.10 m)，這個位置開不到。
+            # 改成背對邊界倒車：車尾只伸出 rear_extent 0.155 m。
+            # target_clear 取「倒車到得了 (> rear_extent)」與「掉頭門檻 (rotation_swept_radius)」的中點，
+            # 由幾何推導，不寫死 (以前的 0.45 是「遠低於 0.5841」)。
             rig.set_mode(2)
-            target_clear = 0.45
+            target_clear = (GEOM.rear_extent + Q_CIRCUM) / 2.0
+            sub('Q3 夾具：倒車到離邊界 < %.3f m (= (rear_extent %.3f + rotation_swept_radius %.4f) / 2)'
+                % (target_clear, GEOM.rear_extent, Q_CIRCUM))
             for _ in range(40):
                 pose = rig.pose()
                 if pose is None:
@@ -3884,14 +4930,15 @@ def phase_q():
                 clear = point_polygon_distance(pose[0], pose[1], bnd)
                 if clear < target_clear:
                     break
-                want = math.atan2(near[1] - pose[1], near[0] - pose[0])
+                # 車尾朝向邊界 = 車頭朝向「遠離最近邊界點」的方向
+                want = math.atan2(pose[1] - near[1], pose[0] - near[0])
                 err = math.atan2(math.sin(want - pose[2]),
                                  math.cos(want - pose[2]))
                 if abs(err) > 0.15:
                     rig.drive(0.0, 0.5 if err > 0 else -0.5,
                               min(abs(err) / 0.5, 1.2))
                 else:
-                    rig.drive(0.25, 0.0, 0.6)
+                    rig.drive(-0.25, 0.0, 0.6)
                 rig.drive(0.0, 0.0, 0.2)
             rig.drive(0.0, 0.0, 0.5)
             pose = rig.pose()
@@ -4524,59 +5571,76 @@ def phase_l():
 # --------------------------------------------------------------------------
 def summary():
     hdr('總結報告')
+    # 輸出蓋章 (階段 38)：vehicle.yaml 還有暫定值時，摘要第一行標出來、摘要檔名加 _PROVISIONAL。
+    # 依 provenance 動態產生，全部 measured 時這一行與後綴自動消失。
+    out = []
+    stamp = GEOM.stamp()
+    if stamp:
+        out.append(stamp)
     total_pass = 0
     total_all = 0
-    print('')
+    out.append('')
     for pid, pname in PHASES:
         items = [r for r in RESULTS if r[0] == pid]
         if not items:
             continue
         npass = sum(1 for r in items if r[3] == 'PASS')
-        nskip = sum(1 for r in items if r[3] == 'SKIP')
         bad = [r[1] for r in items if r[3] == 'FAIL']
+        fixture = [r[1] for r in items if r[3] == 'FIXTURE']
         skipped = [r[1] for r in items if r[3] == 'SKIP']
-        status = 'PASS' if not bad and not skipped else ('FAIL' if bad else 'SKIP')
+        status = ('FAIL' if bad else 'FIXTURE' if fixture else 'SKIP' if skipped else 'PASS')
         note = ''
         if bad:
             note = ' (%s 失敗)' % ', '.join(bad)
-        elif skipped:
-            note = ' (%s 略過)' % ', '.join(skipped)
-        print('  Phase %s  %-10s %d/%d  %s%s'
-              % (pid, pname, npass, len(items), status, note))
+        if fixture:
+            note += ' (%s 夾具失效)' % ', '.join(fixture)
+        if skipped and not bad:
+            note += ' (%s 略過)' % ', '.join(skipped)
+        out.append('  Phase %s  %-10s %d/%d  %s%s'
+                   % (pid, pname, npass, len(items), status, note))
         total_pass += npass
         total_all += len(items)
-        _ = nskip
-    print('')
-    print('  總計     %d/%d' % (total_pass, total_all))
+    out.append('')
+    out.append('  總計     %d/%d' % (total_pass, total_all))
 
-    fails = [r for r in RESULTS if r[3] in ('FAIL', 'SKIP')]
+    # FIXTURE = 夾具失效 (階段 38)：測試場地不滿足產品參數推導出的前提，情境根本沒有成立。
+    # 不是產品失敗，也不算通過 —— 結束碼一樣是 1。
+    fails = [r for r in RESULTS if r[3] in ('FAIL', 'FIXTURE', 'SKIP')]
     if fails:
-        print('')
-        print('-' * 78)
-        print('失敗 / 略過項目明細')
-        print('-' * 78)
+        out.append('')
+        out.append('-' * 78)
+        out.append('失敗 / 夾具失效 / 略過項目明細')
+        out.append('-' * 78)
         for phase, cid, name, status, detail in fails:
-            print('')
-            print('  [%s] %s  %s' % (status, cid, name))
-            print('        實際觀察: %s' % (detail or '(無)'))
-    print('')
-    print('  完整 log 目錄: %s' % LOGDIR)
-    print('')
+            out.append('')
+            out.append('  [%s] %s  %s' % (status, cid, name))
+            out.append('        實際觀察: %s' % (detail or '(無)'))
+    out.append('')
+    out.append('  完整 log 目錄: %s' % LOGDIR)
+    out.append('')
+    print('\n'.join(out))
+    with open(os.path.join(LOGDIR, 'summary%s.txt' % GEOM.file_suffix()), 'w',
+              encoding='utf-8') as fh:
+        fh.write('\n'.join(out) + '\n')
     return 0 if all(r[3] == 'PASS' for r in RESULTS) else 1
 
 
 def main():
-    phases = 'ABCDHLNOPQ'
+    phases = 'ABCDHRLNOPQ'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHLNOPQ'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHRLNOPQ'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
             print(__doc__)
             return 0
 
+    if GEOM.stamp():
+        print(GEOM.stamp())
+        print(GEOM.banner())
     print('mowerbot 冒煙測試   %s' % datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    print('車輛幾何      : %s' % GEOM.summary())
     print('workspace     : %s' % WS)
     print('ROS_DOMAIN_ID : %s' % ENV['ROS_DOMAIN_ID'])
     print('log 目錄      : %s' % LOGDIR)
@@ -4600,6 +5664,7 @@ def main():
             a3_executables()
             a4_interfaces()
             a5_xacro()
+            a6_inscribed_not_used()
 
         if 'B' in phases:
             hdr('Phase B  單元功能測試')
@@ -4619,6 +5684,8 @@ def main():
                 b4_obstacle_extraction()
             finally:
                 bg_stop_all()
+            b5_perimeter_effective_length()
+            b6_b7_perimeter_invariants()
 
         if 'C' in phases:
             try:
@@ -4638,6 +5705,13 @@ def main():
                 phase_h()
             finally:
                 bg_stop_all()
+
+        if 'R' in phases:
+            try:
+                phase_r()
+            finally:
+                bg_stop_all()
+                sweep()
 
         if 'L' in phases:
             try:

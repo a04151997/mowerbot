@@ -6,9 +6,10 @@
     <xacro:property name="camera_height" value="0.08"/>
 
     <!-- 攝像機偏移量 -->
-    <xacro:property name="camera_joint_x" value="${car_length / 2.0 - 0.02}"/>
+    <!-- 車頭、車體方塊頂面上 (階段 38：以 car_base.xacro 的車體方塊為準，base_link 在後輪軸) -->
+    <xacro:property name="camera_joint_x" value="${front_extent - 0.02}"/>
     <xacro:property name="camera_joint_y" value="0.0"/>
-    <xacro:property name="camera_joint_z" value="${car_height / 2.0 + camera_height / 2.0}"/>
+    <xacro:property name="camera_joint_z" value="${body_top_z + camera_height / 2.0}"/>
 
     <!-- 顏色 -->
     <material name="red">

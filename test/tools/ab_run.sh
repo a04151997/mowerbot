@@ -39,6 +39,7 @@
 #
 # 地圖名預設 ab_map，可用環境變數 AB_MAP 改。maps/ 裡的地圖檔不進版控。
 # 世界預設 demo_lawn.world（run_demo.sh 的預設），可用環境變數 AB_WORLD 改（階段 28）。
+# 額外的 demo launch 參數可用 AB_DEMO_ARGS 加在最後 (後面的覆蓋前面的；階段 38 後續 6 錄影用：rviz:=true)。
 # 任務秒數上限預設 1500，可用 AB_LIMIT 改（階段 29：只為了抓規劃路徑時用短的）。
 # ==========================================================================
 set -u
@@ -54,7 +55,7 @@ date +%s > "$OUT/t_start"
 
 # 背景工作在非互動 shell 裡會忽略 SIGINT，所以收尾一律用 SIGTERM
 # （run_demo.sh 有 trap TERM）。
-setsid ./run_demo.sh rviz:=false hmi:=false world:="${AB_WORLD:-demo_lawn.world}" > "$OUT/demo.log" 2>&1 &
+setsid ./run_demo.sh rviz:=false hmi:=false world:="${AB_WORLD:-demo_lawn.world}" ${AB_DEMO_ARGS:-} > "$OUT/demo.log" 2>&1 &
 DEMO=$!
 LOC=; MS=
 if [ "$MODE" = run ]; then

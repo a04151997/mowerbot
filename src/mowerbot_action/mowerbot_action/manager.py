@@ -18,6 +18,63 @@ from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
 
+# ---- 跨檔共用的預設值：單一來源 (階段 38 修正 3 原則 7) ----
+# 以前 launch 檔、HMI、smoke_test 各寫一份並註明「要一致」；現在它們都 import 這裡。
+# 割草線重疊率預設值 (選定理由見 __init__ 裡 overlap_ratio 的註解)
+DEFAULT_OVERLAP_RATIO = 0.4
+# 邊界最小面積預設值 (理由見 __init__ 裡 min_boundary_area 的註解)
+DEFAULT_MIN_BOUNDARY_AREA = 4.0
+# 航點間距：割草線、周邊環繞 (f2c_server 由 launch 傳入)、approach、跑道共用
+WAYPOINT_SPACING = 0.1
+
+
+def perimeter_corner_cuts(xy, window, angle):
+    """周邊環繞的轉角偵測 (階段 38 決定 3)，回傳要切開的航點索引 (遞增)。
+
+    為什麼不用割草線的「單步轉角 >= 90°」規則：SLAM 地圖萃取的邊界不是完美直角，
+    真正的轉角是 85° ~ 89.5°，有的還分散在好幾步 (79° − 46°、40° − 39° − 86° …)，
+    單步規則一刀都切不開 (stage29_lawn、headland 1.20：整圈一段、起點 = 終點)。
+
+    做法：沿路徑累積「有號」轉角；從每個頂點往前看一個 window 的弧長，
+    累積轉角絕對值 >= angle 就是一個轉角區，切在區內累積轉角過半的那個頂點，
+    然後跳過整個區 (同一個轉角只切一刀)。直線上的雜訊轉角正負抵消、累積不起來。
+    """
+    n = len(xy)
+    if n < 3:
+        return []
+    head, pos, s = [], [], 0.0
+    for i in range(n - 1):
+        dx, dy = xy[i + 1][0] - xy[i][0], xy[i + 1][1] - xy[i][1]
+        head.append(math.atan2(dy, dx) if math.hypot(dx, dy) > 1e-9 else None)
+        pos.append(s)
+        s += math.hypot(dx, dy)
+    turn = [0.0] * n          # turn[i] = 在頂點 i 的轉角 (步 i-1 -> 步 i)
+    last = None
+    for i in range(n - 1):
+        if head[i] is None:
+            continue
+        if last is not None:
+            turn[i] = math.atan2(math.sin(head[i] - last), math.cos(head[i] - last))
+        last = head[i]
+    cuts, j = [], 1
+    while j < n - 1:
+        acc, k, best = 0.0, j, None
+        while k < n - 1 and pos[k] - pos[j] < window:
+            acc += turn[k]
+            k += 1
+        if abs(acc) >= angle:
+            half, run = acc / 2.0, 0.0
+            for m in range(j, k):
+                run += turn[m]
+                if abs(run) >= abs(half):
+                    best = m
+                    break
+            cuts.append(best)
+            j = k
+        else:
+            j += 1
+    return cuts
+
 class MowerManager(Node):
     def __init__(self):
         super().__init__('mower_manager')
@@ -53,6 +110,10 @@ class MowerManager(Node):
         self._lead_in_hist = {}        # 跑道長度 -> 幾條割草線用了這個長度
         self._current_label = ''
         self._mission_message = ''     # 任務層級的說明訊息，給 HMI 顯示 (階段 23)
+        # 對正階段 (階段 38 決定 1)：True = 目前在跑的 goal 是對正 (AlignController)；
+        # _aligned_idx = 已經對正完成的佇列索引 (對正成功之後才送那一段本身)
+        self._align_phase = False
+        self._aligned_idx = None
         # approach 迴圈的終止：記住「現在在接近哪一段」與歷次量到的距離
         self._approach_for = None      # 目前在為哪一個段落插 approach
         self._approach_dists = []      # 每一輪量到的「離目標多遠」
@@ -95,7 +156,7 @@ class MowerManager(Node):
         #   (2.75 / 2.93 / 3.03 / 3.10 m²，報告 12.3、14.3) 全部落在 1.96 ~ 4.0 之間。
         #   真實草坪的邊界約 115 m²，遠在門檻之上。
         # 所以不要把它「修正」成 1.96 —— 那會讓這些垃圾邊界通過。
-        self.declare_parameter('min_boundary_area', 4.0)
+        self.declare_parameter('min_boundary_area', DEFAULT_MIN_BOUNDARY_AREA)
         self.min_boundary_area = float(
             self.get_parameter('min_boundary_area').value)
 
@@ -127,7 +188,7 @@ class MowerManager(Node):
         # 刀盤寬來自 vehicle.yaml (由 mower_control.launch.py 傳入)，這裡不給預設值：
         # 沒傳就在 get_parameter 時直接失敗，不要安靜地用一個寫死的數字。
         self.declare_parameter('blade_width', Parameter.Type.DOUBLE)
-        self.declare_parameter('overlap_ratio', 0.4)
+        self.declare_parameter('overlap_ratio', DEFAULT_OVERLAP_RATIO)
         self.blade_width = float(self.get_parameter('blade_width').value)
         self.overlap_ratio = float(self.get_parameter('overlap_ratio').value)
         self.swath_spacing = self.blade_width * (1.0 - self.overlap_ratio)
@@ -135,20 +196,41 @@ class MowerManager(Node):
             f'🔪 實際刀盤寬 = {self.blade_width:.3f} m，'
             f'重疊率 = {self.overlap_ratio:.2f}，'
             f'割草線間距 = {self.swath_spacing:.3f} m')
+        # 參數之間的矛盾檢查 (階段 38 後續 6)：APPROACH_SKIP_DISTANCE >= 割草線間距時，相鄰割草線之間
+        # 永遠不會插入 approach —— 車子在上一條線的終點原地掉頭，帶著一個間距的側向差開始下一條
+        # (simulation_results.md 38.17)。先只警告不 abort：現有設定 (0.5 vs 0.30) 就是這個情況，abort 會起不來。
+        if self.APPROACH_SKIP_DISTANCE >= self.swath_spacing:
+            self.get_logger().warn(
+                f'⚠️ 參數矛盾：APPROACH_SKIP_DISTANCE = {self.APPROACH_SKIP_DISTANCE:.2f} m >= '
+                f'割草線間距 {self.swath_spacing:.3f} m —— 相鄰割草線之間永遠不會插入 approach，'
+                f'每一條割草線都會帶著約 {self.swath_spacing:.2f} m 的側向差起步')
 
-        # 車體 footprint：來自 vehicle.yaml (由 mower_control.launch.py 傳入)，不給預設值，
-        # 理由同 blade_width。兩種淨空門檻由它算出來，說明見 lead_in_point_unsafe() 上方。
-        self.declare_parameter('footprint_length', Parameter.Type.DOUBLE)
-        self.declare_parameter('footprint_width', Parameter.Type.DOUBLE)
-        footprint_length = float(self.get_parameter('footprint_length').value)
-        footprint_width = float(self.get_parameter('footprint_width').value)
-        self.LEAD_IN_BOUNDARY_CLEARANCE = footprint_width / 2.0
-        self.ROTATION_CLEARANCE = math.hypot(footprint_length / 2.0,
-                                             footprint_width / 2.0)
+        # 淨空門檻：來自 mowerbot_description/vehicle_geometry.py (由 mower_control.launch.py
+        # 傳入)，不給預設值，理由同 blade_width。manager 不自己算幾何 (階段 38)。
+        # 說明見 lead_in_point_unsafe() 上方。
+        self.declare_parameter('lateral_half_extent', Parameter.Type.DOUBLE)
+        self.declare_parameter('rotation_swept_radius', Parameter.Type.DOUBLE)
+        self.declare_parameter('soft_inflation_radius', Parameter.Type.DOUBLE)
+        self.LEAD_IN_BOUNDARY_CLEARANCE = float(
+            self.get_parameter('lateral_half_extent').value)
+        self.ROTATION_CLEARANCE = float(
+            self.get_parameter('rotation_swept_radius').value)
+        self.LEAD_IN_OBSTACLE_CLEARANCE = float(
+            self.get_parameter('soft_inflation_radius').value)
+        # 周邊環繞的轉角偵測與「起點 = 終點」判定 (階段 38 決定 3)，沒有預設值：
+        #   perimeter_corner_window / perimeter_corner_angle  來自 vehicle_geometry
+        #   goal_xy_tolerance  nav2 general_goal_checker 的 xy_goal_tolerance (起點離終點不超過它的段落，
+        #                      goal checker 會在送出當下判定到達 —— 一公尺都不會開)
+        self.declare_parameter('perimeter_corner_window', Parameter.Type.DOUBLE)
+        self.declare_parameter('perimeter_corner_angle', Parameter.Type.DOUBLE)
+        self.declare_parameter('goal_xy_tolerance', Parameter.Type.DOUBLE)
+        self.perimeter_corner_window = float(self.get_parameter('perimeter_corner_window').value)
+        self.perimeter_corner_angle = float(self.get_parameter('perimeter_corner_angle').value)
+        self.goal_xy_tolerance = float(self.get_parameter('goal_xy_tolerance').value)
         self.get_logger().info(
-            f'🚙 footprint = {footprint_length} x {footprint_width} m，'
-            f'內切半徑 = {self.LEAD_IN_BOUNDARY_CLEARANCE!r} m，'
-            f'外接半徑 = {self.ROTATION_CLEARANCE!r} m')
+            f'🚙 直線通過門檻 (lateral_half_extent) = {self.LEAD_IN_BOUNDARY_CLEARANCE!r} m，'
+            f'掉頭門檻 (rotation_swept_radius) = {self.ROTATION_CLEARANCE!r} m，'
+            f'跑道離障礙物門檻 (soft_inflation_radius) = {self.LEAD_IN_OBSTACLE_CLEARANCE!r} m')
         # mode 3 是**保留值，沒有實作**(階段 23)。
         #
         # 【為什麼不重新編號】
@@ -557,6 +639,8 @@ class MowerManager(Node):
         self._current_swath_idx = 0
         self._swath_total = 0
         self._result_future = None
+        self._align_phase = False
+        self._aligned_idx = None
         self._reset_approach_tracking()
 
     def cancel_current_goal(self):
@@ -572,7 +656,7 @@ class MowerManager(Node):
 
     # approach 路徑的兩個常數
     APPROACH_SKIP_DISTANCE = 0.5      # 距離小於這個值就不用 approach
-    APPROACH_WAYPOINT_SPACING = 0.1   # 與割草線的航點間距一致
+    APPROACH_WAYPOINT_SPACING = WAYPOINT_SPACING   # 與割草線同一個來源
 
     # ---- approach 迴圈的終止條件 (階段 23) ----
     #
@@ -661,26 +745,27 @@ class MowerManager(Node):
             f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
         return approach
 
-    # 跑道的航點間距，與割草線、approach 一致
-    LEAD_IN_WAYPOINT_SPACING = 0.1
+    # 跑道的航點間距，與割草線、approach 同一個來源
+    LEAD_IN_WAYPOINT_SPACING = WAYPOINT_SPACING
 
-    # 跑道起點與障礙物之間至少要留這麼多。0.45 m 是 local_costmap 的
-    # inflation_radius，路徑落在膨脹層裡控制器會走不動 (不是改 costmap 參數，
-    # 只是拿它當判斷依據)。
-    LEAD_IN_OBSTACLE_CLEARANCE = 0.45
+    # 跑道起點與障礙物之間至少要留這麼多 = local_costmap 的 inflation_radius，
+    # 路徑落在膨脹層裡控制器會走不動 (不是改 costmap 參數，只是拿它當判斷依據)。
+    # 階段 38 以前寫死 0.45 並註明「與 inflation_radius 一致」；現在 self.LEAD_IN_OBSTACLE_CLEARANCE
+    # 在 __init__ 由參數 soft_inflation_radius 設定，與 nav2 讀同一個來源 (vehicle_geometry)。
 
     # ---- 兩種淨空門檻：直線通過 vs 原地掉頭 ----
     #
-    # 【直線通過】只要車體不重疊就好 = 內切半徑 = footprint_width / 2
-    #   (目前 footprint 0.95 x 0.68，半寬 0.34)
+    # 【直線通過】車體側面不重疊 = 側向半寬 lateral_half_extent = body_width_total / 2
+    #   (階段 38：0.42。舊車 base_link 在車體中心時它剛好等於內切半徑 0.34，是巧合；
+    #    base_link 移到後輪軸之後內切半徑是 0.155，不能拿來當通過門檻，
+    #    否則跑道點離邊界 0.16 m 就放行，車身側面已經壓出邊界 0.26 m)
     #
-    # 【原地掉頭】車體四角會掃出一個圓 = 外接半徑
-    #   sqrt((footprint_length/2)^2 + (footprint_width/2)^2)
-    #   (目前 sqrt(0.475^2 + 0.34^2) = 0.584145 m；階段 30 以前寫死成四捨五入的 0.5841)
+    # 【原地掉頭】繞後輪軸旋轉時車頭兩角掃出的圓 = rotation_swept_radius
+    #   hypot(front_extent 0.975, 0.42) = 1.0616 m (階段 37 以前是舊車外接半徑 0.5841)
     #   淨空小於這個值時，原地旋轉一定會掃到障礙物。
     #
-    # 兩個值在 __init__ 裡由 vehicle.yaml 的 footprint 算出來
-    # (self.LEAD_IN_BOUNDARY_CLEARANCE / self.ROTATION_CLEARANCE)，不要寫死。
+    # 兩個值在 __init__ 裡由參數設定 (self.LEAD_IN_BOUNDARY_CLEARANCE / self.ROTATION_CLEARANCE)，
+    # 來源是 vehicle_geometry.py，不要寫死。costmap 的內接半徑 0.155 只給 Nav2 inflation 用。
     #
     # 這個區分是階段 21 才補上的。之前所有檢查都用 0.34，
     # 結果實車那次在 (-5.36, -4.57) 卡住：該點淨空 0.492 m，
@@ -752,12 +837,12 @@ class MowerManager(Node):
         檢查兩件事 —— **邊界與內部障礙物都要看**：
 
         1. 邊界：點必須落在邊界多邊形**裡面**，而且離邊界至少
-           LEAD_IN_BOUNDARY_CLEARANCE (車體內切半徑 = footprint_width / 2)。
+           LEAD_IN_BOUNDARY_CLEARANCE (側向半寬 lateral_half_extent)。
            跑道是沿著割草線往**反方向**延伸的，而 F2C 的地頭本來就貼著邊界，
            所以延伸出去的起點很容易落到邊界外。實測 demo_lawn 上
            割草線 2/36 的跑道起點 x=5.51 直接落在牆體 (5.50~5.70) 裡面，
            controller_server 立刻回 ABORTED。
-        2. 內部障礙物：離障礙物至少 LEAD_IN_OBSTACLE_CLEARANCE (0.45 m，
+        2. 內部障礙物：離障礙物至少 LEAD_IN_OBSTACLE_CLEARANCE (soft_inflation_radius，
            = costmap 的 inflation_radius)。
 
         舊版的 lead_in_blocked() 只看障礙物、不看邊界，
@@ -1003,6 +1088,27 @@ class MowerManager(Node):
             start = cut
         return segments
 
+    def drop_closed_segments(self, queue):
+        """【不變量 ②】起點等於終點的段落不得送出 (階段 38 決定 3)。
+
+        起點與終點相距 <= goal_xy_tolerance 的段落，goal checker 會在送出當下判定到達 ——
+        等於宣告完成了一段一公尺都沒開的路。這不是可調參數；這裡是送進佇列前的最後一道關。
+        queue: [(Path, 標籤)]，回傳過濾後的 list。被丟掉的每一段都印 ERROR。
+        """
+        kept = []
+        for pth, lbl in queue:
+            if not pth.poses:
+                continue
+            a, b = pth.poses[0].pose.position, pth.poses[-1].pose.position
+            d = math.hypot(b.x - a.x, b.y - a.y)
+            if d <= self.goal_xy_tolerance:
+                self.get_logger().error(
+                    f'❌ [{lbl}] 起點 = 終點 (相距 {d:.3f} m <= goal_xy_tolerance '
+                    f'{self.goal_xy_tolerance:.2f} m)，不送出')
+                continue
+            kept.append((pth, lbl))
+        return kept
+
     def split_perimeter_into_edges(self, poses, header):
         """把周邊環繞那一圈依轉角切成一段一段的直邊。
 
@@ -1014,8 +1120,40 @@ class MowerManager(Node):
         對環繞的邊來說那個位置在轉角外側，已經超出作業區、落進
         costmap 的膨脹層，車子根本到不了那裡。
         """
+        # 階段 38：環繞改用累積轉角偵測 (perimeter_corner_cuts)，不再用割草線的 90° 規則；
+        # 相鄰航點的跳接 (GAP_CUT_DISTANCE，被內部障礙物挖開的缺口) 照舊切開。
+        segs = []
+        if len(poses) >= 3:
+            xy = [(p.pose.position.x, p.pose.position.y) for p in poses]
+            cuts = set(perimeter_corner_cuts(xy, self.perimeter_corner_window,
+                                             self.perimeter_corner_angle))
+            for i in range(len(poses) - 1):
+                if math.hypot(xy[i + 1][0] - xy[i][0], xy[i + 1][1] - xy[i][1]) > self.GAP_CUT_DISTANCE:
+                    cuts.add(i)
+                    cuts.add(i + 1)
+            start = 0
+            for cut in sorted(cuts) + [len(poses) - 1]:
+                seg = poses[start:cut + 1]
+                if len(seg) >= 3:
+                    segs.append(list(seg))
+                start = cut
+        # 【不變量 ①】閉合迴圈不得整段送出：切完仍有一段「起點與終點距離 <= goal_xy_tolerance」
+        # (轉角偵測一刀都沒切到時就是整圈)，在離起點最遠的航點切成兩段。這不是可調參數 ——
+        # 送出一個起點等於終點的目標然後宣告完成，是邏輯錯誤。
+        fixed = []
+        for seg in segs:
+            a, b = seg[0].pose.position, seg[-1].pose.position
+            if len(seg) >= 5 and math.hypot(b.x - a.x, b.y - a.y) <= self.goal_xy_tolerance:
+                far = max(range(len(seg)), key=lambda k: math.hypot(
+                    seg[k].pose.position.x - a.x, seg[k].pose.position.y - a.y))
+                self.get_logger().warn(
+                    f'⚠️ 周邊環繞有一段起點 = 終點 (閉合迴圈，{len(seg)} 個航點)，'
+                    f'在離起點最遠的航點 {far} 切成兩段')
+                fixed += [seg[:far + 1], seg[far:]]
+            else:
+                fixed.append(seg)
         edges = []
-        for seg in self.cut_on_direction_change(poses):
+        for seg in fixed:
             sub = Path()
             sub.header.frame_id = header.frame_id
             sub.header.stamp = header.stamp
@@ -1229,10 +1367,56 @@ class MowerManager(Node):
             self.stop_robot()
             return
         path, label = self._swath_queue[self._current_swath_idx]
-        self._current_label = label
         self._mission_state = MissionStatus.STATE_EXECUTING
+        # 【兩階段，階段 38 決定 1】每一段 (含 approach) 先原地對正，對正成功之後才送那一段本身。
+        # 原因：DWB 在段落開頭是「邊前進邊轉」(vx 0.70 + wz 1.2 的弧)，新車車頭在旋轉中心前方 0.975 m，
+        # 同一個弧讓車頭角撞牆 / 頂住箱子 (docs/stage38_collision_brief.md)。
+        if self._aligned_idx != self._current_swath_idx and self.send_align(path, label):
+            return
+        self._current_label = label
         self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
         self.send_path_to_nav2(path, label)
+
+    # 對正階段用的控制器與 goal checker (階段 38 決定 1)，要與 nav2_params.yaml 一致
+    ALIGN_CONTROLLER = 'AlignController'
+    ALIGN_GOAL_CHECKER = 'align_goal_checker'
+    # 取路徑方向時，跳過起點附近這個距離以內的航點 (第一步太短，方向不穩)
+    ALIGN_HEADING_LOOKAHEAD = 0.2
+
+    def send_align(self, path, label):
+        """送出對正 goal：原地 (車子當下位置) 轉到這一段的行進方向。送出了回傳 True。
+
+        目標是單一位姿 (當下 xy、段落方向)，用 AlignController (max_vel_x = 0，只能原地轉)
+        與 align_goal_checker (yaw 0.10、stateful false)。**不要**改用 approach_goal_checker：
+        它不檢查朝向，目標又在當下位置，送出的瞬間就會假成功。
+        查不到車子位置時不對正、直接送那一段 (與 maybe_insert_approach 的處理一致：警告並放行)。
+        """
+        if len(path.poses) < 2:
+            return False
+        p0 = path.poses[0].pose.position
+        far = next((q.pose.position for q in path.poses[1:]
+                    if math.hypot(q.pose.position.x - p0.x, q.pose.position.y - p0.y)
+                    >= self.ALIGN_HEADING_LOOKAHEAD), path.poses[-1].pose.position)
+        yaw = math.atan2(far.y - p0.y, far.x - p0.x)
+        xy = self.get_robot_pose_in_map()
+        if xy is None:
+            self.get_logger().warn(f'⚠️ [{label}] 查不到車子位置，這一段不對正、直接送出')
+            return False
+        target = Path()
+        target.header.frame_id = path.header.frame_id or 'map'
+        target.header.stamp = self.get_clock().now().to_msg()
+        pose = PoseStamped()
+        pose.header = target.header
+        pose.pose.position.x, pose.pose.position.y = xy[0], xy[1]
+        pose.pose.orientation.z, pose.pose.orientation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        target.poses = [pose]
+        self._align_phase = True
+        self._current_label = f'對正 → {label}'
+        self.get_logger().info(
+            f'↪️ 對正 [{label}]：原地轉到 {math.degrees(yaw):.1f}° (位置 {xy[0]:.2f}, {xy[1]:.2f})')
+        self.send_path_to_nav2(target, label, controller_id=self.ALIGN_CONTROLLER,
+                               goal_checker_id=self.ALIGN_GOAL_CHECKER)
+        return True
 
     def log_mission_summary(self, ended_early=False):
         """任務結束時印一份摘要：總段數 / 完成 / 跳過，以及每個跳過段落的座標。
@@ -1288,6 +1472,25 @@ class MowerManager(Node):
             GoalStatus.STATUS_CANCELED: 'CANCELED',
             GoalStatus.STATUS_ABORTED: 'ABORTED',
         }.get(status, f'STATUS_{status}')
+
+        # ---- 0. 對正階段的結果 (階段 38 決定 1) ----
+        # 取消 (急停 / 離開 mode 1) 不在這裡處理：往下走第 1 條，行為與訊息一個位元都不變。
+        if self._align_phase and not (self._cancelling or status == GoalStatus.STATUS_CANCELED):
+            self._align_phase = False
+            if status == GoalStatus.STATUS_SUCCEEDED:
+                self._aligned_idx = self._current_swath_idx
+                self._current_label = label
+                self.get_logger().info(f'✅ 對正完成 [{label}]')
+                self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
+                self.send_path_to_nav2(path, label)
+                return
+            # 對正失敗 = 該段失敗，走下面既有的跳過邏輯 (計入 max_consecutive_failures)。
+            # 原地旋轉不平移，progress checker (只看平移) 15 s 一到就判 ABORTED —— 這幾乎一定是對正超時。
+            status_name = 'ALIGN_TIMEOUT'
+            self.get_logger().error(
+                f'⏱️ [{label}] 對正超時 (原地旋轉 15 s 內沒有完成；progress checker 只看平移，'
+                f'原地旋轉期間永遠看不到進展) —— 視為這一段失敗')
+        self._align_phase = False
 
         # ---- 1. 主動取消：維持原本的行為與訊息 ----
         if self._cancelling or status == GoalStatus.STATUS_CANCELED:
@@ -1381,7 +1584,7 @@ class MowerManager(Node):
     APPROACH_GOAL_CHECKER = 'approach_goal_checker'
     DEFAULT_GOAL_CHECKER = 'general_goal_checker'
 
-    def send_path_to_nav2(self, path_msg, label=''):
+    def send_path_to_nav2(self, path_msg, label='', controller_id=None, goal_checker_id=None):
         """將一條割草線打包成 Action Goal 交給 Nav2 底層控制器。
 
         label 決定要用哪一個 goal checker：
@@ -1405,8 +1608,8 @@ class MowerManager(Node):
         # 建立 FollowPath 的目標請求
         goal_msg = FollowPath.Goal()
         goal_msg.path = path_msg
-        goal_msg.controller_id = 'FollowPath' # 呼叫 Nav2 預設的循跡控制器
-        goal_msg.goal_checker_id = (
+        goal_msg.controller_id = controller_id or 'FollowPath'  # 對正階段用 AlignController
+        goal_msg.goal_checker_id = goal_checker_id or (
             self.APPROACH_GOAL_CHECKER if label == 'approach'
             else self.DEFAULT_GOAL_CHECKER)
 
@@ -1485,6 +1688,8 @@ class MowerManager(Node):
                 queue = [(e, f'周邊環繞 {i + 1}/{n_edges}')
                          for i, e in enumerate(perimeter_edges)]
                 queue += [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
+                # 【不變量 ②】起點等於終點的段落不得送出 (見 drop_closed_segments)
+                queue = self.drop_closed_segments(queue)
                 # 【不在這裡插 approach】
                 # 「車子離下一段的起點太遠就先開過去」這件事，以前在三個地方
                 # 各寫一份 (任務開頭的 approach、環繞結束的銜接段、

@@ -3,22 +3,26 @@
     <xacro:include filename="car_inertia.xacro"/>
     <xacro:property name="PI" value="3.1415926535897931"/>
 
-    <!-- 車體與輪子尺寸來自 vehicle.yaml (car_base.xacro 載入的 vehicle) -->
-    <xacro:property name="body_length" value="${vehicle['body_length']}"/>
-    <xacro:property name="body_width" value="${vehicle['body_width']}"/>
-    <xacro:property name="body_height" value="${vehicle['body_height']}"/>
-
-    <xacro:property name="wheel_radius" value="${vehicle['wheel_radius']}"/>
+    <!-- 輪子尺寸來自 vehicle.yaml (car_base.xacro 載入的 vehicle)。
+         階段 38：XLK X2RS = 後兩輪差速驅動 + 前兩個腳輪 (照片確認，可自由轉向)。
+         階段 37 以前前輪建成固定方向的從動輪，原地旋轉時前輪被迫側滑，
+         摩擦 mu >= 1.0 就完全轉不動 (報告 30.4) —— 那是建模假象，不是物理限制。 -->
+    <xacro:property name="rear_wheel_radius" value="${vehicle['rear_wheel_radius']}"/>
+    <xacro:property name="rear_wheel_width" value="${vehicle['rear_wheel_width']}"/>
     <xacro:property name="wheel_separation" value="${vehicle['wheel_separation']}"/>
-    <xacro:property name="wheel_width" value="0.1"/> 
-    <xacro:property name="wheel_mass" value="1.0"/> 
-    
-    <xacro:macro name="visual_wheel" params="prefix">
-        <link name="${prefix}_wheel">
+    <xacro:property name="front_wheel_radius" value="${vehicle['front_wheel_radius']}"/>
+    <xacro:property name="front_wheel_width" value="${vehicle['front_wheel_width']}"/>
+    <xacro:property name="caster_track" value="${vehicle['caster_track']}"/>
+    <xacro:property name="caster_trail" value="${vehicle['caster_trail']}"/>
+    <xacro:property name="wheel_mass" value="1.0"/>
+
+    <!-- ================= 後輪 (驅動) ================= -->
+    <xacro:macro name="add_rear_wheel" params="prefix y_reflect">
+        <link name="${prefix}_rear_wheel">
             <visual>
                 <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
                 <geometry>
-                    <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+                    <cylinder radius="${rear_wheel_radius}" length="${rear_wheel_width}"/>
                 </geometry>
                 <material name="black">
                     <color rgba="0.1 0.1 0.1 1.0"/>
@@ -27,23 +31,16 @@
             <collision>
                 <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
                 <geometry>
-                    <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+                    <cylinder radius="${rear_wheel_radius}" length="${rear_wheel_width}"/>
                 </geometry>
             </collision>
-            <xacro:cylinder_inertia m="${wheel_mass}" r="${wheel_radius}" h="${wheel_width}" o_rpy="${PI/2} 0 0"/>
+            <xacro:cylinder_inertia m="${wheel_mass}" r="${rear_wheel_radius}" h="${rear_wheel_width}" o_rpy="${PI/2} 0 0"/>
         </link>
-    </xacro:macro>
-
-    <xacro:macro name="add_rear_wheel" params="prefix y_reflect">
-        <xacro:visual_wheel prefix="${prefix}_rear" />
-        <!-- y = +-wheel_separation/2；z 讓輪子剛好著地 = wheel_radius - base_link 離地高度。
-             以前 y 是 body_width/2 + wheel_width/2 + 0.01、z 寫死 -0.26 (= 0.17 - 0.43)，
-             量測值一換就會與 diff_drive 的 wheel_separation 對不上 / 輪子懸空或陷地。
-             x = +-0.35 (軸距 0.70) 仍然寫死：vehicle.yaml 的 wheelbase 還是 TBD。 -->
+        <!-- base_link 就在後輪軸中心：x = 0、z = 0，y = ±wheel_separation/2 -->
         <joint name="${prefix}_rear_wheel_joint" type="continuous">
             <parent link="base_link"/>
             <child link="${prefix}_rear_wheel"/>
-            <origin xyz="-0.35 ${y_reflect * wheel_separation / 2} ${wheel_radius - (car_height / 2.0 + ground_height)}" rpy="0 0 0"/>
+            <origin xyz="0 ${y_reflect * wheel_separation / 2} 0" rpy="0 0 0"/>
             <axis xyz="0 1 0"/>
         </joint>
 
@@ -54,24 +51,60 @@
     <xacro:add_rear_wheel prefix="left"  y_reflect="1" />
     <xacro:add_rear_wheel prefix="right" y_reflect="-1" />
 
-    <xacro:macro name="add_front_wheel" params="prefix y_reflect">
-        <xacro:visual_wheel prefix="${prefix}_front" />
-        <joint name="${prefix}_front_wheel_joint" type="continuous">
+    <!-- ================= 前輪 (腳輪) ================= -->
+    <!-- 每側兩個關節：
+           caster_swivel_joint  continuous，繞 z 軸 (垂直)，自由轉向
+           caster_roll_joint    continuous，繞 y 軸，滾動
+         轉軸 (swivel) 在滾動軸前方 caster_trail (後傾偏移 0.02 m)：輪子拖在轉軸後面才會自動回正，
+         沒有這段偏移 Gazebo 裡腳輪會抖。【caster_trail 是建模值，不是實測值】。
+         滾動軸位置：x = wheelbase (前輪最前凸點 = wheelbase + front_wheel_radius = front_extent)，
+         離地 front_wheel_radius。轉軸高度取滾動軸上方 front_wheel_radius (叉架高度，建模值)。
+         腳輪接地摩擦低 (mu 0.1 / mu2 0.05)：它只承重，不提供牽引。 -->
+    <xacro:macro name="add_caster" params="prefix y_reflect">
+        <link name="${prefix}_caster_swivel">
+            <xacro:cylinder_inertia m="0.2" r="0.02" h="0.02"/>
+        </link>
+        <joint name="${prefix}_caster_swivel_joint" type="continuous">
             <parent link="base_link"/>
+            <child link="${prefix}_caster_swivel"/>
+            <origin xyz="${wheelbase + caster_trail} ${y_reflect * caster_track / 2} ${front_wheel_radius - rear_r + front_wheel_radius}" rpy="0 0 0"/>
+            <axis xyz="0 0 1"/>
+        </joint>
+
+        <link name="${prefix}_front_wheel">
+            <visual>
+                <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+                <geometry>
+                    <cylinder radius="${front_wheel_radius}" length="${front_wheel_width}"/>
+                </geometry>
+                <material name="black">
+                    <color rgba="0.1 0.1 0.1 1.0"/>
+                </material>
+            </visual>
+            <collision>
+                <origin xyz="0 0 0" rpy="${PI/2} 0 0"/>
+                <geometry>
+                    <cylinder radius="${front_wheel_radius}" length="${front_wheel_width}"/>
+                </geometry>
+            </collision>
+            <xacro:cylinder_inertia m="${wheel_mass}" r="${front_wheel_radius}" h="${front_wheel_width}" o_rpy="${PI/2} 0 0"/>
+        </link>
+        <joint name="${prefix}_caster_roll_joint" type="continuous">
+            <parent link="${prefix}_caster_swivel"/>
             <child link="${prefix}_front_wheel"/>
-            <origin xyz="0.35 ${y_reflect * wheel_separation / 2} ${wheel_radius - (car_height / 2.0 + ground_height)}" rpy="0 0 0"/>
+            <origin xyz="${-caster_trail} 0 ${-front_wheel_radius}" rpy="0 0 0"/>
             <axis xyz="0 1 0"/>
         </joint>
 
         <gazebo reference="${prefix}_front_wheel">
-            <mu1>0.1</mu1>      
-            <mu2>0.0</mu2>      
-            <kp>1000000.0</kp>  
-            <kd>100.0</kd>    
-            <minDepth>0.001</minDepth>  
+            <mu1>0.1</mu1>
+            <mu2>0.05</mu2>
+            <kp>1000000.0</kp>
+            <kd>100.0</kd>
+            <minDepth>0.001</minDepth>
         </gazebo>
     </xacro:macro>
 
-    <xacro:add_front_wheel prefix="left"  y_reflect="1" />
-    <xacro:add_front_wheel prefix="right" y_reflect="-1" />
+    <xacro:add_caster prefix="left"  y_reflect="1" />
+    <xacro:add_caster prefix="right" y_reflect="-1" />
 </robot>

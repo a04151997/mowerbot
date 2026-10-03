@@ -44,17 +44,21 @@ def straight_path(x0, y0, n=20, step=0.1):
 
 
 def main():
-    # mower_manager 的 footprint 與刀盤寬沒有預設值 (階段 30)，
-    # 照 mower_control.launch.py 一樣從 vehicle.yaml 傳進去。
-    import os
-    import yaml
+    # mower_manager 的淨空門檻與刀盤寬沒有預設值 (階段 30 / 38)，
+    # 照 mower_control.launch.py 一樣從 vehicle_geometry 傳進去。
+    from mowerbot_description import vehicle_geometry
+    g = vehicle_geometry.load()
+    import os, yaml
     from ament_index_python.packages import get_package_share_directory
-    with open(os.path.join(get_package_share_directory('mowerbot_description'),
-                           'config', 'vehicle.yaml')) as fh:
-        vehicle = yaml.safe_load(fh)
+    with open(os.path.join(get_package_share_directory('mowerbot_bringup'), 'config',
+                           'nav2_params.yaml')) as fh:
+        xy_tol = float(yaml.safe_load(fh)['controller_server']['ros__parameters']
+                       ['general_goal_checker']['xy_goal_tolerance'])
     rclpy.init(args=['--ros-args'] + [
-        a for k in ('footprint_length', 'footprint_width', 'blade_width')
-        for a in ('-p', '%s:=%r' % (k, vehicle[k]))])
+        a for k in ('lateral_half_extent', 'rotation_swept_radius',
+                    'soft_inflation_radius', 'blade_width',
+                    'perimeter_corner_window', 'perimeter_corner_angle')
+        for a in ('-p', '%s:=%r' % (k, getattr(g, k)))] + ['-p', 'goal_xy_tolerance:=%r' % xy_tol])
     node = MowerManager()
     node.latest_boundary = big_boundary()
     node.latest_obstacles = []

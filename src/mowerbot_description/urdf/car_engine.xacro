@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <!-- 汽油引擎 (Honda GCVxe200) 的遮擋實體 (階段 38 第 7 節)。
+         沒有這個方塊時模擬的光達會看到實車看不到的東西，模擬 SLAM 會不真實地樂觀。
+         前後中心 = 曲軸 = 刀盤中心 (同心)，由 blade_offset_x 推導 (engine_center_x xacro 參數)；
+         尺寸與高度是暫定值 (vehicle.yaml 的 engine_*，照片估計)。現場目視確認實機光達沒有被擋，
+         所以引擎頂暫取低於光達；光達高度量出來之後，遮擋與否由模型自己反映。
+         碰撞幾何是重點 (光達的射線打得到它)；質量只給 0.1 kg 佔位，整車質量仍是 vehicle.yaml 的 mass
+         (Gazebo 會把沒有 inertial 的 link 連同碰撞一起丟掉，所以一定要有)。 -->
+    <xacro:property name="engine_h" value="${vehicle['engine_top_z_ground'] - vehicle['engine_bottom_z_ground']}"/>
+    <link name="engine">
+        <visual>
+            <geometry>
+                <box size="${vehicle['engine_length']} ${vehicle['engine_width']} ${engine_h}"/>
+            </geometry>
+            <material name="dark_red">
+                <color rgba="0.5 0.1 0.1 0.9"/>
+            </material>
+        </visual>
+        <collision>
+            <geometry>
+                <box size="${vehicle['engine_length']} ${vehicle['engine_width']} ${engine_h}"/>
+            </geometry>
+        </collision>
+        <xacro:box_inertia m="0.1" w="${vehicle['engine_length']}" h="${vehicle['engine_width']}" d="${engine_h}"/>
+    </link>
+    <joint name="engine_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="engine"/>
+        <!-- engine_*_z_ground 是離地高度，base_link 離地 rear_r -->
+        <origin xyz="${engine_center_x} 0 ${(vehicle['engine_bottom_z_ground'] + vehicle['engine_top_z_ground']) / 2.0 - rear_r}"/>
+    </joint>
+    <gazebo reference="engine">
+        <material>Gazebo/DarkGrey</material>
+    </gazebo>
+</robot>

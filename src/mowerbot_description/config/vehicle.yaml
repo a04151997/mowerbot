@@ -1,30 +1,142 @@
-# 車輛幾何的單一來源 (階段 30)
+# 車輛幾何的單一來源 (階段 30；階段 38 改成 XLK X2RS 實車)
 #
-# 實測值(目前為暫定,待實機量測後更新)
+# 讀這個檔案的唯一入口：mowerbot_description/vehicle_geometry.py 的 load()。它會：
+#   1. 檢查每一個值在 provenance 都有對應項 (measured / measured_coarse / provisional / derived)
+#      measured_coarse 還必須在 uncertainty 有誤差值；缺一個就拒絕
+#   2. 由這裡的原始值推導所有衍生量 (軸距、footprint、三個半徑、headland、光達 z ...)
+#   3. 誤差傳遞 (propagate_uncertainty)：headland 在誤差範圍內必須是同一個值，否則拒絕
+#   4. 產生 PROVISIONAL / COARSE / DERIVED-RANGE 蓋章 —— 依 provenance 動態產生，全部 measured 時自動消失
+# 衍生值一律用算的，不要在任何地方寫死，也不要寫進這個檔案。
 #
-# 實機量測之後只改這個檔案，然後重新 colcon build。
-# 讀這個檔案的地方：
-#   - URDF (car_base.xacro / car_wheels.xacro)：車體方塊、輪子、diff_drive plugin
-#   - navigation.launch.py：local_costmap 的 footprint
-#   - mower_control.launch.py：mower_manager 的淨空檢查與刀盤寬
-#   - bringup_real.launch.py：bridge_node 的輪半徑與輪距
-#   - test/smoke_test.py、test/tools/ 下的工具
+# 座標系 (階段 38)：base_link = 後輪軸中心 (前輪是腳輪，純差速的瞬時旋轉中心就在這裡)。
+#   x 朝前、y 朝左、z 朝上；base_footprint 是 base_link 在地面的投影。
 #
-# 衍生值一律用算的，不要在任何地方寫死：
-#   inscribed_radius     = footprint_width / 2
-#   circumscribed_radius = sqrt((footprint_length/2)^2 + (footprint_width/2)^2)
+# ⚠ 原廠規格是 0.98 × 0.73 × 0.46 m，下面的實測值比較大，是因為本機加裝了鋁架。
+#   footprint 一律用實測值，不得改用原廠值 —— 鋁架就是實際會撞到障礙物的部分。
+#   (寫在這裡是為了避免日後有人看到原廠規格，以為實測值量錯了。)
 #
-# 【標註】每一項後面註明「量測值」或「暫定值」。
-# 目前全部是暫定值：真車確認是後兩輪差速驅動 + 前兩輪固定方向從動輪，
-# 輪徑、輪距、軸距即將重新量測。量完一項就把該項改成「量測值」。
+# 量完一項：改值、改 provenance、colcon build。每一項怎麼量見 docs/measurement_worklist.md (同名小節)。
 
-wheel_radius:        0.17    # 暫定值。後輪(驅動輪)半徑
-wheel_separation:    0.58    # 暫定值。後輪中心距 (URDF 的輪子擺在 +-wheel_separation/2)
-wheelbase:           TBD     # 暫定值。前後軸距，待量 (URDF 目前前後輪 x = +-0.35，尚未讀這一項)
-footprint_length:    0.95    # 暫定值。footprint 長 (nav2 footprint、淨空檢查)
-footprint_width:     0.68    # 暫定值。輪外緣到輪外緣
-body_length:         0.95    # 暫定值。視覺用 (URDF 車體方塊)
-body_width:          0.46    # 暫定值。視覺用 (URDF 車體方塊)
-body_height:         0.46    # 暫定值。視覺用 (URDF 車體方塊)
-blade_width:         0.50    # 暫定值。刀盤寬 (mower_manager 的割草線間距與覆蓋判定)
-mass:                73.4    # 暫定值。整車質量 kg (車體 57.2 + 電池 16.2)
+# ========== 實測 ==========
+# 原話：「左後輪中心到右後輪中心是 61 cm」，量法明確。
+wheel_separation:     0.610
+# 原話：「前輪凸出的地方到後面凸出的地方 113 cm」，說法肯定。(原廠 0.98，差在鋁架)
+body_length_total:    1.130
+# 照片確認：可自由轉向的萬向腳輪
+front_wheel_type:     caster
+
+# ========== 粗略實測 (原始說法是範圍) ==========
+# 原話：「圓心到黑色外框最外面大概 15-16 cm」，是範圍不是單點。
+# 這是靜態幾何半徑 (輪心到胎面最外緣)，不是承載後的滾動半徑；兩者差異見 measurement_worklist.md。
+rear_wheel_radius:    0.155
+# 原話：「前輪大概是 9-10 cm，連胎紋突出算進去，前輪胎紋凸出比較少半徑約 10 cm」。
+# 注意：它在 footprint 推導裡會完全抵消 (見 vehicle_geometry.py)，不影響 footprint。
+front_wheel_radius:   0.100
+# 原話：「這樣大概是 84 cm，因為有那些鐵架」。⚠ 原廠規格 0.73，實測較大是因為加裝鋁架。
+body_width_total:     0.840
+# 後輪軸中心 → 刀盤旋轉中心，實測範圍 0.35 ~ 0.40。刀盤藏在機殼下方，無法直接定位圓心。
+blade_offset_x:       0.375
+# 實測後輪區域到光達約 30 ~ 32 cm (捲尺台寸刻度換算，1 台寸 ≈ 3.03 cm)。
+# ⚠ 量測基準點 (後輪輪心 / 鋁架後緣 / 胎面最後端) 尚未確認，三者相差可達 15.5 cm，
+#   所以 uncertainty 設 0.08 涵蓋。確認基準後應可收斂到 ±0.02。
+lidar_x:              0.30
+
+# ========== 原廠規格 ==========
+# 原廠規格表「割幅：約 50 公分」，圓盤 4 支刀組，0.50 為掃掠直徑。原廠寫「約」，所以仍跑敏感度掃描。
+blade_width:          0.50
+# 原廠：車體 57.2 kg + 電池 16.2 kg。
+# ⚠ 本機加裝鋁架、兩顆減速馬達、編碼器、迷你電腦、光達、控制板，實際應為 82 ~ 86 kg。
+#   基線仍用 73.4 以隔離變數，另有單獨的質量探測跑測 (報告 38 節)。
+mass:                 73.4
+
+# ========== 暫定 (未量測) ==========
+# ⚠ body_height / lidar_z_ground 經過一次自洽性修正 (2026-10-02)：
+#   原本 0.70 / 0.55 是兩次獨立的照片目測，彼此矛盾 —— 光達掃描面落在車體方塊裡，
+#   模擬中車體會遮蔽自身光達 (360 條射線全打在方塊內壁)。照片中光達明確裝在鋁架頂端。
+#   修正後光達在車體方塊上方 0.05 m。兩個仍然都是照片目測，不是量測值。
+#   lidar_z_ground 仍是 measurement_worklist 的第一優先。
+#   vehicle_geometry.py 有跨參數斷言：光達掃描面落在車體方塊高度範圍內就拒絕啟動。
+# 方塊頂面離地 = 鋁架甲板高度 (照片目測)。原廠車身 0.46。只影響 URDF 方塊與慣量。
+body_height:          0.50
+# 光達掃描平面離地，位於鋁架甲板之上 (照片目測，未量測)。現有兩次量測都是俯視拍攝，無法取得高度。
+# 必須從側面量「地面 → 光達開口中線」。base_link 相對高度 = lidar_z_ground - rear_wheel_radius (由載入器推導)。
+lidar_z_ground:       0.55
+
+# --- 以下是原本寫死在 xacro 裡、階段 38 依原則 1 / 6 移過來的暫定值 (都沒量過) ---
+# 汽油引擎 (Honda GCVxe200) 的碰撞方塊。前後中心 = 引擎曲軸 = 刀盤中心 (兩者同心)，
+# 所以不另設 x，由 blade_offset_x 推導。尺寸與高度為照片估計：
+#   現場目視確認實機光達「沒有」被引擎擋住，所以引擎頂暫取 0.50 (低於光達 0.55)。
+#   光達高度一旦量出來比引擎頂低，模型就會出現遮擋 (報告 38.7 有遮擋角與高度的關係)。
+engine_length:          0.35
+engine_width:           0.45
+engine_bottom_z_ground: 0.25
+engine_top_z_ground:    0.50
+# 質心：水平取車體幾何中心、高度沿用舊模型離地 0.25。決定後輪 / 腳輪載重分配 = 模擬牽引力。
+com_x:                0.41
+com_height:           0.25
+# 腳輪左右間距 (轉軸中心到中心)，暫用後輪輪距。
+caster_track:         0.61
+# 腳輪後傾偏移 (trail)：Gazebo 建模值，不是實測值；沒有它腳輪在模擬裡會抖。
+caster_trail:         0.02
+# 輪寬 (胎面寬)
+rear_wheel_width:     0.10
+front_wheel_width:    0.05
+# 車體方塊離地高度 (方塊底面)，只影響 URDF 方塊。
+body_ground_clearance: 0.20
+
+provenance:
+  wheel_separation:       measured
+  body_length_total:      measured
+  front_wheel_type:       measured
+  rear_wheel_radius:      measured_coarse
+  front_wheel_radius:     measured_coarse
+  body_width_total:       measured_coarse
+  blade_offset_x:         measured_coarse
+  lidar_x:                measured_coarse
+  blade_width:            measured
+  mass:                   measured
+  body_height:            provisional
+  lidar_z_ground:         provisional
+  engine_length:          provisional
+  engine_width:           provisional
+  engine_bottom_z_ground: provisional
+  engine_top_z_ground:    provisional
+  com_x:                  provisional
+  com_height:             provisional
+  caster_track:           provisional
+  caster_trail:           provisional
+  rear_wheel_width:       provisional
+  front_wheel_width:      provisional
+  body_ground_clearance:  provisional
+
+# measured_coarse 的誤差 (±，公尺)。誤差傳遞見 vehicle_geometry.propagate_uncertainty()。
+uncertainty:
+  rear_wheel_radius:   0.005
+  front_wheel_radius:  0.005
+  body_width_total:    0.005
+  blade_offset_x:      0.025
+  lidar_x:             0.08
+
+# provisional / measured_coarse 項目的影響程度 (high / medium / low)，用於橫幅、蓋章與量測優先順序。
+impact:
+  blade_width:            high
+  lidar_x:                high
+  lidar_z_ground:         high
+  rear_wheel_radius:      medium
+  body_width_total:       medium
+  body_length_total:      medium
+  blade_offset_x:         medium
+  mass:                   medium
+  front_wheel_radius:     low     # footprint 推導中會抵消
+  body_height:            low
+  engine_top_z_ground:    high    # 高過光達掃描面就會遮擋
+  engine_width:           medium  # 遮擋時的角度寬度
+  engine_length:          low
+  engine_bottom_z_ground: low
+  com_x:                  medium  # 後輪 / 腳輪載重分配
+  com_height:             low
+  caster_track:           low
+  caster_trail:           low
+  rear_wheel_width:       low
+  front_wheel_width:      low
+  body_ground_clearance:  low

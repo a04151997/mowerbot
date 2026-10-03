@@ -1,17 +1,42 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="mowerbot">
 
-    <!-- 車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml (階段 30) -->
+    <!-- 車輛幾何的單一來源：mowerbot_description/config/vehicle.yaml (階段 30)。
+         衍生量 (軸距、前後伸出量、側向半寬) 不在 xacro 裡重算，由
+         vehicle_geometry.xacro_mappings() 當 xacro 參數傳進來 (階段 38)，公式只有一份。
+         直接跑 xacro 而沒有帶這些參數時會失敗，這是刻意的。 -->
     <xacro:property name="vehicle" value="${xacro.load_yaml('$(find mowerbot_description)/config/vehicle.yaml')}"/>
+    <xacro:arg name="wheelbase" default=""/>
+    <xacro:arg name="front_extent" default=""/>
+    <xacro:arg name="rear_extent" default=""/>
+    <xacro:arg name="lateral_half_extent" default=""/>
+    <xacro:arg name="lidar_z" default=""/>
+    <xacro:arg name="engine_center_x" default=""/>
+    <xacro:property name="wheelbase" value="${float('$(arg wheelbase)')}"/>
+    <xacro:property name="front_extent" value="${float('$(arg front_extent)')}"/>
+    <xacro:property name="rear_extent" value="${float('$(arg rear_extent)')}"/>
+    <xacro:property name="lateral_half_extent" value="${float('$(arg lateral_half_extent)')}"/>
+    <!-- 光達相對 base_link 的高度 = lidar_z_ground - rear_wheel_radius；引擎中心 x = 刀盤中心 (曲軸同心) -->
+    <xacro:property name="lidar_z" value="${float('$(arg lidar_z)')}"/>
+    <xacro:property name="engine_center_x" value="${float('$(arg engine_center_x)')}"/>
 
-    <xacro:property name="car_length" value="${vehicle['body_length']}"/>
-    <xacro:property name="car_width" value="${vehicle['body_width']}"/>
-    <xacro:property name="car_height" value="${vehicle['body_height']}"/>
+    <!-- base_link = 後輪軸中心 (階段 38)。前輪是腳輪，純差速的瞬時旋轉中心就在這裡。
+         base_footprint 是它在地面的投影，base_link 離地 rear_wheel_radius。 -->
+    <xacro:property name="rear_r" value="${vehicle['rear_wheel_radius']}"/>
     <xacro:property name="car_mass" value="${vehicle['mass']}"/>
-    <xacro:property name="ground_height" value="0.2"/>
+    <!-- 車體方塊：前後涵蓋整個 footprint (-rear_extent ~ front_extent)，左右 ±lateral_half_extent，
+         上下從 body_ground_clearance 到 body_height (都是離地)。
+         camera / imu 的位置以它為準 (car_camera.xacro / car_imu.xacro)。 -->
+    <xacro:property name="car_length" value="${front_extent + rear_extent}"/>
+    <xacro:property name="car_width" value="${2.0 * lateral_half_extent}"/>
+    <xacro:property name="body_center_x" value="${(front_extent - rear_extent) / 2.0}"/>
+    <xacro:property name="body_bottom_z" value="${vehicle['body_ground_clearance'] - rear_r}"/>
+    <xacro:property name="body_top_z" value="${vehicle['body_height'] - rear_r}"/>
+    <xacro:property name="car_height" value="${body_top_z - body_bottom_z}"/>
 
     <xacro:include filename="car_inertia.xacro"/>
     <xacro:include filename="car_wheels.xacro"/>
+    <xacro:include filename="car_engine.xacro"/>
 
     <material name="yellow">
         <color rgba="0.9 0.6 0.0 0.7"/>
@@ -21,23 +46,46 @@
 
     <link name="base_link">
         <visual>
+            <origin xyz="${body_center_x} 0 ${(body_bottom_z + body_top_z) / 2.0}"/>
             <geometry>
                 <box size="${car_length} ${car_width} ${car_height}"/>
             </geometry>
             <material name="yellow"/>
         </visual>
+        <!-- 光達掃描面不得落在這個方塊的高度範圍內 (vehicle_geometry.py 啟動斷言)，
+             否則模擬中車體會遮蔽自身光達。 -->
         <collision>
+            <origin xyz="${body_center_x} 0 ${(body_bottom_z + body_top_z) / 2.0}"/>
             <geometry>
                 <box size="${car_length} ${car_width} ${car_height}"/>
             </geometry>
         </collision>
-        <xacro:box_inertia m="${car_mass}" w="${car_length}" h="${car_width}" d="${car_height}" o_xyz="0 0 -0.18"/>
+        <!-- 質心 (com_x, com_height) 是暫定值，決定後輪 / 腳輪的載重分配 = 模擬裡的牽引力 -->
+        <xacro:box_inertia m="${car_mass}" w="${car_length}" h="${car_width}" d="${car_height}"
+                           o_xyz="${vehicle['com_x']} 0 ${vehicle['com_height'] - rear_r}"/>
     </link>
 
     <joint name="base_to_footprint" type="fixed">
         <parent link="base_footprint"/>
         <child link="base_link"/>
-        <origin xyz="0.0 0.0 ${car_height / 2.0 + ground_height}" rpy="0 0 0"/>
+        <origin xyz="0.0 0.0 ${rear_r}" rpy="0 0 0"/>
+    </joint>
+
+    <!-- 刀片 (階段 38)：後輪軸前方 blade_offset_x，貼地。只發 TF (覆蓋率用刀片軌跡算)，沒有碰撞。 -->
+    <link name="blade_link">
+        <visual>
+            <geometry>
+                <cylinder radius="${vehicle['blade_width'] / 2.0}" length="0.005"/>
+            </geometry>
+            <material name="grey">
+                <color rgba="0.5 0.5 0.5 0.4"/>
+            </material>
+        </visual>
+    </link>
+    <joint name="blade_joint" type="fixed">
+        <parent link="base_link"/>
+        <child link="blade_link"/>
+        <origin xyz="${vehicle['blade_offset_x']} 0 ${-rear_r}" rpy="0 0 0"/>
     </joint>
 
     <gazebo>
@@ -45,19 +93,19 @@
         <left_joint>left_rear_wheel_joint</left_joint>
         <right_joint>right_rear_wheel_joint</right_joint>
         <wheel_separation>${vehicle['wheel_separation']}</wheel_separation>
-        <wheel_diameter>${2 * vehicle['wheel_radius']}</wheel_diameter>
-        <max_wheel_torque>200</max_wheel_torque> 
+        <wheel_diameter>${2 * rear_r}</wheel_diameter>
+        <max_wheel_torque>200</max_wheel_torque>
         <max_wheel_acceleration>3.0</max_wheel_acceleration>
         <command_topic>cmd_vel</command_topic>
         <odometry_topic>odom</odometry_topic>
         <odometry_frame>odom</odometry_frame>
-        
+
         <robot_base_frame>base_footprint</robot_base_frame>
 
         <update_rate>30</update_rate>
         <publish_odom>true</publish_odom>
         <publish_odom_tf>true</publish_odom_tf>
-        
+
         <publish_wheel_tf>false</publish_wheel_tf>
     </plugin>
     </gazebo>

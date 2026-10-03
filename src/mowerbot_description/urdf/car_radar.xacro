@@ -4,12 +4,14 @@
     <xacro:property name="radar_radius" value="0.1"/>
     <xacro:property name="radar_height" value="0.1"/>
 
-    <!-- 雷達偏移量 -->
-    <xacro:property name="radar_joint_x" value="0.0"/>
+    <!-- 雷達偏移量 (相對 base_link = 後輪軸中心)。階段 38：
+         x = vehicle.yaml lidar_x (measured_coarse 0.30 ± 0.08，量測基準點未確認)
+         z = lidar_z_ground - rear_wheel_radius (lidar_z_ground 0.55 是 provisional，未量測)
+         實車由 allow_provisional 閘門擋住，模擬放行。量測任務見 docs/measurement_worklist.md。
+         (階段 37 以前是舊 base_link (車體中心) 上方 0.45 m，用來避開相機頂端) -->
+    <xacro:property name="radar_joint_x" value="${vehicle['lidar_x']}"/>
     <xacro:property name="radar_joint_y" value="0.0"/>
-    <!-- 抬高到 0.45：雷達佔據 z = 0.40 ~ 0.50，完全高於相機頂端的 0.31，
-         避免 360 度掃描一直掃到車頭前方 0.455m 的相機 -->
-    <xacro:property name="radar_joint_z" value="0.45"/>
+    <xacro:property name="radar_joint_z" value="${lidar_z}"/>
 
     <!-- 顏色 -->
     <material name="blue">

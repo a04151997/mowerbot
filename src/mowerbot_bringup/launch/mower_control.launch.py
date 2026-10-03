@@ -1,4 +1,3 @@
-import math
 import os
 
 import yaml
@@ -11,30 +10,29 @@ from launch.conditions import IfCondition
 # 注意：SetParameter 位於 launch_ros.actions 之中
 from launch_ros.actions import Node, SetParameter
 
-def check_headland(context, vehicle, nav2_params_path):
+from mowerbot_action.manager import DEFAULT_OVERLAP_RATIO, WAYPOINT_SPACING
+from mowerbot_description import vehicle_geometry
+
+def check_headland(context, geom, nav2_params_path):
     """斷言 headland_width >= 外接半徑 + xy_goal_tolerance (階段 31)。
 
-    headland 0.70 是階段 21 由「外接半徑 0.5841 + xy_goal_tolerance 0.10，再進位」決定的，
-    沒辦法自動跟著車輛幾何算 (進位是判斷)。所以不自動算，而是在啟動時檢查：
-    vehicle.yaml 改了之後外接半徑變大、headland 沒跟著改，就在這裡直接失敗。
-    xy_goal_tolerance 取 general_goal_checker 的 —— 它決定割草線終點「停在哪裡算到了」。
+    階段 38 起 headland_width 不再是 launch 參數，而是 vehicle_geometry 由幾何推導：
+      ceil((rotation_swept_radius + TURN_MARGIN 0.12) / 0.05) x 0.05 = 1.20 m
+    f2c_server 自己另有一道 headland >= rotation_swept_radius + 0.10 的斷言 (階段 38 規格)。
+    這一道保留，因為它看的是 nav2 的 xy_goal_tolerance (它決定割草線終點「停在哪裡算到了」)：
+    之後有人放寬 xy_goal_tolerance 而 TURN_MARGIN 沒跟著改，就在這裡直接失敗。
     """
-    headland = float(LaunchConfiguration('headland_width').perform(context))
     with open(nav2_params_path) as fh:
         nav2 = yaml.safe_load(fh)
     xy_tol = float(nav2['controller_server']['ros__parameters']
                    ['general_goal_checker']['xy_goal_tolerance'])
-    circumscribed = math.hypot(vehicle['footprint_length'] / 2.0,
-                               vehicle['footprint_width'] / 2.0)
-    need = circumscribed + xy_tol
-    if headland < need:
+    need = geom.rotation_swept_radius + xy_tol
+    if geom.headland_width < need:
         raise RuntimeError(
-            '車輛幾何變更後 headland 未同步更新：headland_width = %.4f m，'
-            '但外接半徑 %.4f m (vehicle.yaml footprint %.3f x %.3f) + xy_goal_tolerance %.2f m '
-            '= %.4f m。請重新決定 headland_width (mower_control.launch.py 與 f2c_server.cpp '
-            '的預設值)，見 docs/hardware_bringup.md「車輛幾何」一節。'
-            % (headland, circumscribed, vehicle['footprint_length'],
-               vehicle['footprint_width'], xy_tol, need))
+            'headland_width = %.4f m (vehicle_geometry 推導) 小於 '
+            'rotation_swept_radius %.4f m + xy_goal_tolerance %.2f m = %.4f m。'
+            'xy_goal_tolerance 放寬了的話，vehicle_geometry.TURN_MARGIN 要跟著重新決定。'
+            % (geom.headland_width, geom.rotation_swept_radius, xy_tol, need))
     return []
 
 
@@ -44,9 +42,12 @@ def generate_launch_description():
     description_dir = get_package_share_directory('mowerbot_description')
     bridge_dir = get_package_share_directory('mowerbot_bridge')
 
-    # 車輛幾何的單一來源 (階段 30)
-    with open(os.path.join(description_dir, 'config', 'vehicle.yaml')) as fh:
-        vehicle = yaml.safe_load(fh)
+    # 車輛幾何的單一來源 (階段 30；階段 38 起一律經過 vehicle_geometry.load())
+    geom = vehicle_geometry.load()
+    # 起點 = 終點的判定門檻 = nav2 general_goal_checker 的 xy_goal_tolerance (單一來源，階段 38)
+    with open(os.path.join(bringup_dir, 'config', 'nav2_params.yaml')) as fh:
+        goal_xy_tolerance = float(yaml.safe_load(fh)['controller_server']['ros__parameters']
+                                  ['general_goal_checker']['xy_goal_tolerance'])
 
     # 2. 宣告 Launch 參數
     use_sim_time = LaunchConfiguration('use_sim_time', default='true')
@@ -123,8 +124,12 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': use_sim_time,
-            # 地頭寬度，預設與跑道長度 L 相同，讓跑道剛好落在地頭裡
-            'headland_width': LaunchConfiguration('headland_width'),
+            # 地頭寬度：由車輛幾何推導 (階段 38)，不是 launch 參數、也沒有寫死的預設值。
+            # rotation_swept_radius 給 f2c_server 做啟動斷言 (headland >= 它 + 0.10)。
+            'headland_width': geom.headland_width,
+            'rotation_swept_radius': geom.rotation_swept_radius,
+            'headland_min_margin': vehicle_geometry.HEADLAND_MIN_MARGIN,
+            'waypoint_spacing': WAYPOINT_SPACING,
         }]
     )
 
@@ -140,10 +145,18 @@ def generate_launch_description():
             'lead_in_length': LaunchConfiguration('lead_in_length'),
             # 割草線重疊率，讓實測可以掃不同數值而不用重建
             'overlap_ratio': LaunchConfiguration('overlap_ratio'),
-            # 車體 footprint 與刀盤寬：來自 vehicle.yaml，淨空門檻由 manager 自己算
-            'footprint_length': vehicle['footprint_length'],
-            'footprint_width': vehicle['footprint_width'],
-            'blade_width': vehicle['blade_width'],
+            # 淨空門檻與刀盤寬：全部來自 vehicle_geometry (階段 38)，manager 不自己算幾何。
+            #   lateral_half_extent    直線通過的門檻 (body_width_total / 2)
+            #   rotation_swept_radius  要原地旋轉的點的門檻 (後輪軸到車頭角的距離)
+            #   soft_inflation_radius  跑道離內部障礙物的門檻 (= local_costmap 的 inflation_radius)
+            'lateral_half_extent': geom.lateral_half_extent,
+            'rotation_swept_radius': geom.rotation_swept_radius,
+            'soft_inflation_radius': geom.soft_inflation_radius,
+            'blade_width': geom.blade_width,
+            # 周邊環繞的轉角偵測 (vehicle_geometry) 與起點 = 終點的判定門檻 (nav2)
+            'perimeter_corner_window': geom.perimeter_corner_window,
+            'perimeter_corner_angle': geom.perimeter_corner_angle,
+            'goal_xy_tolerance': goal_xy_tolerance,
         }]
     )
 
@@ -169,25 +182,18 @@ def generate_launch_description():
         # 0 代表零重疊 (間距 = 刀盤寬)。
         DeclareLaunchArgument(
             'overlap_ratio',
-            default_value='0.4',
+            default_value=str(DEFAULT_OVERLAP_RATIO),
             description='Swath overlap ratio. Swath spacing = blade_width * '
                         '(1 - overlap_ratio). 0 means no overlap.'
         ),
 
-        # F2C 地頭 (headland) 寬度，單位公尺，0 代表停用地頭。
-        # 階段 21 從 0.5 改成 0.70：地頭要能容納車子原地掉頭，
-        # 而外接半徑就有 0.5841 m (見 f2c_server.cpp 的推導)。
-        DeclareLaunchArgument(
-            'headland_width',
-            default_value='0.70',
-            description='Headland width in metres. Swaths are generated on the '
-                        'field shrunk by this margin. 0 disables the headland.'
-        ),
+        # F2C 地頭 (headland) 寬度：階段 38 起不再是 launch 參數，由車輛幾何推導
+        # (vehicle_geometry.headland_width = 1.20 m，推導見 f2c_server.cpp 與 vehicle_geometry.py)。
 
-        # headland 與車輛幾何的一致性斷言 (階段 31)。放在所有節點之前，
+        # headland 與 xy_goal_tolerance 的一致性斷言 (階段 31)。放在所有節點之前，
         # 不成立時整個 launch 在啟動任何節點之前就失敗。
         OpaqueFunction(function=check_headland, args=[
-            vehicle, os.path.join(bringup_dir, 'config', 'nav2_params.yaml')]),
+            geom, os.path.join(bringup_dir, 'config', 'nav2_params.yaml')]),
 
         # 【核心修正】全域設定模擬時間參數
         SetParameter(name='use_sim_time', value=use_sim_time),

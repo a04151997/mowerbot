@@ -15,9 +15,16 @@
 
 <prefix>_traj.csv 的欄位：
 
-    t, x, y, label, odom_vx, odom_wz, cmd_vx, cmd_wz, cmd_age, yaw
+    t, x, y, label, odom_vx, odom_wz, cmd_vx, cmd_wz, cmd_age, yaw, blade_x, blade_y
 
+  第一行是註解行 (以 # 開頭)：vehicle.yaml 還有暫定值時寫 PROVISIONAL 蓋章 (階段 38)，
+  全部 measured 時沒有這一行。讀檔的工具要先濾掉 # 開頭的行。
+
+  x, y  /odom 的位置 = base_footprint (階段 38 起是後輪軸中心的投影；以前是車體中心)。
   yaw  /odom 的朝向 (rad)（階段 29 新增在最後一欄，原本 9 欄的位置與意義不變）。
+  blade_x, blade_y  刀片中心 (blade_link) 的位置 (階段 38 新增，前 10 欄不變)。
+       offset 在開始時從 TF (base_footprint -> blade_link，URDF 的固定關節) 查一次，
+       每一筆用同一筆 /odom 的位姿轉過去，所以與 x / y / yaw 完全同一個時刻。
        車子被擋住時 twist 會抖，把 odom_wz 積分回去得不到可靠的朝向，所以直接錄。
 
   odom_vx / odom_wz  /odom 的 twist，車子**實際**的線速度與角速度
@@ -35,7 +42,7 @@
   欄位 x, y，依原順序。coverage_budget.py 用它算「規劃上涵蓋了哪裡」，
   讓 E2a 只由計畫決定、不受軌跡影響。多輪規劃時存最後一輪。
 """
-import csv, math, sys, time, numpy as np, rclpy
+import csv, math, os, sys, time, numpy as np, rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
@@ -53,6 +60,30 @@ LIMIT = float(_pos[1]) if len(_pos) > 1 else 1500.0
 MAP_ONLY = '--map-only' in sys.argv
 NO_DRIVE = '--no-drive' in sys.argv
 rclpy.init(); n = Node('coverage_run')
+# 輸出蓋章 (階段 38)：依 vehicle.yaml 的 provenance 動態產生，全部 measured 時是空字串
+from mowerbot_description import vehicle_geometry
+GEOM = vehicle_geometry.load()
+STAMP = GEOM.stamp()
+if STAMP:
+    print(STAMP)
+# 刀片相對 base_footprint 的固定偏移：從 TF 查 (驗證 URDF 的 blade_link 確實存在)，
+# 查不到就停 —— 不要安靜地退回寫死的數字。
+import tf2_ros
+from rclpy.time import Time as _Time
+_tfbuf = tf2_ros.Buffer(); _tfl = tf2_ros.TransformListener(_tfbuf, n)
+blade_off = None
+_t0 = time.time()
+while blade_off is None and time.time() - _t0 < 30.0:
+    rclpy.spin_once(n, timeout_sec=0.2)
+    try:
+        _tr = _tfbuf.lookup_transform('base_footprint', 'blade_link', _Time())
+        blade_off = (_tr.transform.translation.x, _tr.transform.translation.y)
+    except Exception:
+        pass
+if blade_off is None:
+    sys.exit('30 秒內查不到 base_footprint -> blade_link 的 TF (URDF 沒有 blade_link？)')
+print('blade_link 偏移 (base_footprint 座標) = (%.4f, %.4f)，vehicle.yaml blade_offset_x = %.4f'
+      % (blade_off[0], blade_off[1], GEOM.blade_offset_x))
 qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                  reliability=ReliabilityPolicy.RELIABLE)
 odom, maps, bnds = [], [], []
@@ -70,11 +101,26 @@ def on_odom(m):
     pose['y'] = m.pose.pose.position.y
     pose['yaw'] = math.atan2(2*(q.w*q.z), 1-2*(q.z*q.z))
     now = time.time()
+    c, s_ = math.cos(pose['yaw']), math.sin(pose['yaw'])
+    bx = pose['x'] + c * blade_off[0] - s_ * blade_off[1]
+    by = pose['y'] + s_ * blade_off[0] + c * blade_off[1]
     odom.append((now, pose['x'], pose['y'], state['label'],
                  m.twist.twist.linear.x, m.twist.twist.angular.z,
                  cmd['vx'], cmd['wz'], now - cmd['t'] if cmd['t'] else 999.0,
-                 pose['yaw']))
+                 pose['yaw'], bx, by))
 n.create_subscription(Odometry, '/odom', on_odom, 50)
+# map -> odom 每秒取樣一次 (階段 38)：模擬的 odom 是完美的，map -> odom 偏離 (0,0,0) 多少
+# 就是定位 (slam_toolbox 定位模式的掃描匹配) 漂了多少。用來看引擎遮擋 / 光達自身回波的影響。
+mapodom = []
+def _sample_mapodom():
+    try:
+        tr = _tfbuf.lookup_transform('map', 'odom', _Time())
+        q = tr.transform.rotation
+        mapodom.append((time.time(), tr.transform.translation.x, tr.transform.translation.y,
+                        math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))))
+    except Exception:
+        pass
+n.create_timer(1.0, _sample_mapodom)
 n.create_subscription(OccupancyGrid, '/map', lambda m: maps.append(m), qos)
 plans = []
 n.create_subscription(Path, '/f2c_path', lambda m: plans.append(
@@ -115,8 +161,11 @@ else:
     print('切 mode 2，開車繞一圈建圖...'); mode(2)
     # 3 m 見方的小方塊就夠：雷達 12 m，在 12x12 的草坪中央就看得到所有牆面。
     # 走 6 m 會直接頂到牆，車子還會停在角落轉不了身。
+    # COV_MAP_SIDE_S：方塊每邊直走的秒數 (預設 6.5 s ≈ 2.9 m)。小場地 (demo_lawn_small，6 m 見方) 用 3.0 s，
+    # 否則車頭 0.975 m 會頂到牆 (階段 38 後續 6)。
+    side_s = float(os.environ.get('COV_MAP_SIDE_S', '6.5'))
     for _ in range(4):
-        drive(0.45, 0.0, 6.5); drive(0.0, 0.6, 2.6); drive(0.0, 0.0, 0.6)
+        drive(0.45, 0.0, side_s); drive(0.0, 0.6, 2.6); drive(0.0, 0.0, 0.6)
     drive(0.0, 0.0, 2.0)
 
     print('開回場中央 (用 odom 的實際朝向)...')
@@ -142,7 +191,7 @@ if MAP_ONLY:
     rclpy.shutdown()
     sys.exit(0)
 
-del odom[:]
+del odom[:]; del mapodom[:]
 print('切 mode 1 開始覆蓋任務...'); mode(1)
 t0 = time.time(); last = 0
 while time.time()-t0 < LIMIT:
@@ -159,18 +208,31 @@ print('任務結束：state=%d 完成 %d/%d 跳過 %d，耗時 %.0f s'
       % (state['state'], state['done'], state['total'], state['skipped'], time.time()-t0))
 mode(2)
 with open(OUT + '_traj.csv', 'w', newline='') as fh:
+    if STAMP:
+        fh.write(''.join('# %s\n' % l for l in STAMP.splitlines()))
     w = csv.writer(fh)
     w.writerow(['t', 'x', 'y', 'label',
-                'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz', 'cmd_age', 'yaw'])
+                'odom_vx', 'odom_wz', 'cmd_vx', 'cmd_wz', 'cmd_age', 'yaw',
+                'blade_x', 'blade_y'])
     for r in odom:
         w.writerow(['%.3f' % r[0], '%.4f' % r[1], '%.4f' % r[2], r[3],
                     '%.4f' % r[4], '%.4f' % r[5],
-                    '%.4f' % r[6], '%.4f' % r[7], '%.3f' % r[8], '%.4f' % r[9]])
+                    '%.4f' % r[6], '%.4f' % r[7], '%.3f' % r[8], '%.4f' % r[9],
+                    '%.4f' % r[10], '%.4f' % r[11]])
 with open(OUT + '_plan.csv', 'w', newline='') as fh:
+    if STAMP:
+        fh.write(''.join('# %s\n' % l for l in STAMP.splitlines()))
     w = csv.writer(fh)
     w.writerow(['x', 'y'])
     for px, py in (plans[-1] if plans else []):
         w.writerow(['%.4f' % px, '%.4f' % py])
+with open(OUT + '_mapodom.csv', 'w', newline='') as fh:
+    if STAMP:
+        fh.write(''.join('# %s\n' % l for l in STAMP.splitlines()))
+    w = csv.writer(fh)
+    w.writerow(['t', 'x', 'y', 'yaw'])
+    for r in mapodom:
+        w.writerow(['%.3f' % r[0], '%.4f' % r[1], '%.4f' % r[2], '%.5f' % r[3]])
 print('已存 %s_plan.csv (收到 /f2c_path %d 次，最後一次 %d 個航點)'
       % (OUT, len(plans), len(plans[-1]) if plans else 0))
 m = maps[-1]

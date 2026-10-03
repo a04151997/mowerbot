@@ -15,8 +15,13 @@ controller_server:
     min_theta_velocity_threshold: 0.001
     failure_tolerance: 0.3
     progress_checker_plugin: "progress_checker"
-    goal_checker_plugins: ["general_goal_checker", "approach_goal_checker"]
-    controller_plugins: ["FollowPath"]
+    goal_checker_plugins: ["general_goal_checker", "approach_goal_checker", "align_goal_checker"]
+    # AlignController (階段 38 決定 1)：每段開始前先原地對正的控制器。
+    # navigation.launch.py 在啟動時從下面 FollowPath 注入它負責的鍵：critic 權重、max_vel_x = 0.0
+    # (只能原地轉)、xy_goal_tolerance。這樣兩個控制器的 critic 權重永遠是同一份。
+    # 其餘的鍵沿用 FollowPath，除非下面的 AlignController 區塊自己寫了 (注入不會蓋掉它們，見後續 5)。
+    # max_vel_x = 0 是**收緊**速度限制 (上限從 0.7 降到 0)，不是放寬，因此不違反速度限制的凍結條件。
+    controller_plugins: ["FollowPath", "AlignController"]
 
     # 割草機速度慢，進度檢查的時間給寬一點，避免正常慢速前進被誤判成卡住
     progress_checker:
@@ -52,11 +57,49 @@ controller_server:
     # 對 approach 來說「到了沒」只該看位置：刀盤是關的，朝向沒有作業意義，
     # 下一段的對齊本來就由 DWB 的 PathAlign / PathDist 在那一段裡處理。
     # 所以 yaw 容忍設成 3.15 rad (> pi)，等於不檢查朝向。
+    # 對正段落專用 (階段 38 決定 1)。**不要重用 approach_goal_checker**：它的 yaw 容忍 3.15 rad
+    # 等於不檢查朝向，對正目標又就在車子當下位置 —— 送出的瞬間就會假成功，一度都沒轉。
+    align_goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      # xy_goal_tolerance 不寫在這裡：navigation.launch.py 從 approach_goal_checker 注入 (沿用 0.10，單一來源)
+      #
+      # yaw_goal_tolerance = 0.10 是【實驗值，非推導值】。
+      # 依據：docs/stage38_align_and_perimeter.md 與 simulation_results.md 38.13 的容忍值掃描
+      #   (0.03 / 0.05 / 0.10 各 5 次：收斂 2/5、3/5、4/5；成功後 1 s 的最終誤差 0.16~0.17 / 0.15~0.17 / 0.09~0.12)。
+      #   本模擬的停止精度約 0.15 rad，容忍值訂在它以下沒有意義。
+      #   由幾何推導的 0.048 rad 是系統做不到的數字，已棄用。
+      # ⚠ 這是【模擬限制下的值】，不是物理上的最佳值。模擬的低角速度行為已知不可信
+      #   (低速死區、停不住、旋轉中心漂移)；實機量到原地旋轉角速度與停止精度後必須重新定案。
+      yaw_goal_tolerance: 0.10
+      # stateful 必須是 false：對正的重點就是朝向，latch 掉 xy 之後只檢查 yaw 看似無害，
+      # 但 stateful 已經讓 approach 假成功過一次 (階段 25)，這裡不冒險。
+      stateful: false
+
     approach_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.10
       yaw_goal_tolerance: 3.15
       stateful: true
+
+    # AlignController 自己的鍵 (注入不歸它管的部分；權重 / max_vel_x / xy_goal_tolerance 寫在這裡會被注入蓋掉並印 WARN)
+    AlignController:
+      # 對正階段的角速度下限 (階段 38 後續 4 / 6)。
+      # 實車的減速馬達有靜摩擦 (stiction)，85 kg 的車對 0.06 rad/s 的命令多半也轉不動；
+      # 「對正時角速度要有下限」很可能是實車上的真實需求，但這個值仍需實機驗證。
+      # 目前 0.0 = 不作用 (與加入前的行為完全相同)。理由 (simulation_results.md 38.17)：
+      #   在本檔的 yaw 容忍 0.10 下，0.3 收斂 1/5、0.5 收斂 0/5，都沒達到採用標準 (>= 4/5)，
+      #   而且比不設 (9/15) 還差。展示用設定 (yaw 容忍 0.25 + 0.3) 由
+      #   test/tools/stage38_demo_run.sh 0.25 <目錄>  搭配  ALIGN_MST=0.3  重現；
+      #   yaw 容忍不能在本檔改成 0.25：N7 的判準直接讀它，改了等於放寬測試。
+      min_speed_theta: 0.0
+      # 這個值在這裡【不是速度限制】,而是一道開關。
+      # DWB 的 isValidSpeed() 要求「平移 < min_speed_xy」且
+      # 「|θ| < min_speed_theta」同時成立才剔除取樣。
+      # AlignController 的 max_vel_x = 0,平移恆為 0、恆小於 0.01,
+      # 所以第一個條件永遠成立,min_speed_theta 才會真正作用。
+      # 它不改變任何速度上限,FollowPath 完全未動。
+      # (前提 max_vel_x == 0 由 navigation.launch.py 的啟動斷言檢查，不成立就 abort。)
+      min_speed_xy: 0.01
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
@@ -89,10 +132,9 @@ controller_server:
       linear_granularity: 0.05
       angular_granularity: 0.025
       transform_tolerance: 0.2
-      # 與上面 general_goal_checker 同步收緊 (理由見該處註解)。
-      # DWB 自己也有一份 xy_goal_tolerance，兩處不一致時行為會不好預期，
-      # 所以兩邊都要改。
-      xy_goal_tolerance: 0.10
+      # xy_goal_tolerance 不寫在這裡 (階段 38 單一來源)：DWB 自己也有一份，兩處不一致時
+      # 行為會不好預期 —— 以前靠註解「兩邊都要改」維持，現在由 navigation.launch.py
+      # 直接把 general_goal_checker.xy_goal_tolerance 注入 FollowPath.xy_goal_tolerance，值不變 (0.10)。
       trans_stopped_velocity: 0.25
       short_circuit_trajectory_evaluation: true
       stateful: true
@@ -139,10 +181,11 @@ local_costmap:
       height: 5
       resolution: 0.05
 
-      # 車體 footprint 不寫在這裡 (階段 30)：由 navigation.launch.py 從
-      # mowerbot_description/config/vehicle.yaml 的 footprint_length / footprint_width
-      # 算出 [[L/2, W/2], [L/2, -W/2], [-L/2, -W/2], [-L/2, W/2]] 再傳給 local_costmap。
-      # 寬度要算到輪子外緣 (輪外緣到輪外緣)。
+      # 車體 footprint 不寫在這裡 (階段 30 / 38)：由 navigation.launch.py 從
+      # mowerbot_description/vehicle_geometry.py 取真實四角多邊形再傳給 local_costmap。
+      # base_link = 後輪軸中心：[[0.975, 0.42], [0.975, -0.42], [-0.155, -0.42], [-0.155, 0.42]]。
+      # costmap 從它自動算出內接半徑 0.155 (inflation 的 inscribed 帶) 與外接半徑 1.06。
+      # 不要改用 robot_radius。
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -166,9 +209,11 @@ local_costmap:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
         cost_scaling_factor: 3.0
-        # 車體內切半徑 0.34 m，膨脹半徑不能設太大，
-        # 否則割草機無法貼近邊界作業
-        inflation_radius: 0.45
+        # inflation_radius 不寫在這裡 (階段 38)：由 navigation.launch.py 注入
+        # vehicle_geometry.SOFT_INFLATION_RADIUS (0.45)。manager 的跑道離障礙物門檻、
+        # Phase Q 讀同一個值；這裡再寫一份 launch 會直接拒絕啟動。
+        # 定位是「柔性避讓」，不是安全保證 (docs/architecture.md「footprint 不對稱」一節)：
+        # 內接半徑 0.155 只決定 cost 253 的帶寬，0.45 必須 > 側向半寬 0.42 梯度才延伸得到車身邊緣。
 
 lifecycle_manager_navigation:
   ros__parameters:

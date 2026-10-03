@@ -6,10 +6,12 @@ bridge_node 只透過 base.MotorDriver 的介面跟驅動板講話，
 
 from .base import MotorDriver, DriverError          # noqa: F401
 from .loopback import LoopbackDriver                # noqa: F401
+from .wheeltec import WheeltecDriver                # noqa: F401
 
 # driver_type 參數 -> 類別。接上真實驅動板時在這裡多一行。
 DRIVERS = {
     'loopback': LoopbackDriver,
+    'wheeltec': WheeltecDriver,
 }
 
 

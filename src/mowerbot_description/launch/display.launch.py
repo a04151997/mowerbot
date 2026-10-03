@@ -6,6 +6,8 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 import xacro
 
+from mowerbot_description import vehicle_geometry
+
 def generate_launch_description():
     pkg_name = 'mowerbot_description'
     
@@ -19,7 +21,8 @@ def generate_launch_description():
 
     # 2. 取得 xacro 檔案路徑並解析
     xacro_file = os.path.join(get_package_share_directory(pkg_name), 'urdf', 'car.xacro')
-    robot_description_config = xacro.process_file(xacro_file).toxml()
+    robot_description_config = xacro.process_file(
+        xacro_file, mappings=vehicle_geometry.load().xacro_mappings()).toxml()
 
     # RViz 設定檔 (Fixed Frame = map，含覆蓋路徑/邊界/costmap 等 display)
     rviz_config = os.path.join(get_package_share_directory(pkg_name), 'rviz', 'mowerbot.rviz')

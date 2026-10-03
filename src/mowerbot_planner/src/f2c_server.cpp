@@ -4,6 +4,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <cmath>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -19,28 +20,39 @@ public:
     F2CServer() : Node("f2c_server") {
         // 地頭 (headland) 寬度，單位公尺。
         //
-        // 為什麼需要：沒有地頭時，F2C 的第 1 條割草線距離邊界只有半個刀盤寬
-        // (0.25 m)，但車體半寬是 0.34 m (輪外緣 +-0.34)。在開闊地測試看不出問題，
-        // 但真實草地的邊界是牆或圍籬時，第 1 條與最後 1 條割草線會落在 costmap
-        // 的膨脹層裡 (inflation_radius 0.45)，車子根本進不去。
-        // 而且 mower_manager 的跑道 (lead-in) 會往割草線起點的後方延伸，
-        // 也需要這塊空間，否則跑道會跑到邊界外。
+        // 為什麼需要：沒有地頭時，F2C 的第 1 條割草線距離邊界只有半個割草線間距，
+        // 車體會壓出邊界；而且地頭存在的目的就是提供掉頭空間 (階段 21，報告 17 節)。
         //
-        // 【階段 21：0.5 -> 0.70，理由是量出來的】
-        // 地頭存在的目的就是提供掉頭空間，但原本的 0.5 m 比車子的迴轉圓還小：
-        //   車體 footprint 0.95 x 0.68 -> 外接半徑 sqrt(0.475^2+0.34^2) = 0.5841 m
-        // 也就是說車子開到割草線起點之後，原地轉 180 度時四個角會掃到邊界外。
-        // 實車那次就是這樣卡住的 (詳見報告 17 節)。
+        // 【階段 38：由車輛幾何推導，不再寫死】
+        // 舊值 0.70 = 舊車外接半徑 0.5841 + 0.10 再進位 (階段 21)。
+        // 階段 38 換成 XLK X2RS，base_link 移到後輪軸中心 (前輪是腳輪，原地旋轉繞後輪軸)，
+        // 原地旋轉時車頭角掃出的半徑 rotation_swept_radius = hypot(0.975, 0.42) = 1.0616 m。
+        //   headland_width = ceil((rotation_swept_radius + TURN_MARGIN 0.12) / 0.05) x 0.05 = 1.20 m
+        //   TURN_MARGIN 0.12 沿用舊值 0.70 - 0.5841 ≈ 0.1159 的同等絕對餘裕。
+        // 公式只在 mowerbot_description/vehicle_geometry.py 算一次，由 mower_control.launch.py
+        // 當參數傳進來 (這個節點是 C++，不另外讀 vehicle.yaml，免得公式有兩份)。
+        // 這裡沒有預設值：沒傳就在 get_parameter 時失敗，不要安靜地用一個寫死的數字。
         //
-        // 新的值 = 外接半徑 0.5841 + xy_goal_tolerance 0.10 = 0.6841，進位到 0.70。
-        // 那 0.10 是因為車子停在上一段終點時本來就允許差 xy_goal_tolerance，
-        // 它可能停在更靠近邊界的一側。
-        //
-        // 代價 (用實車那張地圖量的)：作業面積 107.16 -> 99.04 m^2 (-7.6%)，
-        // 割草線 36 -> 35 條。這是正確的取捨：
-        // 少割一圈，好過規劃出一個車子轉不出來的點。
-        // 設 0 時停用地頭，維持加入這個功能之前的行為。
-        this->declare_parameter<double>("headland_width", 0.70);
+        // 代價：地頭從 0.70 變 1.20，作業面積一定會減少 (報告 38 節量化)。
+        // 不要為了覆蓋率去調小它 —— 少割一圈，好過規劃出一個車子轉不出來的點。
+        this->declare_parameter("headland_width", rclcpp::PARAMETER_DOUBLE);
+        this->declare_parameter("rotation_swept_radius", rclcpp::PARAMETER_DOUBLE);
+        this->declare_parameter("headland_min_margin", rclcpp::PARAMETER_DOUBLE);
+        // 割草線與周邊環繞的航點間距 (manager 的 approach / 跑道用同一個值)，沒有預設值
+        this->declare_parameter("waypoint_spacing", rclcpp::PARAMETER_DOUBLE);
+        {
+            // 啟動斷言 (階段 38)：headland_width >= rotation_swept_radius + 0.10，不滿足直接中止
+            const double hw = this->get_parameter("headland_width").as_double();
+            const double rs = this->get_parameter("rotation_swept_radius").as_double();
+            const double mm = this->get_parameter("headland_min_margin").as_double();
+            if (hw < rs + mm - 1e-9) {
+                RCLCPP_FATAL(this->get_logger(),
+                    "headland_width %.4f m < rotation_swept_radius %.4f m + %.2f m = %.4f m："
+                    "地頭容不下原地掉頭，拒絕啟動。",
+                    hw, rs, mm, rs + mm);
+                throw std::runtime_error("headland_width 小於 rotation_swept_radius + headland_min_margin");
+            }
+        }
 
         // 周邊環繞 (perimeter pass)：在弓字形割草線之前，先沿著作業區
         // (mainland) 的邊緣繞一圈。
@@ -214,7 +226,8 @@ private:
             // 每一段都不含終點 (下一段的起點就是它)，最後再補回起點把圈收起來：
             // 「最後一個航點的座標與第 0 個完全相同」就是 mower_manager
             // 用來辨識「這一段是環繞、不是割草線」的依據，不需要改 srv 介面。
-            const double kPerimeterSpacing = 0.1;
+            // 航點間距：mower_control.launch.py 從 mowerbot_action.manager.WAYPOINT_SPACING 傳入 (階段 38 單一來源)
+            const double kPerimeterSpacing = this->get_parameter("waypoint_spacing").as_double();
             size_t n_perimeter_clipped = 0;
             for (size_t i = 0; i + 1 < perimeter_pts.size(); ++i) {
                 const double x1 = perimeter_pts[i].first;
@@ -299,7 +312,7 @@ private:
                     // 以 0.1 公尺為間距線性補點。
                     // 所有內插點共用同一個 orientation，也就是這條 swath 的行進方向，
                     // 不要給單位四元數，否則控制器會以為車頭要一直朝向 +x。
-                    const double waypoint_spacing = 0.1;
+                    const double waypoint_spacing = this->get_parameter("waypoint_spacing").as_double();
                     const double dx = p2.getX() - p1.getX();
                     const double dy = p2.getY() - p1.getY();
                     const double swath_length = std::hypot(dx, dy);

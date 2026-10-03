@@ -36,7 +36,7 @@ def main():
             if m.group(1) == '1':
                 queue = {}
             queue[m.group(2)] = tuple(float(m.group(k)) for k in range(3, 7))
-    plan = [(float(r['x']), float(r['y'])) for r in csv.DictReader(open(run + '/run_plan.csv'))]
+    plan = [(float(r['x']), float(r['y'])) for r in csv.DictReader(l for l in open(run + '/run_plan.csv') if not l.startswith('#'))]
     per = next((plan[:i + 1] for i in range(1, len(plan)) if plan[i] == plan[0]), [])
 
     def px(x, y_):
