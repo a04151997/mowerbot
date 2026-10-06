@@ -99,11 +99,15 @@ else:
     st, ok, tot, sk, sec = -1, 0, 1, 0, 0
 c1 = st == 3
 c2 = tot > 0 and ok >= 0.9 * tot
-c3 = bool(cor) and float(cor.group(1)) < float(cor.group(2))
+# 2026-10-06 使用者授權改判準（解除凍結）：第 3 項改為「全程最小淨空 >= 0.15 m」(footprint_collision.py 的 CLEARANCE_OK)。
+# 舊的「前 2 m 車頭角 < 判準」量測保留，只當資訊印出，不參與 VERDICT。
+clr = re.search(r'CLEARANCE_OK=(yes|no) \(最小 ([\d.]+) m，門檻 ([\d.]+) m\)', rd('collision.txt'))
+c3 = bool(clr) and clr.group(1) == 'yes'
 print('1 最終狀態 DONE        : %s (state=%d)' % ('通過' if c1 else '未通過', st))
 print('2 完成段數 >= 90 %%     : %s (%d/%d = %.1f %%，跳過 %d)' % ('通過' if c2 else '未通過', ok, tot, 100.0 * ok / max(tot, 1), sk))
-print('3 前 2 m 車頭角 < 判準 : %s (%s)' % ('通過' if c3 else '未通過',
-      ('最大 %s m，判準 %s m' % (cor.group(1), cor.group(2))) if cor else '沒有取樣點'))
+print('3 最小淨空 >= 0.15 m  : %s (%s)' % ('通過' if c3 else '未通過',
+      ('最小 %s m，門檻 %s m' % (clr.group(2), clr.group(3))) if clr else '沒有淨空資料'))
+print('  (資訊，不計入) 舊判準 前 2 m 車頭角 : %s' % (('最大 %s m，舊判準 %s m' % (cor.group(1), cor.group(2))) if cor else '沒有取樣點'))
 print('4 全程無碰撞 (幾何)     : %s' % ('通過' if col else '未通過'))
 print('耗時 %d s；對正送出 %d 次、對正超時 %d 次' % (sec, n_align, n_to))
 print('VERDICT=%s' % ('PASS' if (c1 and c2 and c3 and col) else 'FAIL'))
