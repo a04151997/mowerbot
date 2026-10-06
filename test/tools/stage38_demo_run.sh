@@ -13,7 +13,8 @@
 #
 # nav2_params.yaml 只在這一趟期間暫時改 align_goal_checker / AlignController 的值，
 # 開始前備份、結束 (含中斷) 一律還原並重編 bringup。FollowPath 一個位元都不動 (結束時 cmp 檢查)。
-# 驗收 (四項)：最終狀態 DONE、完成段數 >= 90 %、前 2 m 車頭角 < 0.558 m、全程無碰撞 (幾何)。
+# 驗收 (四項)：最終狀態 DONE、完成段數 >= 90 %、全程最小淨空 >= MIN_CLEARANCE (預設 0.15 m，decisions 第 89 項)、全程無碰撞 (幾何)。
+# (判定段在 stage38_verdict.sh，可對既有輸出目錄單獨重跑；舊的前 2 m 車頭角量測只當覆蓋品質指標印出。)
 # ==========================================================================
 set -u
 TOL=${1:?yaw 容忍}; D=${2:?輸出目錄}
@@ -21,6 +22,7 @@ WS="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 mkdir -p "$D"; D="$(cd "$D" && pwd)"
 NP=$WS/src/mowerbot_bringup/config/nav2_params.yaml
 RUN_TIMEOUT=${RUN_TIMEOUT:-2400}
+MIN_CLEARANCE=${MIN_CLEARANCE:-0.15}   # 驗收第 3 項門檻 (m)，見 stage38_verdict.sh
 WORLD=${AB_WORLD:-demo_lawn.world}
 MAPN=${AB_MAP:-stage29_lawn}
 set +u; source /opt/ros/humble/setup.bash; source "$WS/install/setup.bash"; set -u
@@ -75,42 +77,5 @@ rc=$?; t1=$(date +%s)
 bash "$WS/test/logs/stage38/clean.sh" > /dev/null 2>&1
 log "ab_run 結束 rc=$rc，$((t1-t0)) s"
 
-# ---- 分析 ----
-W="$WS/src/mowerbot_bringup/worlds/$WORLD"
-python3 test/tools/footprint_collision.py "$D" --world "$W" > "$D/collision.txt" 2>&1
-python3 test/tools/corner_offset.py "$D" > "$D/corner.txt" 2>&1
-python3 test/tools/coverage_budget.py "$D/run" --log "$D/manager.log" --world "$W" --traj base \
-    --heatmap "$D/heatmap_base.png" > "$D/budget_base.txt" 2>&1
-python3 test/tools/coverage_budget.py "$D/run" --log "$D/manager.log" --world "$W" --traj blade \
-    --heatmap "$D/heatmap_blade.png" > "$D/budget_blade.txt" 2>&1
-python3 - "$D" > "$D/verdict.txt" <<'PY'
-import re, sys, os
-d = sys.argv[1]
-rd = lambda f: open(os.path.join(d, f), encoding='utf-8', errors='replace').read() if os.path.exists(os.path.join(d, f)) else ''
-end = re.search(r'任務結束：state=(\d+) 完成 (\d+)/(\d+) 跳過 (\d+)，耗時 (\d+) s', rd('coverage_run.log'))
-cor = re.search(r'【前 2\.0 m】.*?最大 ([\d.]+) m.*?= ([\d.]+) m', rd('corner.txt'))
-col = 'COLLISION_FREE=yes' in rd('collision.txt')
-mgr = rd('manager.log')
-n_align = mgr.count('對正 [')
-n_to = mgr.count('對正超時')
-if end:
-    st, ok, tot, sk, sec = int(end.group(1)), int(end.group(2)), int(end.group(3)), int(end.group(4)), int(end.group(5))
-else:
-    st, ok, tot, sk, sec = -1, 0, 1, 0, 0
-c1 = st == 3
-c2 = tot > 0 and ok >= 0.9 * tot
-# 2026-10-06 使用者授權改判準（解除凍結）：第 3 項改為「全程最小淨空 >= 0.15 m」(footprint_collision.py 的 CLEARANCE_OK)。
-# 舊的「前 2 m 車頭角 < 判準」量測保留，只當資訊印出，不參與 VERDICT。
-clr = re.search(r'CLEARANCE_OK=(yes|no) \(最小 ([\d.]+) m，門檻 ([\d.]+) m\)', rd('collision.txt'))
-c3 = bool(clr) and clr.group(1) == 'yes'
-print('1 最終狀態 DONE        : %s (state=%d)' % ('通過' if c1 else '未通過', st))
-print('2 完成段數 >= 90 %%     : %s (%d/%d = %.1f %%，跳過 %d)' % ('通過' if c2 else '未通過', ok, tot, 100.0 * ok / max(tot, 1), sk))
-print('3 最小淨空 >= 0.15 m  : %s (%s)' % ('通過' if c3 else '未通過',
-      ('最小 %s m，門檻 %s m' % (clr.group(2), clr.group(3))) if clr else '沒有淨空資料'))
-print('  (資訊，不計入) 舊判準 前 2 m 車頭角 : %s' % (('最大 %s m，舊判準 %s m' % (cor.group(1), cor.group(2))) if cor else '沒有取樣點'))
-print('4 全程無碰撞 (幾何)     : %s' % ('通過' if col else '未通過'))
-print('耗時 %d s；對正送出 %d 次、對正超時 %d 次' % (sec, n_align, n_to))
-print('VERDICT=%s' % ('PASS' if (c1 and c2 and c3 and col) else 'FAIL'))
-PY
-cat "$D/verdict.txt" | tee -a "$D/run.log"
-grep -a "覆蓋率 = \|扣掉 E1\|規劃可割" "$D/budget_base.txt" "$D/budget_blade.txt" | tee -a "$D/run.log"
+# ---- 分析 (判定段已搬到 stage38_verdict.sh，可單獨重跑) ----
+MIN_CLEARANCE="$MIN_CLEARANCE" bash "$WS/test/tools/stage38_verdict.sh" "$D" "$WORLD"
