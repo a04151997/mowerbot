@@ -686,8 +686,12 @@ ros2 launch mowerbot_bringup navigation.launch.py use_sim_time:=false
 ros2 lifecycle get /controller_server              # 要是 active
 ```
 
+   這時 log 要有 `光達停止區開啟：車頭前 0.40 m`，`ros2 lifecycle get /collision_monitor` 也要是 active。
 2. 按住 LB + B 切到自動割草（mode 1）。manager 會自己從地圖萃取邊界、呼叫 F2C 規劃、開始執行。
+   **整趟都要按住 LB**：放開 LB、手把斷線、光達斷線，車子都會停（`mower_manager` 印 `⏸️ 自動模式暫停`），
+   再按住就從原地接著走。停超過 15 秒，那一段會被當成失敗跳過。
 3. **第一趟刀盤不接電**，人跟在車旁邊，手放在急停上。
+   車頭前 0.40 m 內有東西會停車，但光達只看得到它那個高度（約 55 cm）的東西，比它矮的東西看不到。
 4. 第一趟正常跑完，才在第二趟接上刀盤。
 
 **預期**：`mower_manager` 的 log 依序出現 `邊界提取成功`、`📋 佇列`、`➡️ 送出任務`、`✅ ... 完成`；

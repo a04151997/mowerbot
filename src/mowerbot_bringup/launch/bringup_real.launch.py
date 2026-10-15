@@ -153,6 +153,10 @@ def generate_launch_description():
                 'use_sim_time': use_sim_time,
                 # 實車沒有 gazebo.launch.py 幫忙起 robot_state_publisher
                 'start_rsp': 'true',
+                # 自動模式的放行條件 (2026-10-15 will 決定)：實車一律開，不開放從命令列關掉。
+                # 放開 LB、手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
+                'auto_requires_deadman': 'true',
+                'auto_requires_scan': 'true',
             }.items()
         )
     ])

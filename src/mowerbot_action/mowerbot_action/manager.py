@@ -8,9 +8,10 @@ from geometry_msgs.msg import PolygonStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path
 from mowerbot_interfaces.srv import GenerateCoveragePath
-from mowerbot_interfaces.msg import ObstaclePolygons, MowerStatus, MissionStatus
+from mowerbot_interfaces.msg import ObstaclePolygons, MowerStatus, MissionStatus, JoyStatus
 from rclpy.action import ActionClient
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import FollowPath
 import rclpy
 from rclpy.node import Node
@@ -257,6 +258,39 @@ class MowerManager(Node):
         # 安全計時器 如果0.5秒內沒收到任何速度指令則停止馬達
         self.last_cmd_time = self.get_clock().now()
         self.watchdog_timeout = 0.5
+
+        # ---- 自動模式 (1 / 3) 的放行條件 (2026-10-15 will 決定) ----
+        # 自動模式以前完全不看手把：放開 LB 車子照跑，只有急停鍵 (RB) 停得下來。
+        # 現在 Nav2 的速度指令要同時滿足下面兩個條件才轉發，任何一個不成立就送零速度 (暫停)：
+        #   auto_requires_deadman  手把連線中而且 LB 按住 (看 teleop 發的 /joy_status，
+        #                          button index 只有 teleop 知道，理由見 JoyStatus.msg)
+        #   auto_requires_scan     光達 /scan 沒有中斷。Nav2 Humble 的 collision_monitor 在
+        #                          光達資料逾時的時候會「忽略這個來源、照常放行」(fail-open，
+        #                          nav2_collision_monitor source.cpp sourceValid)，所以光達斷掉
+        #                          要由這裡擋。沒有光達 SLAM 也定不了位，本來就不該自動走。
+        # 暫停不會取消 Nav2 的 goal、也不動佇列：重新按住 LB (或光達恢復) 就從原地接著走。
+        # 暫停超過 progress_checker 的 movement_time_allowance (15 s)，那一段會被 Nav2 判
+        # ABORTED，走既有的「跳過這一段」邏輯；連續 max_consecutive_failures 段就整個任務停止。
+        # 預設都是 true (安全的方向)。mower_control.launch.py 依 use_sim_time 決定：
+        # 實車 (use_sim_time:=false) 開、模擬關 (模擬沒有手把，Gazebo 的既有測試也不按 LB)。
+        self.declare_parameter('auto_requires_deadman', True)
+        self.declare_parameter('auto_requires_scan', True)
+        self.auto_requires_deadman = bool(self.get_parameter('auto_requires_deadman').value)
+        self.auto_requires_scan = bool(self.get_parameter('auto_requires_scan').value)
+        # /joy_status 5 Hz (LB 一變化 teleop 立刻多發一筆)、/scan 10 Hz：0.5 s 內沒有新資料就算中斷
+        self.auto_input_timeout = 0.5
+        self._joy_status = None
+        self._joy_status_time = None
+        self._scan_time = None
+        self._auto_block_prev = None    # 上一次的暫停原因，只在變化時印 log
+        self.joy_status_sub = self.create_subscription(
+            JoyStatus, '/joy_status', self.joy_status_cb, 10)
+        if self.auto_requires_scan:
+            self.scan_sub = self.create_subscription(
+                LaserScan, '/scan', self.scan_cb, qos_profile_sensor_data)
+        self.get_logger().info(
+            f'自動模式放行條件：按住 LB = {self.auto_requires_deadman}，'
+            f'光達 /scan 不中斷 = {self.auto_requires_scan}')
         # 發布者：發給真正的底盤驅動
         self.real_vel_pub = self.create_publisher(Twist, '/cmd_vel' ,10)
 
@@ -321,9 +355,45 @@ class MowerManager(Node):
     """
     def nav_vel_cb(self,msg):
         if self.current_mode == 1 or self.current_mode == 3:
-            self.publish_and_update(msg)
+            # 放行條件不成立 (沒按住 LB / 手把斷線 / 光達中斷) 就送零速度，不轉發
+            if self.auto_block_reason() is None:
+                self.publish_and_update(msg)
+            else:
+                self.stop_robot()
         elif self.current_mode == 4:
             self.handle_estop_violation('導航系統 (Nav2)')
+
+    def joy_status_cb(self, msg):
+        self._joy_status = msg
+        self._joy_status_time = self.get_clock().now()
+
+    def scan_cb(self, _msg):
+        # 用收到的時間，不用 header.stamp：只要判斷「光達還有沒有在送」，不受光達時間戳影響
+        self._scan_time = self.get_clock().now()
+
+    def _age(self, t):
+        return (self.get_clock().now() - t).nanoseconds / 1e9
+
+    def auto_block_reason(self):
+        """自動模式 (1 / 3) 現在不能動的原因；可以動時回傳 None。
+
+        失效方向是安全的：沒收過、收不到、逾時一律當成不能動。
+        """
+        if self.auto_requires_deadman:
+            if self._joy_status_time is None:
+                return '還沒收到 /joy_status (teleop 沒在跑？)'
+            if self._age(self._joy_status_time) > self.auto_input_timeout:
+                return '/joy_status 中斷 %.1f s (teleop 沒在跑？)' % self._age(self._joy_status_time)
+            if not self._joy_status.connected:
+                return '手把斷線'
+            if not self._joy_status.deadman_held:
+                return '沒有按住 LB'
+        if self.auto_requires_scan:
+            if self._scan_time is None:
+                return '還沒收到光達 /scan'
+            if self._age(self._scan_time) > self.auto_input_timeout:
+                return '光達 /scan 中斷 %.1f s' % self._age(self._scan_time)
+        return None
 
     def publish_and_update(self,msg):
         self.real_vel_pub.publish(msg)
@@ -547,6 +617,22 @@ class MowerManager(Node):
             self.stop_robot()
             return
 
+        # 自動模式 (1/3) 放行條件不成立 (沒按住 LB / 手把斷線 / 光達中斷)：
+        # 跟急停一樣每次 timer 都送零速度，不等 watchdog。只在原因改變時印一次 log。
+        if self.current_mode in (1, 3):
+            reason = self.auto_block_reason()
+            if reason != self._auto_block_prev:
+                if reason is not None:
+                    self.get_logger().warn(f'⏸️ 自動模式暫停：{reason}，車子停住，不轉發 Nav2 速度指令')
+                elif self._auto_block_prev is not None:
+                    self.get_logger().info('▶️ 自動模式恢復：LB 按住、光達正常，繼續轉發 Nav2 速度指令')
+                self._auto_block_prev = reason
+            if reason is not None:
+                self.stop_robot()
+                return
+        else:
+            self._auto_block_prev = None
+
         # 其餘模式(0/1/2/3)一律套用通用 watchdog：
         # 超過 watchdog_timeout 沒收到任何 cmd_vel(手把或 Nav2)就停車。
         now = self.get_clock().now()
@@ -600,6 +686,11 @@ class MowerManager(Node):
             _ = reason
         ms.skipped_labels = labels
         ms.message = self._mission_message
+        if self.current_mode in (1, 3):
+            reason = self.auto_block_reason()
+            if reason is not None:
+                pause = '暫停：%s。' % reason
+                ms.message = pause + ('\n' + ms.message if ms.message else '')
         self.mission_status_pub.publish(ms)
 
     def abort_mission_if_running(self):

@@ -89,8 +89,15 @@ class MowerTeleop(Node):
         # 先記下狀態再處理控制：下面的急停分支會提早 return，
         # 記在後面的話急停按住期間 /joy_status 就會停在舊資料。
         self._last_joy_time = self.get_clock().now()
-        self._deadman_held = self._button(data.buttons, self.p['button_deadman'])
-        self._stop_pressed = self._button(data.buttons, self.p['button_stop'])
+        deadman = self._button(data.buttons, self.p['button_deadman'])
+        stop = self._button(data.buttons, self.p['button_stop'])
+        changed = (deadman != self._deadman_held or stop != self._stop_pressed)
+        self._deadman_held = deadman
+        self._stop_pressed = stop
+        # LB / 急停鍵一變化就立刻多發一筆 /joy_status，不等 5 Hz timer (最多晚 0.2 s)：
+        # 自動模式放開 LB 要停車，mower_manager 看的就是這個話題 (2026-10-15)
+        if changed:
+            self.publish_joy_status()
 
         if self.last_button is None:
             self.last_button = list(data.buttons)

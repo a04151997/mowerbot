@@ -3,7 +3,7 @@ import os
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, OpaqueFunction
+from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, LogInfo, OpaqueFunction
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
@@ -34,6 +34,32 @@ def check_headland(context, geom, nav2_params_path):
             'xy_goal_tolerance 放寬了的話，vehicle_geometry.TURN_MARGIN 要跟著重新決定。'
             % (geom.headland_width, geom.rotation_swept_radius, xy_tol, need))
     return []
+
+
+def launch_bool(value, name):
+    """launch 參數的布林值：只認 true / false (與 1 / 0)，其他一律拒絕啟動，不要猜。"""
+    v = value.strip().lower()
+    if v in ('true', '1'):
+        return True
+    if v in ('false', '0'):
+        return False
+    raise RuntimeError('%s 只能是 true 或 false，收到 %r' % (name, value))
+
+
+# 自動模式的放行條件 (2026-10-15)：mower_manager 的兩個參數，說明見 manager.py。
+# launch 參數留空 = 跟著 use_sim_time 走：實車 (false) 開、模擬 (true) 關。
+# 模擬沒有手把；Gazebo 的既有測試 (Phase C/N/O/P/Q/L) 也都是不按 LB 直接切 mode 1。
+AUTO_GATES = ('auto_requires_deadman', 'auto_requires_scan')
+
+
+def resolve_auto_gates(context):
+    sim = launch_bool(LaunchConfiguration('use_sim_time', default='true').perform(context),
+                      'use_sim_time')
+    gates = {}
+    for k in AUTO_GATES:
+        v = LaunchConfiguration(k).perform(context)
+        gates[k] = (not sim) if v.strip() == '' else launch_bool(v, k)
+    return gates
 
 
 def generate_launch_description():
@@ -145,31 +171,39 @@ def generate_launch_description():
     )
 
     # 模式管理與 Watchdog
-    manager_node = Node(
-        package='mowerbot_action',
-        executable='mower_manager',
-        name='mower_manager',
-        output='screen',
-        parameters=[{
-            'use_sim_time': use_sim_time,
-            # 跑道 (lead-in) 長度，讓實測可以掃不同數值而不用重建
-            'lead_in_length': LaunchConfiguration('lead_in_length'),
-            # 割草線重疊率，讓實測可以掃不同數值而不用重建
-            'overlap_ratio': LaunchConfiguration('overlap_ratio'),
-            # 淨空門檻與刀盤寬：全部來自 vehicle_geometry (階段 38)，manager 不自己算幾何。
-            #   lateral_half_extent    直線通過的門檻 (body_width_total / 2)
-            #   rotation_swept_radius  要原地旋轉的點的門檻 (後輪軸到車頭角的距離)
-            #   soft_inflation_radius  跑道離內部障礙物的門檻 (= local_costmap 的 inflation_radius)
-            'lateral_half_extent': geom.lateral_half_extent,
-            'rotation_swept_radius': geom.rotation_swept_radius,
-            'soft_inflation_radius': geom.soft_inflation_radius,
-            'blade_width': geom.blade_width,
-            # 周邊環繞的轉角偵測 (vehicle_geometry) 與起點 = 終點的判定門檻 (nav2)
-            'perimeter_corner_window': geom.perimeter_corner_window,
-            'perimeter_corner_angle': geom.perimeter_corner_angle,
-            'goal_xy_tolerance': goal_xy_tolerance,
-        }]
-    )
+    # 放行條件 (auto_requires_*) 要等 launch 執行時才知道 use_sim_time，所以包在 OpaqueFunction 裡
+    def manager_action(context):
+        gates = resolve_auto_gates(context)
+        log = LogInfo(msg='[mower_control] 自動模式放行條件：按住 LB = %s，光達 /scan 不中斷 = %s'
+                          % (gates['auto_requires_deadman'], gates['auto_requires_scan']))
+        manager_node = Node(
+            package='mowerbot_action',
+            executable='mower_manager',
+            name='mower_manager',
+            output='screen',
+            parameters=[gates, {
+                'use_sim_time': use_sim_time,
+                # 跑道 (lead-in) 長度，讓實測可以掃不同數值而不用重建
+                'lead_in_length': LaunchConfiguration('lead_in_length'),
+                # 割草線重疊率，讓實測可以掃不同數值而不用重建
+                'overlap_ratio': LaunchConfiguration('overlap_ratio'),
+                # 淨空門檻與刀盤寬：全部來自 vehicle_geometry (階段 38)，manager 不自己算幾何。
+                #   lateral_half_extent    直線通過的門檻 (body_width_total / 2)
+                #   rotation_swept_radius  要原地旋轉的點的門檻 (後輪軸到車頭角的距離)
+                #   soft_inflation_radius  跑道離內部障礙物的門檻 (= local_costmap 的 inflation_radius)
+                'lateral_half_extent': geom.lateral_half_extent,
+                'rotation_swept_radius': geom.rotation_swept_radius,
+                'soft_inflation_radius': geom.soft_inflation_radius,
+                'blade_width': geom.blade_width,
+                # 周邊環繞的轉角偵測 (vehicle_geometry) 與起點 = 終點的判定門檻 (nav2)
+                'perimeter_corner_window': geom.perimeter_corner_window,
+                'perimeter_corner_angle': geom.perimeter_corner_angle,
+                'goal_xy_tolerance': goal_xy_tolerance,
+            }]
+        )
+        return [log, manager_node]
+
+    manager_node = OpaqueFunction(function=manager_action)
 
     # 4. 回傳 LaunchDescription
     return LaunchDescription([
@@ -196,6 +230,20 @@ def generate_launch_description():
             default_value=str(DEFAULT_OVERLAP_RATIO),
             description='Swath overlap ratio. Swath spacing = blade_width * '
                         '(1 - overlap_ratio). 0 means no overlap.'
+        ),
+
+        # 自動模式的放行條件 (2026-10-15)，留空 = 實車開、模擬關 (見 AUTO_GATES 的註解)
+        DeclareLaunchArgument(
+            'auto_requires_deadman',
+            default_value='',
+            description='自動模式 (mode 1/3) 要按住 LB 才轉發 Nav2 速度指令。'
+                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+        ),
+        DeclareLaunchArgument(
+            'auto_requires_scan',
+            default_value='',
+            description='自動模式 (mode 1/3) 光達 /scan 中斷超過 0.5 s 就停車。'
+                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
         ),
 
         # F2C 地頭 (headland) 寬度：階段 38 起不再是 launch 參數，由車輛幾何推導
