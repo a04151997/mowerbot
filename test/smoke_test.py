@@ -3248,7 +3248,9 @@ def _r_launch(fake, extra_args):
            'encoder_ticks_per_rev:=%d' % R_TICKS_PER_REV,
            'serial_port:=%s' % fake.port,
            # 幾何閘門 (階段 38)：實車 launch 預設 false；這裡是假 C30D，放行暫定幾何
-           'allow_provisional:=true'] + list(extra_args)
+           'allow_provisional:=true',
+           # 沒有實體光達 (也不一定裝了 rplidar_ros)，不啟動光達驅動
+           'use_lidar:=false'] + list(extra_args)
     return cmd
 
 

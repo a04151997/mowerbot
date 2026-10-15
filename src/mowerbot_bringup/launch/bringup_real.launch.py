@@ -4,6 +4,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction, OpaqueFunction,
                             IncludeLaunchDescription, LogInfo, RegisterEventHandler)
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -30,9 +31,7 @@ def generate_launch_description():
       3. use_sim_time 預設 false，start_rsp 預設 true
          (模擬時 robot_state_publisher 是 gazebo.launch.py 起的，實車沒有那一支)。
 
-    【還沒有接雷達】實體雷達的驅動節點在下面留了註解佔位。
-    不先填是因為現在還不知道會用哪一顆雷達，猜一個套件名稱寫進去，
-    之後只會變成「看起來已經處理好、實際上是錯的」。
+    雷達是 Slamtec RPLIDAR S3 (2026-10-07 確認，見下面「2. 實體雷達」)。
     """
     pkg_bringup = get_package_share_directory('mowerbot_bringup')
 
@@ -46,6 +45,8 @@ def generate_launch_description():
     max_vel_scale = LaunchConfiguration('max_vel_scale')
     allow_provisional = LaunchConfiguration('allow_provisional')
     override_reason = LaunchConfiguration('provisional_override_reason')
+    use_lidar = LaunchConfiguration('use_lidar')
+    lidar_port = LaunchConfiguration('lidar_port')
 
     # ---- 0. 幾何閘門 (階段 38) -------------------------------------------
     # 整個 launch 的第一個節點。vehicle.yaml 還有 provisional 值而 allow_provisional=false
@@ -109,28 +110,36 @@ def generate_launch_description():
         }]
     )
 
-    # ---- 2. 實體雷達 (待填) ---------------------------------------------
-    # TODO: 型號待現場跑 deploy/hw_probe.sh 確認（第 3 節 VID:PID、第 4 節原始位元組）。
-    # 拿到雷達之後在這裡啟動它的驅動節點。需要先確認的事:
-    #   - 雷達型號與對應的 ROS 2 套件
-    #   - 裝置路徑固定成 /dev/mowerbot_lidar (在 deploy/99-mowerbot.rules 加一行)，
-    #     不要用 /dev/ttyUSB0
-    #   - 鮑率
-    #   - frame_id 必須是 "radar" (car.xacro 裡雷達的 link 名稱)，
-    #     否則 TF 對不起來、scan matching 會拿到錯的外參
-    #   - 掃描頻率與角解析度，要與 mapper_params.yaml 的設定相容
-    # lidar_node = Node(
-    #     package='<雷達套件>',
-    #     executable='<驅動節點>',
-    #     name='lidar',
-    #     output='screen',
-    #     parameters=[{
-    #         'use_sim_time': use_sim_time,
-    #         'frame_id': 'radar',
-    #         'serial_port': '/dev/mowerbot_lidar',
-    #         'serial_baudrate': 0,
-    #     }]
-    # )
+    # ---- 2. 實體雷達：Slamtec RPLIDAR S3 (2026-10-07 確認) -------------
+    # 型號來源：學長 ROS 1 的 mapping.launch / navigation.launch 載入 rplidar_ros 的
+    # rplidar_s3.launch。光達底部原廠貼紙被財產標籤蓋住，接上後看驅動啟動時印出的
+    # 型號與韌體版本再確認一次。
+    # 驅動：apt 的 ros-humble-rplidar-ros (Slamtec 官方 ros2 分支，2.1.4 有 S3)。
+    # 參數照學長的 rplidar_s3.launch：1 Mbps、每秒 10 圈、angle_compensate 開。
+    #   - frame_id 必須是 "radar" (car_radar.xacro 裡雷達的 link 名稱)，
+    #     不能用驅動預設的 laser_frame，否則 TF 對不起來、scan matching 會拿到錯的外參
+    #   - scan_mode 留空 = 用光達自己的典型模式 (學長的設定也沒有指定)
+    #   - 裝置路徑固定成 /dev/mowerbot_lidar (deploy/99-mowerbot.rules，比對轉接板序號)；
+    #     規則還沒裝的機器用 lidar_port:=/dev/ttyUSB0
+    #   - 供電：S3 啟動瞬間約 1.2 A，轉接板的 DC 孔接車上 5.1 V 降壓模組
+    #   - 0° 方向、安裝位置 (lidar_x / lidar_z_ground) 照 docs/hardware_bringup.md 的 M5 確認
+    lidar_node = Node(
+        package='rplidar_ros',
+        executable='rplidar_node',
+        name='lidar',
+        output='screen',
+        condition=IfCondition(use_lidar),
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'channel_type': 'serial',
+            'serial_port': lidar_port,
+            'serial_baudrate': 1000000,
+            'frame_id': 'radar',
+            'inverted': False,
+            'angle_compensate': True,
+            'scan_frequency': 10.0,
+        }]
+    )
 
     # ---- 3. 其餘節點照舊 -------------------------------------------------
     # SLAM / teleop / manager / map_to_boundary / f2c_server 與模擬時完全相同，
@@ -198,14 +207,26 @@ def generate_launch_description():
             default_value='',
             description='allow_provisional:=false 但仍要強制通行時的理由 (非空字串，寫進 log)。'),
 
-        LogInfo(msg='[bringup_real] 注意：雷達驅動尚未填入，SLAM 不會收到 /scan。'),
+        DeclareLaunchArgument(
+            'use_lidar',
+            default_value='true',
+            description='是否啟動 RPLIDAR S3 驅動。沒接光達、只測底盤時設 false '
+                        '(SLAM 就不會收到 /scan)。'),
+
+        DeclareLaunchArgument(
+            'lidar_port',
+            default_value='/dev/mowerbot_lidar',
+            description='光達轉接板的序列埠。udev 規則寫好之前用 /dev/ttyUSB0。'),
+
+        LogInfo(msg=['[bringup_real] 光達 RPLIDAR S3：use_lidar=', use_lidar,
+                     ', lidar_port=', lidar_port]),
 
         geometry_guard,
         RegisterEventHandler(OnProcessExit(
             target_action=geometry_guard,
             on_exit=lambda event, _ctx: (
                 [bridge_node,
-                 # lidar_node,          # TODO: 見上面的說明
+                 lidar_node,
                  mower_control]
                 if event.returncode == 0 else
                 [OpaqueFunction(function=_geometry_gate_failed)]))),

@@ -23,7 +23,7 @@ source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一�
 | `bridge_node`（ROS ↔ 驅動板） | 骨架完成，用 loopback 假驅動測過（Phase H） |
 | 里程計數學 | 完成，單元測試在 `mowerbot_bridge/test/test_odometry.py` |
 | 馬達驅動（`drivers/wheeltec.py`） | 依輪趣 C30D 協定寫的，**待驗證**：新控制板 STM32F407 的協定待學長 ROS 1 原始碼比對 |
-| 光達驅動 | **空白**：RPLIDAR，型號細節待確認 |
+| 光達驅動 | **Slamtec RPLIDAR S3**，`bringup_real.launch.py` 已接 `rplidar_ros`。2026-10-12 單獨用 `view_rplidar_s3_launch.py` 實機驗證：S3M1、韌體 1.02、1 Mbps、DenseBoost、`/scan` 10 Hz；轉接板 DC 孔接車上 5.1 V 降壓模組。跟 bringup 一起跑待驗證 |
 | 車輛幾何 `vehicle.yaml` | 階段 38：實測 / 粗略實測 / 暫定三類並存，見下面「實機資訊」與 `measurement_worklist.md` |
 
 ---
@@ -36,7 +36,7 @@ source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一�
 | 原廠規格 | 98 × 73 × 46 cm，57.2 kg + 電池 16.2 kg，割幅約 50 cm，圓盤 4 支刀組，割草高度 1 ~ 8 cm 無段可調，最高車速 4.5 km/h |
 | | ⚠ 最高車速是原廠值，**本機已更換驅動馬達，不適用**，實際上限待實測。⚠ 本機加裝鋁架，實測外形 1.13 × 0.84 m（`vehicle.yaml` 一律用實測值） |
 | 控制板 | **STM32F407**。OLED 顯示 DIFF / GYRO / ROS / 左右輪數值 / BIAS；板上有 MotorA ~ D 四個馬達通道（目前用兩個）、USB-C、Power 滑動開關、USER / RESET 按鍵。具體型號未確認，但目錄結構（`turn_on_mini3_robot`）與 OLED 格式高度符合輪趣（Wheeltec）系控制板 |
-| 光達 | **RPLIDAR**，裝於引擎與電池之間的鋁架上，位於後輪軸前方。現場目視確認**未**被引擎遮擋 |
+| 光達 | **Slamtec RPLIDAR S3**（學長 `mapping.launch` / `navigation.launch` 載入 `rplidar_s3.launch`：1 Mbps、10 Hz）。5 V、啟動約 1.2 A，接頭 XH2.54-5P（紅 VCC、黃 TX、綠 RX、黑 GND、一格 NC），要經 CP2102 轉接板接 USB。裝於引擎與電池之間的鋁架上，位於後輪軸前方。現場目視確認**未**被引擎遮擋 |
 | 深度相機 | **無**。學長 workspace 裡的 `ros_astra_camera` / `rtabmap` / `3d_navigation` 全是原「mini3」平台遺留，與割草機無關，忽略 |
 | 上位機 | Intel N100 四核 / 約 16 GB RAM |
 | 上位機 OS | **Ubuntu 18.04.6 LTS**，核心 `5.16.0-051600rc7-generic`（手動安裝的 mainline RC 核心，為支援 N100 硬體）。⚠ **不要執行 `apt upgrade`**，會動到這顆核心，換回舊核心可能導致顯示異常 |
@@ -593,8 +593,14 @@ ros2 launch mowerbot_description robot_state_publisher.launch.py use_sim_time:=f
 ros2 run tf2_ros tf2_echo base_link radar                          # 印出來的平移要等於量到的值
 ```
 
-光達驅動節點填在 `bringup_real.launch.py` 的 TODO（型號確定之後），
-`frame_id` 必須是 `radar`，裝置用 udev 固定成 `/dev/mowerbot_lidar`（在 `deploy/99-mowerbot.rules` 的光達 TODO 那一行填好，做法同 M1 第 3 步）。
+光達驅動（RPLIDAR S3）已經接在 `bringup_real.launch.py`，`frame_id` 是 `radar`。先安裝驅動：
+
+```bash
+sudo apt install -y ros-humble-rplidar-ros
+```
+
+裝置用 udev 固定成 `/dev/mowerbot_lidar`（`deploy/99-mowerbot.rules` 的光達那一行比對轉接板序號，安裝做法同 M1 第 3 步）。
+換了轉接板就要改那一行的序號；規則還沒裝的機器，啟動時加 `lidar_port:=/dev/ttyUSB0`。只測底盤、沒接光達時加 `use_lidar:=false`。
 
 ### 預期看到什麼
 
