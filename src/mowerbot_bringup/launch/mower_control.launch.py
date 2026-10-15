@@ -104,6 +104,17 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
+    # 草地邊界記錄器 (2026-10-08)：用手把沿草地邊緣開一圈，記成 /lawn_boundary，
+    # map_to_boundary 會把割草範圍限制在它裡面。不呼叫它的服務就什麼都不做。
+    # 用法見 mowerbot_action/boundary_recorder.py 開頭。
+    boundary_recorder_node = Node(
+        package='mowerbot_action',
+        executable='boundary_recorder',
+        name='boundary_recorder',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
+    )
+
     # 手把控制邏輯
     teleop_node = Node(
         package='mowerbot_bridge',
@@ -206,4 +217,5 @@ def generate_launch_description():
         f2c_server_node,
         manager_node,
         boundary_node,
+        boundary_recorder_node,
     ])

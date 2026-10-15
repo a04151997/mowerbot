@@ -612,6 +612,7 @@ EXECUTABLES = [
     ('mowerbot_planner', 'f2c_server'),
     ('mowerbot_action', 'mower_manager'),
     ('mowerbot_action', 'map_to_boundary'),
+    ('mowerbot_action', 'boundary_recorder'),
     ('mowerbot_bridge', 'teleop_node'),
 ]
 
@@ -1010,6 +1011,118 @@ def b2_boundary():
         record('B', 'B2', '邊界提取 (收到 PolygonStamped 且頂點數>=4)',
                'PASS' if ok else 'FAIL',
                '頂點數=%d, 座標偏差=%.3fm' % (len(pts), dev))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+# B8 (2026-10-08)：草地邊界。map_to_boundary 收到 /lawn_boundary (boundary_recorder 記的那一圈) 之後，
+# 割草範圍只能落在它裡面；收到空的多邊形 (清除) 之後回到原本的範圍。同一個節點、同一張假地圖跑三段：
+#   ① 沒有草地邊界 (對照組)：範圍 = 自由區域腐蝕 0.10 m，跟 B2 一樣約 2.6 ~ 7.35 m
+#   ② 草地邊界 = 4.0 ~ 6.0 m 的正方形：所有頂點都要在它裡面 (容差 1 個 cell)
+#   ③ 清除：回到 ①
+# 對照組必須超出草地邊界，不然 ② 就算什麼都沒做也會過。
+B8_LAWN_LO, B8_LAWN_HI = 4.0, 6.0
+
+
+def b8_lawn_boundary():
+    hdr('B8  草地邊界 (map_to_boundary + /lawn_boundary，餵假地圖)')
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped, Point32
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    tol = RES
+
+    node_proc = bg_start('B8_map_to_boundary',
+                         ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+                          '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b8')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    lawn_pub = node.create_publisher(PolygonStamped, '/lawn_boundary', latched)
+    got = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary。"""
+        spin_for(1.0)
+        del got[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got:
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        pts = [(p.x, p.y) for p in got[-1].polygon.points]
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        return len(pts), min(xs), max(xs), min(ys), max(ys)
+
+    def publish_lawn(points):
+        msg = PolygonStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = node.get_clock().now().to_msg()
+        for x, y in points:
+            msg.polygon.points.append(Point32(x=x, y=y, z=0.0))
+        lawn_pub.publish(msg)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f' % ((tag,) + r))
+
+    try:
+        ctrl = next_boundary()
+        show('① 沒有草地邊界 (對照組)', ctrl)
+        lo, hi = B8_LAWN_LO, B8_LAWN_HI
+        publish_lawn([(lo, lo), (hi, lo), (hi, hi), (lo, hi)])
+        lawn = next_boundary()
+        show('② 草地邊界 %.1f ~ %.1f m' % (lo, hi), lawn)
+        publish_lawn([])
+        cleared = next_boundary()
+        show('③ 清除之後', cleared)
+        if ctrl is None or lawn is None or cleared is None:
+            print(node_proc.log_tail(30))
+            record('B', 'B8', '草地邊界', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        ctrl_ok = ctrl[1] < lo - 0.5 and ctrl[2] > hi + 0.5
+        lawn_ok = (lawn[0] >= 4 and lawn[1] >= lo - tol and lawn[2] <= hi + tol
+                   and lawn[3] >= lo - tol and lawn[4] <= hi + tol)
+        clear_ok = all(abs(a - b) <= tol for a, b in zip(cleared[1:], ctrl[1:]))
+        sub('對照組超出草地邊界 (代表檢查有鑑別力) = %s' % ctrl_ok)
+        sub('套用後全部落在草地邊界內 = %s；清除後回到對照組範圍 = %s' % (lawn_ok, clear_ok))
+        record('B', 'B8', '草地邊界：套用後範圍在草地多邊形內、清除後復原；對照組確實超出',
+               'PASS' if (ctrl_ok and lawn_ok and clear_ok) else 'FAIL',
+               '對照 x %.2f~%.2f ; 套用 x %.2f~%.2f y %.2f~%.2f ; 清除 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], lawn[1], lawn[2], lawn[3], lawn[4],
+                  cleared[1], cleared[2]))
     finally:
         node.destroy_node()
         rclpy.shutdown()
@@ -5684,6 +5797,10 @@ def main():
                 bg_stop_all()
             try:
                 b4_obstacle_extraction()
+            finally:
+                bg_stop_all()
+            try:
+                b8_lawn_boundary()
             finally:
                 bg_stop_all()
             b5_perimeter_effective_length()

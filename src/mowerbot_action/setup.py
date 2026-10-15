@@ -23,6 +23,7 @@ setup(
             # 關鍵點：'執行檔名稱 = 套件名.檔名:函數名'
             'mower_manager = mowerbot_action.manager:main',
             'map_to_boundary = mowerbot_action.map_to_boundary:main',
+            'boundary_recorder = mowerbot_action.boundary_recorder:main',
         ],
     },
 )

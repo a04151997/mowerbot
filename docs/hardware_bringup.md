@@ -654,6 +654,27 @@ ros2 run mowerbot_bringup save_map.sh <地圖名稱>
 **預期**：RViz 裡的地圖沒有重影或糊掉；繞回起點時牆面與第一次掃到的重疊；
 `save_map.sh` 印出四個檔案（`.posegraph .data .pgm .yaml`），`.yaml` 的 `free_thresh` 是 0.10。
 
+#### 7-2b 草地邊界（戶外、草地旁邊沒有牆時必做）
+
+2D 光達看不到草地和水泥地、步道的分界。四周沒有牆時，`map_to_boundary` 會把光達掃到的空地
+全部當成草地，F2C 會規劃到草地外面。做法是在同一次建圖裡，用手把**沿著草地邊緣開一圈**記成割草範圍：
+
+```bash
+ros2 service call /boundary_recorder/start std_srvs/srv/Trigger
+# 手把沿草地邊緣慢慢開一整圈，開回起點附近（1 m 以內）
+ros2 service call /boundary_recorder/stop  std_srvs/srv/Trigger
+```
+
+- 記的是後輪軸中心的軌跡，**邊界就是這條軌跡**，不會往外推。車子開在草地裡面一點，比壓著邊緣開安全。
+- `stop` 回報終點離起點太遠時，再往起點開一點、再呼叫一次 `stop`（記錄不會中斷）。要整圈重來用 `cancel`。
+- RViz 加 `/boundary_recorder/track`（Path）看正在記的軌跡、`/lawn_boundary`（Polygon）看結果；
+  `/f2c_boundary` 應該縮到草地邊界裡面。
+- 要回到「只看牆」：`ros2 service call /boundary_recorder/clear std_srvs/srv/Trigger`。
+- **每次重開 bringup 都要重新繞**：每次啟動 slam_toolbox 都從頭建一張新圖，上次的多邊形放進新地圖會錯位。
+  存檔（`~/.ros/mowerbot_lawn_boundary.yaml`）只留紀錄，預設不載入。
+- 限制：只管 F2C 規劃的範圍。Nav2 從一條割草線開到下一條時，路線不受草地邊界限制；
+  草地是凹形（L 形、U 形）時可能抄近路經過草地外面。第一次先找接近方形的草地。
+
 ### 7-3 自動割草（刀盤先不接電）
 
 第一次不要直接跑整個覆蓋任務：

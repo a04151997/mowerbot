@@ -9,6 +9,8 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 import numpy as np
 import cv2
 
+from mowerbot_action import lawn_boundary
+
 class MapToBoundaryNode(Node):
 
     # ---- 邊界簡化的兩個參數 (階段 20，數字是量出來的不是喬出來的) ----
@@ -58,9 +60,38 @@ class MapToBoundaryNode(Node):
         self.obstacle_pub = self.create_publisher(
             ObstaclePolygons, '/f2c_obstacles', 10)
         
+        # 草地邊界 (2026-10-08)：boundary_recorder 記下的「沿草地邊緣開一圈」的多邊形。
+        # 收到之後自由區域只取它裡面的部分 (戶外草地旁邊是水泥地時，光達看不出草地在哪結束)。
+        # 沒收到、或收到空的多邊形 (清除) 時，行為與之前完全相同。
+        # 發布端是 transient local，這裡也要 transient local 才收得到比自己早發的那一個。
+        self.lawn_polygon = None
+        self.last_map = None
+        self.lawn_sub = self.create_subscription(
+            PolygonStamped, '/lawn_boundary', self.lawn_callback, map_qos)
+
         self.get_logger().info('✅ 邊界提取節點已成功掛載 Transient Local QoS，開始監聽 /map...')
 
+    def lawn_callback(self, msg):
+        pts = [(p.x, p.y) for p in msg.polygon.points]
+        if len(pts) < 3:
+            self.lawn_polygon = None
+            self.get_logger().info('🌱 草地邊界已清除，割草範圍回到只由地圖決定。')
+        elif msg.header.frame_id and msg.header.frame_id != 'map':
+            # 這個節點把地圖格子直接換算成 map 座標，不做 TF 轉換
+            self.get_logger().error(
+                f'⚠️ 草地邊界的 frame_id 是 {msg.header.frame_id}，不是 map，忽略。')
+            return
+        else:
+            self.lawn_polygon = pts
+            self.get_logger().info(
+                f'🌱 收到草地邊界：{len(pts)} 個頂點、面積 '
+                f'{lawn_boundary.polygon_area(pts):.1f} m²，之後的割草範圍只取它裡面的部分。')
+        # 不用等下一張地圖，拿最近一張馬上重算
+        if self.last_map is not None:
+            self.map_callback(self.last_map)
+
     def map_callback(self, msg):
+        self.last_map = msg
         width = msg.info.width
         height = msg.info.height
         resolution = msg.info.resolution
@@ -78,6 +109,16 @@ class MapToBoundaryNode(Node):
         img = np.zeros((height, width), dtype=np.uint8)
         free_space_mask = (grid >= 0) & (grid <= 20)
         img[free_space_mask] = 255 
+
+        # 2.5 草地邊界：自由區域只留草地多邊形裡面的部分 (取交集只會變小，不會變大)。
+        # 放在找輪廓之前，所以落在草地外面的未知格、障礙物也不會被當成內部障礙物送出去。
+        if self.lawn_polygon is not None:
+            lawn_mask = lawn_boundary.rasterize(
+                self.lawn_polygon, origin_x, origin_y, resolution, width, height)
+            img = cv2.bitwise_and(img, lawn_mask)
+            self.get_logger().info(
+                f'🌱 套用草地邊界：自由區域 {int(np.count_nonzero(free_space_mask))} 格 -> '
+                f'{int(np.count_nonzero(img))} 格')
         
         # 【影像防錯微調】：給影像四周加上 1 畫素的黑邊，防止草地頂到地圖邊緣導致 OpenCV 找不到輪廓
         padded_img = cv2.copyMakeBorder(img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
