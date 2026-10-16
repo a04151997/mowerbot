@@ -13,6 +13,7 @@
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一行
+source ~/tf2_fix_ws/install/setup.bash    # tf2 死鎖修正，實車也要疊（docs/tf2_deadlock_fix.md）
 ```
 
 目前的狀態：
