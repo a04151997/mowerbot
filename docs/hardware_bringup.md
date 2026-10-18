@@ -676,6 +676,29 @@ ros2 service call /boundary_recorder/stop  std_srvs/srv/Trigger
 - 限制：只管 F2C 規劃的範圍。Nav2 從一條割草線開到下一條時，路線不受草地邊界限制；
   草地是凹形（L 形、U 形）時可能抄近路經過草地外面。第一次先找接近方形的草地。
 
+#### 7-2c 禁區：在地圖上用紅色畫（光達看不到的玻璃、坑洞、低矮障礙物）
+
+光達只看得到它那個高度（約 0.55 m）的東西：玻璃門只掃得到門框，地圖上是虛線，割草範圍會從縫漏出去；
+坑洞、低矮的石頭完全看不到。做法是存圖之後，在地圖圖片上用紅色把牆和禁區畫上去，
+割草範圍（F2C）與 Nav2 的 local costmap 都會避開。**跟 7-2b 一樣，只在同一次開機有效**：
+建圖、存圖、畫圖、套用、割草都要在同一次 bringup 裡做完。
+
+```bash
+ros2 run mowerbot_bringup save_map.sh <地圖名稱>     # 會多存 <名稱>.session 與 <名稱>_draw.png
+# 用任何繪圖程式在 <名稱>_draw.png 上畫紅色（Mac 預覽程式的標示工具、小畫家都可以），存檔
+ros2 run mowerbot_action keepout_tool apply <maps 資料夾>/<地圖名稱> [畫好的圖]
+ros2 run mowerbot_action keepout_tool clear          # 清除禁區
+```
+
+- 只認紅色（R 至少 150、比 G 與 B 都大 80 以上）。地圖本身是灰階，不會被誤認。
+  1 像素 = 5 公分；線要從牆畫到牆、中間不能有缺口，否則外面那塊仍然連在一起。
+- 套用之後看：RViz / Lichtblick 加 `/keepout_mask`（OccupancyGrid）看禁區位置；
+  `/f2c_boundary` 會繞開禁區（禁區在中間就變成內部障礙物，碰到外圈就切掉外圈）。
+- 開機永遠沒有禁區。`keepout_server` 每次啟動產生新的 session，
+  上一次開機存的地圖畫出來的禁區會被拒絕（每次開機地圖原點不同，舊的禁區會錯位）。
+- 實作：`keepout_server` 發布 `/keepout_mask`；`map_to_boundary` 把禁區格子（多擴 1 格）當成不能割；
+  local costmap 的 `keepout_layer`（StaticLayer）把它當成牆。說明見 `mowerbot_action/keepout.py`。
+
 ### 7-3 自動割草（刀盤先不接電）
 
 第一次不要直接跑整個覆蓋任務：

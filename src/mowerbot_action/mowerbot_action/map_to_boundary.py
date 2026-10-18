@@ -9,6 +9,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 import numpy as np
 import cv2
 
+from mowerbot_action import keepout
 from mowerbot_action import lawn_boundary
 
 class MapToBoundaryNode(Node):
@@ -40,6 +41,10 @@ class MapToBoundaryNode(Node):
     # 真正需要繞開的東西不會低於這個尺寸。
     MIN_OBSTACLE_AREA = 0.09
 
+    # 禁區 (2026-10-18) 套到地圖上時往外多擴 1 格：建圖中的地圖 origin 不一定跟存圖時對齊，
+    # 換格子時最多差半格，多擴 1 格保證禁區只會變大、不會縮小。
+    KEEPOUT_DILATE_CELLS = 1
+
     def __init__(self):
         super().__init__('map_to_boundary')
         
@@ -69,6 +74,13 @@ class MapToBoundaryNode(Node):
         self.lawn_sub = self.create_subscription(
             PolygonStamped, '/lawn_boundary', self.lawn_callback, map_qos)
 
+        # 禁區 (2026-10-18)：使用者在存好的地圖上用紅色畫的區域，由 keepout_server 發布。
+        # 禁區裡的格子當成不能割：在作業區中間就變成內部障礙物 (F2C 的內環)，碰到外圈就切掉外圈。
+        # 收到「沒有禁區」(全部是 0) 時行為與之前完全相同。
+        self.keepout = None
+        self.keepout_sub = self.create_subscription(
+            OccupancyGrid, '/keepout_mask', self.keepout_callback, map_qos)
+
         self.get_logger().info('✅ 邊界提取節點已成功掛載 Transient Local QoS，開始監聽 /map...')
 
     def lawn_callback(self, msg):
@@ -87,6 +99,25 @@ class MapToBoundaryNode(Node):
                 f'🌱 收到草地邊界：{len(pts)} 個頂點、面積 '
                 f'{lawn_boundary.polygon_area(pts):.1f} m²，之後的割草範圍只取它裡面的部分。')
         # 不用等下一張地圖，拿最近一張馬上重算
+        if self.last_map is not None:
+            self.map_callback(self.last_map)
+
+    def keepout_callback(self, msg):
+        if msg.header.frame_id and msg.header.frame_id != 'map':
+            self.get_logger().error(
+                f'⚠️ 禁區的 frame_id 是 {msg.header.frame_id}，不是 map，忽略。')
+            return
+        grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width)) > 50
+        if not grid.any():
+            if self.keepout is not None:
+                self.get_logger().info('⛔ 禁區已清除，割草範圍回到只由地圖決定。')
+            self.keepout = None
+        else:
+            self.keepout = (grid, msg.info.resolution,
+                            msg.info.origin.position.x, msg.info.origin.position.y)
+            self.get_logger().info(
+                f'⛔ 收到禁區：{int(np.count_nonzero(grid))} 格 '
+                f'({np.count_nonzero(grid) * msg.info.resolution ** 2:.2f} m²)，之後的割草範圍會避開。')
         if self.last_map is not None:
             self.map_callback(self.last_map)
 
@@ -120,6 +151,19 @@ class MapToBoundaryNode(Node):
                 f'🌱 套用草地邊界：自由區域 {int(np.count_nonzero(free_space_mask))} 格 -> '
                 f'{int(np.count_nonzero(img))} 格')
         
+        # 2.6 禁區：禁區裡的格子一律當成不能割 (只會讓作業區變小)。跟草地邊界一樣放在找輪廓之前。
+        if self.keepout is not None:
+            ko_grid, ko_res, ko_ox, ko_oy = self.keepout
+            ko = keepout.resample(ko_grid, ko_res, ko_ox, ko_oy,
+                                  width, height, resolution, origin_x, origin_y)
+            if self.KEEPOUT_DILATE_CELLS > 0 and ko.any():
+                k = 2 * self.KEEPOUT_DILATE_CELLS + 1
+                ko = cv2.dilate(ko.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+            before = int(np.count_nonzero(img))
+            img[ko] = 0
+            self.get_logger().info(
+                f'⛔ 套用禁區：自由區域 {before} 格 -> {int(np.count_nonzero(img))} 格')
+
         # 【影像防錯微調】：給影像四周加上 1 畫素的黑邊，防止草地頂到地圖邊緣導致 OpenCV 找不到輪廓
         padded_img = cv2.copyMakeBorder(img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
         

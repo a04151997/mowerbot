@@ -97,6 +97,21 @@ if [ -f "${TARGET}.yaml" ]; then
 fi
 echo ""
 
+# 禁區 (2026-10-18)：記下這次開機的 session_id，再產生一張給人畫禁區的圖 <名稱>_draw.png
+# (用法見 mowerbot_action/keepout.py)。keepout_server 沒開時 (只跑 SLAM、舊版程式) 跳過，
+# 不影響存圖本身，也不改 rc。
+if [ -f "${TARGET}.yaml" ]; then
+    if session="$(ros2 run mowerbot_action keepout_tool session 2>/dev/null)" && [ -n "${session}" ]; then
+        echo "${session}" > "${TARGET}.session"
+        echo "  這次開機的 session：${session}（只有這次開機能用這張圖畫禁區）"
+        ros2 run mowerbot_action keepout_tool template "${TARGET}" \
+            || echo "  !! 畫禁區用的圖沒有產生" >&2
+    else
+        echo "  (keepout_server 沒開，沒有產生畫禁區用的圖)"
+    fi
+    echo ""
+fi
+
 echo "產生的檔案:"
 found=0
 for ext in posegraph data pgm yaml; do

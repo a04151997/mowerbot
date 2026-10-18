@@ -615,6 +615,8 @@ EXECUTABLES = [
     ('mowerbot_action', 'mower_manager'),
     ('mowerbot_action', 'map_to_boundary'),
     ('mowerbot_action', 'boundary_recorder'),
+    ('mowerbot_action', 'keepout_server'),
+    ('mowerbot_action', 'keepout_tool'),
     ('mowerbot_bridge', 'teleop_node'),
 ]
 
@@ -1130,6 +1132,161 @@ def b8_lawn_boundary():
         rclpy.shutdown()
 
 
+# B9 (2026-10-18)：禁區。keepout_server 載入「這次開機」畫的禁區，map_to_boundary 避開它；
+# 別次開機 (session 不同) 的禁區要被拒絕；清除後復原。假地圖與 B8 相同 (自由區域 2.5 ~ 7.5 m)：
+#   ① 沒有禁區 (對照組)：範圍約 2.6 ~ 7.35 m
+#   ② 禁區 = x >= B9_CUT_X 的整條帶子 + 中間一個 1 m 見方的坑：外圈 x 上限要 <= B9_CUT_X，
+#      /f2c_obstacles 裡要有一個多邊形蓋住整個坑
+#   ③ 用別的 session 寫的禁區：~/load 必須回 success=false
+#   ④ 清除：回到 ①
+B9_CUT_X = 6.5
+B9_PIT = (4.0, 5.0)
+
+
+def b9_keepout():
+    hdr('B9  禁區 (keepout_server + map_to_boundary，餵假地圖)')
+    import numpy as np
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped
+    from std_srvs.srv import Trigger
+    from mowerbot_interfaces.msg import ObstaclePolygons
+    from mowerbot_action import keepout
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    tol = RES
+    ko_dir = os.path.join(LOGDIR, 'B9_keepout')
+    os.makedirs(ko_dir, exist_ok=True)
+
+    bg_start('B9_map_to_boundary',
+             ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+              '--ros-args', '-p', 'use_sim_time:=false'])
+    ks_proc = bg_start('B9_keepout_server',
+                       ['ros2', 'run', 'mowerbot_action', 'keepout_server',
+                        '--ros-args', '-p', 'use_sim_time:=false', '-p', 'keepout_dir:=' + ko_dir])
+    rclpy.init()
+    node = Node('smoke_b9')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    got = []
+    obst = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+    node.create_subscription(ObstaclePolygons, '/f2c_obstacles', lambda m: obst.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def call(name, timeout=15.0):
+        cli = node.create_client(Trigger, '/keepout_server/' + name)
+        if not cli.wait_for_service(timeout_sec=timeout):
+            return None
+        fut = cli.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(node, fut, timeout_sec=timeout)
+        return fut.result()
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary 與 /f2c_obstacles。"""
+        spin_for(1.0)
+        del got[:]
+        del obst[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not (got and obst):
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        xs = [p.x for p in got[-1].polygon.points]
+        ys = [p.y for p in got[-1].polygon.points]
+        holes = []
+        for poly in (obst[-1].polygons if obst else []):
+            hx = [p.x for p in poly.points]
+            hy = [p.y for p in poly.points]
+            holes.append((min(hx), max(hx), min(hy), max(hy)))
+        return len(xs), min(xs), max(xs), min(ys), max(ys), holes
+
+    def write_active(session_id):
+        # 網格方向 (row 0 = y 最小) 畫好，再翻成圖片方向交給 write_mask
+        g = np.zeros((H, W), dtype=bool)
+        g[:, int(round(B9_CUT_X / RES)):] = True
+        lo, hi = (int(round(v / RES)) for v in B9_PIT)
+        g[lo:hi, lo:hi] = True
+        keepout.write_mask(os.path.join(ko_dir, 'active'), np.flipud(g), RES, 0.0, 0.0, session_id)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f，內部障礙物 %d 個'
+                % ((tag,) + r[:5] + (len(r[5]),)))
+
+    try:
+        ctrl = next_boundary()
+        show('① 沒有禁區 (對照組)', ctrl)
+        sess = call('session')
+        if sess is None or not sess.success:
+            print(ks_proc.log_tail(30))
+            record('B', 'B9', '禁區', 'FAIL', 'keepout_server 的 ~/session 沒有回應 (見上方 log)')
+            return
+        write_active(sess.message)
+        loaded = call('load')
+        sub('② ~/load：success=%s，%s' % (loaded.success if loaded else None,
+                                          loaded.message if loaded else '沒有回應'))
+        ko = next_boundary()
+        show('② 禁區 x >= %.1f m + 坑 %.1f ~ %.1f m' % ((B9_CUT_X,) + B9_PIT), ko)
+        write_active('別次開機')
+        wrong = call('load')
+        sub('③ 別的 session：success=%s，%s' % (wrong.success if wrong else None,
+                                               wrong.message if wrong else '沒有回應'))
+        call('clear')
+        cleared = next_boundary()
+        show('④ 清除之後', cleared)
+        if ctrl is None or ko is None or cleared is None:
+            print(ks_proc.log_tail(30))
+            record('B', 'B9', '禁區', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        lo, hi = B9_PIT
+        ctrl_ok = ctrl[2] > B9_CUT_X + 0.5 and not any(
+            h[0] <= lo and h[1] >= hi and h[2] <= lo and h[3] >= hi for h in ctrl[5])
+        load_ok = bool(loaded and loaded.success)
+        cut_ok = ko[2] <= B9_CUT_X + tol
+        pit_ok = any(h[0] <= lo + tol and h[1] >= hi - tol and h[2] <= lo + tol and h[3] >= hi - tol
+                     for h in ko[5])
+        wrong_ok = wrong is not None and not wrong.success
+        clear_ok = all(abs(a - b) <= tol for a, b in zip(cleared[1:5], ctrl[1:5]))
+        sub('對照組超出禁區、沒有坑 = %s；載入成功 = %s' % (ctrl_ok, load_ok))
+        sub('外圈 x 上限 <= %.2f = %s；坑被內部障礙物蓋住 = %s' % (B9_CUT_X, cut_ok, pit_ok))
+        sub('別次開機的禁區被拒絕 = %s；清除後回到對照組範圍 = %s' % (wrong_ok, clear_ok))
+        record('B', 'B9', '禁區：只接受這次開機畫的、套用後範圍避開禁區與坑、清除後復原',
+               'PASS' if (ctrl_ok and load_ok and cut_ok and pit_ok and wrong_ok and clear_ok)
+               else 'FAIL',
+               '對照 x %.2f~%.2f ; 套用 x %.2f~%.2f ; 坑=%s ; 別次拒絕=%s ; 清除 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], ko[1], ko[2], pit_ok, wrong_ok, cleared[1], cleared[2]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
 # B5 (階段 38)：周邊環繞「實際會開的長度」。
 # 以前的測試只看「周邊環繞有沒有完成」—— 整圈被切成一段、起點 = 終點時，goal checker 在送出的當下
 # 就判定到達，0 秒「完成」、邊緣一公尺都沒割，測試照樣綠。這一項用存檔地圖 (stage29_lawn，進版控)
@@ -1296,7 +1453,7 @@ def b4_obstacle_extraction():
 # --------------------------------------------------------------------------
 EXPECTED_NODES = ['robot_state_publisher', 'joint_state_publisher', 'slam_toolbox',
                   'joy_node', 'mower_teleop', 'mower_manager', 'map_to_boundary',
-                  'f2c_server']
+                  'keepout_server', 'f2c_server']
 
 # 節點名 -> 用來 pgrep 的行程特徵，C1 診斷用
 NODE_PROC_PATTERN = {
@@ -1307,6 +1464,7 @@ NODE_PROC_PATTERN = {
     'mower_teleop': 'mowerbot_bridge/teleop_node',
     'mower_manager': 'mowerbot_action/mower_manager',
     'map_to_boundary': 'mowerbot_action/map_to_boundary',
+    'keepout_server': 'mowerbot_action/keepout_server',
     'f2c_server': 'mowerbot_planner/f2c_server',
 }
 
@@ -6183,6 +6341,10 @@ def main():
                 bg_stop_all()
             try:
                 b8_lawn_boundary()
+            finally:
+                bg_stop_all()
+            try:
+                b9_keepout()
             finally:
                 bg_stop_all()
             b5_perimeter_effective_length()

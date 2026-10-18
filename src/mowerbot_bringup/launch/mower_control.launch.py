@@ -141,6 +141,17 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
+    # 禁區 (2026-10-18)：使用者在存好的地圖上用紅色畫的區域，發布成 /keepout_mask，
+    # map_to_boundary 與 local costmap 的 KeepoutFilter 都會避開。開機永遠沒有禁區
+    # (每次開機地圖原點不同)。用法見 mowerbot_action/keepout.py 開頭。
+    keepout_node = Node(
+        package='mowerbot_action',
+        executable='keepout_server',
+        name='keepout_server',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time}]
+    )
+
     # 手把控制邏輯
     teleop_node = Node(
         package='mowerbot_bridge',
@@ -266,4 +277,5 @@ def generate_launch_description():
         manager_node,
         boundary_node,
         boundary_recorder_node,
+        keepout_node,
     ])

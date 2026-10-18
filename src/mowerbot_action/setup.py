@@ -24,6 +24,8 @@ setup(
             'mower_manager = mowerbot_action.manager:main',
             'map_to_boundary = mowerbot_action.map_to_boundary:main',
             'boundary_recorder = mowerbot_action.boundary_recorder:main',
+            'keepout_server = mowerbot_action.keepout_server:main',
+            'keepout_tool = mowerbot_action.keepout_tool:main',
         ],
     },
 )
