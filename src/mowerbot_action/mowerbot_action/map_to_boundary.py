@@ -103,11 +103,12 @@ class MapToBoundaryNode(Node):
             self.map_callback(self.last_map)
 
     def keepout_callback(self, msg):
-        if msg.header.frame_id and msg.header.frame_id != 'map':
+        grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width)) > 50
+        # 沒有禁區的空遮罩 keepout_server 放在 odom (還沒開始建圖時沒有 map)，空的就不必看座標系
+        if grid.any() and msg.header.frame_id and msg.header.frame_id != 'map':
             self.get_logger().error(
                 f'⚠️ 禁區的 frame_id 是 {msg.header.frame_id}，不是 map，忽略。')
             return
-        grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width)) > 50
         if not grid.any():
             if self.keepout is not None:
                 self.get_logger().info('⛔ 禁區已清除，割草範圍回到只由地圖決定。')

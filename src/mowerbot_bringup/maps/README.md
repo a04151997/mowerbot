@@ -43,3 +43,6 @@ ros2 service call /slam_toolbox/save_map slam_toolbox/srv/SaveMap \
 ```bash
 ros2 launch mowerbot_bringup localization.launch.py
 ```
+
+實車切到自動割草 (LB + B) 時 `map_autosave` 會先自動存一份 `f2c_<月日>_<時分秒>` (同一支 save_map.sh)，
+存成功才規劃路線 (見 docs/hardware_bringup.md 7-0)。

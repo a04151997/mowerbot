@@ -191,7 +191,7 @@ local_costmap:
       # /keepout_mask，map 座標系)。光達看不到的玻璃、坑洞，Nav2 也當成牆 —— 主要是擋
       # approach 那種直線路徑。排在第一個：obstacle_layer 取最大值疊上去，inflation_layer
       # 也會把禁區膨脹，跟真的牆一樣。沒畫禁區時 keepout_server 發的是 1 x 1、值 0 的遮罩，
-      # 等於沒有這一層。
+      # 等於沒有這一層 (放在 odom 座標系：實車按 LB + A 之前沒有 map，見 keepout_server.py)。
       # 不用 Nav2 的 KeepoutFilter：Humble 的 filter 不會擴大更新範圍，遮罩只在其他圖層
       # 剛好更新到的格子裡生效。實測 (只有 inflation_layer 時) 開機後才載入的禁區一格都沒標上。
       # 推論 (沒有實測)：戶外光達前方沒東西、obstacle_layer 的更新範圍很小時也會這樣。

@@ -52,14 +52,30 @@ def launch_bool(value, name):
 AUTO_GATES = ('auto_requires_deadman', 'auto_requires_scan')
 
 
-def resolve_auto_gates(context):
+def resolve_sim_default(context, keys):
+    """launch 參數留空 = 實車 (use_sim_time false) 開、模擬關；有寫就照寫的。"""
     sim = launch_bool(LaunchConfiguration('use_sim_time', default='true').perform(context),
                       'use_sim_time')
-    gates = {}
-    for k in AUTO_GATES:
+    out = {}
+    for k in keys:
         v = LaunchConfiguration(k).perform(context)
-        gates[k] = (not sim) if v.strip() == '' else launch_bool(v, k)
-    return gates
+        out[k] = (not sim) if v.strip() == '' else launch_bool(v, k)
+    return out
+
+
+def resolve_auto_gates(context):
+    return resolve_sim_default(context, AUTO_GATES)
+
+
+# 手把三種模式 (2026-10-18 will)：LB + X 手動 (純遙控車)、LB + A 開始建圖、LB + B 先存圖再規劃割草。
+# 留空 = 跟著 use_sim_time：實車開、模擬關 (模擬的既有測試一開始就要有地圖，也不需要存圖)。
+#   mapping_on_button    slam_toolbox 讀 /scan_slam，slam_scan_gate 等第一次切到建圖模式才轉送 /scan
+#   save_map_before_f2c  mower_manager 切進 mode 1 先呼叫 map_autosave 存圖，存成功才規劃
+MODE_OPTIONS = ('mapping_on_button', 'save_map_before_f2c')
+
+
+def resolve_mode_options(context):
+    return resolve_sim_default(context, MODE_OPTIONS)
 
 
 def generate_launch_description():
@@ -102,13 +118,40 @@ def generate_launch_description():
         parameters=[{'use_sim_time': use_sim_time}]
     )
 
-    # SLAM 建圖
-    slam_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            os.path.join(bringup_dir, 'launch', 'mapping.launch.py')
-        ),
-        launch_arguments={'use_sim_time': use_sim_time}.items()
-    )
+    # SLAM 建圖。實車 (mapping_on_button) 要等按 LB + A 才開始：slam_toolbox 改讀 /scan_slam，
+    # 由 slam_scan_gate 在第一次切到建圖模式之後才把 /scan 轉過去 (理由見 slam_scan_gate.py)。
+    def slam_action(context):
+        opts = resolve_mode_options(context)
+        on = opts['mapping_on_button']
+        actions = [
+            LogInfo(msg='[mower_control] 建圖：%s' % (
+                '按 LB + A (建圖模式) 才開始，在那之前沒有地圖' if on
+                else 'bringup 一開就開始 (模擬)')),
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(bringup_dir, 'launch', 'mapping.launch.py')),
+                launch_arguments={'use_sim_time': use_sim_time,
+                                  'scan_topic': '/scan_slam' if on else '/scan'}.items()),
+        ]
+        if on:
+            actions.append(Node(
+                package='mowerbot_action',
+                executable='slam_scan_gate',
+                name='slam_scan_gate',
+                output='screen',
+                parameters=[{'use_sim_time': use_sim_time,
+                             'input_topic': '/scan', 'output_topic': '/scan_slam'}]))
+        if opts['save_map_before_f2c']:
+            # 切到自動割草時先存圖 (mower_manager 呼叫 /map_autosave/save)
+            actions.append(Node(
+                package='mowerbot_action',
+                executable='map_autosave',
+                name='map_autosave',
+                output='screen',
+                parameters=[{'use_sim_time': use_sim_time}]))
+        return actions
+
+    slam_launch = OpaqueFunction(function=slam_action)
 
     # 手把硬體驅動
     joy_node = Node(
@@ -142,7 +185,7 @@ def generate_launch_description():
     )
 
     # 禁區 (2026-10-18)：使用者在存好的地圖上用紅色畫的區域，發布成 /keepout_mask，
-    # map_to_boundary 與 local costmap 的 KeepoutFilter 都會避開。開機永遠沒有禁區
+    # map_to_boundary 與 local costmap 的 keepout_layer 都會避開。開機永遠沒有禁區
     # (每次開機地圖原點不同)。用法見 mowerbot_action/keepout.py 開頭。
     keepout_node = Node(
         package='mowerbot_action',
@@ -185,8 +228,11 @@ def generate_launch_description():
     # 放行條件 (auto_requires_*) 要等 launch 執行時才知道 use_sim_time，所以包在 OpaqueFunction 裡
     def manager_action(context):
         gates = resolve_auto_gates(context)
-        log = LogInfo(msg='[mower_control] 自動模式放行條件：按住 LB = %s，光達 /scan 不中斷 = %s'
-                          % (gates['auto_requires_deadman'], gates['auto_requires_scan']))
+        gates['save_map_before_f2c'] = resolve_mode_options(context)['save_map_before_f2c']
+        log = LogInfo(msg='[mower_control] 自動模式放行條件：按住 LB = %s，光達 /scan 不中斷 = %s；'
+                          '切到自動割草先存圖 = %s'
+                          % (gates['auto_requires_deadman'], gates['auto_requires_scan'],
+                             gates['save_map_before_f2c']))
         manager_node = Node(
             package='mowerbot_action',
             executable='mower_manager',
@@ -254,6 +300,20 @@ def generate_launch_description():
             'auto_requires_scan',
             default_value='',
             description='自動模式 (mode 1/3) 光達 /scan 中斷超過 0.5 s 就停車。'
+                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+        ),
+
+        # 手把三種模式 (2026-10-18)，留空 = 實車開、模擬關 (見 MODE_OPTIONS 的註解)
+        DeclareLaunchArgument(
+            'mapping_on_button',
+            default_value='',
+            description='按 LB + A (建圖模式) 才開始建圖，在那之前 slam_toolbox 收不到光達資料。'
+                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+        ),
+        DeclareLaunchArgument(
+            'save_map_before_f2c',
+            default_value='',
+            description='切到自動割草 (mode 1) 先存一份地圖，存成功才規劃。'
                         '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
         ),
 

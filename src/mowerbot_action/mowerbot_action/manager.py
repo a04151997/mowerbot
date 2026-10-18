@@ -18,6 +18,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
+from std_srvs.srv import Trigger
 
 # ---- 跨檔共用的預設值：單一來源 (階段 38 修正 3 原則 7) ----
 # 以前 launch 檔、HMI、smoke_test 各寫一份並註明「要一致」；現在它們都 import 這裡。
@@ -291,6 +292,19 @@ class MowerManager(Node):
         self.get_logger().info(
             f'自動模式放行條件：按住 LB = {self.auto_requires_deadman}，'
             f'光達 /scan 不中斷 = {self.auto_requires_scan}')
+
+        # ---- 切到自動割草時先存圖 (2026-10-18 will 要的手把三種模式) ----
+        # true：切進 mode 1 先呼叫 map_autosave 存一份地圖 (save_map.sh)，存成功才呼叫 F2C 規劃；
+        # 存失敗就不規劃、任務 ABORTED，車子不動。存圖要 10 ~ 30 秒 (N150)，這段時間任務是
+        # PLANNING、message 寫「存圖中」。存圖中途離開 mode 1 (或再按一次 LB + B)，舊的存圖結果
+        # 回來時不會規劃 (_mode_epoch 對不上)。
+        # 速度指令的仲裁完全沒變：存圖、規劃都還沒有路徑，Nav2 沒有東西可送。
+        # 節點預設 false；mower_control.launch.py 依 use_sim_time 決定 (實車開、模擬關)。
+        self.declare_parameter('save_map_before_f2c', False)
+        self.save_map_before_f2c = bool(self.get_parameter('save_map_before_f2c').value)
+        self.autosave_client = self.create_client(Trigger, 'map_autosave/save')
+        self._mode_epoch = 0           # 每次 change_mode 加一，用來丟掉過期的存圖結果
+        self.get_logger().info(f'切到自動割草時先存圖 = {self.save_map_before_f2c}')
         # 發布者：發給真正的底盤驅動
         self.real_vel_pub = self.create_publisher(Twist, '/cmd_vel' ,10)
 
@@ -557,8 +571,41 @@ class MowerManager(Node):
 
     # 模式切換服務
     # 模式切換服務
+    def start_f2c(self):
+        """切進 mode 1：需要的話先存圖 (save_map_before_f2c)，再呼叫 F2C 規劃。"""
+        # 還沒有任何邊界 (還沒建圖) 時不必先花時間存圖：call_f2c_planner 會直接說「請先建圖」
+        if not self.save_map_before_f2c or self.latest_boundary is None:
+            self.call_f2c_planner()
+            return
+        if not self.autosave_client.wait_for_service(timeout_sec=1.0):
+            text = '無法開始：存圖服務 (map_autosave) 沒有開，沒有存圖就不規劃。'
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+        epoch = self._mode_epoch
+        self.set_mission_state(MissionStatus.STATE_PLANNING,
+                               message='存圖中，存好才規劃路線 (約 10 ~ 30 秒)。')
+        self.get_logger().info('💾 切到自動割草：先存圖，存好才規劃路線...')
+        future = self.autosave_client.call_async(Trigger.Request())
+        future.add_done_callback(lambda f: self.autosave_done(f, epoch))
+
+    def autosave_done(self, future, epoch):
+        if epoch != self._mode_epoch or self.current_mode != 1:
+            self.get_logger().warn('💾 存圖結束了，但這中間模式已經切換過，不規劃。')
+            return
+        result = future.result() if future.done() else None
+        if result is None or not result.success:
+            reason = result.message if result is not None else '存圖服務沒有回應'
+            text = '無法開始：存圖失敗 (%s)，沒有規劃，車子不會動。' % reason
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+        self.get_logger().info(f'💾 地圖已存：{result.message}，開始規劃。')
+        self.call_f2c_planner()
+
     def change_mode_callback(self,request,response):
         if request.mode in self.mode_map:
+            self._mode_epoch += 1
             previous_mode = self.current_mode
             self.current_mode = request.mode
             mode_name = self.mode_map[self.current_mode]
@@ -595,9 +642,9 @@ class MowerManager(Node):
                     # 任務已經跑完 (DONE) 之後離開自動模式，那份結果要留著。
                     self.abort_mission_if_running()
 
-                # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖
+                # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖 (實車上先存圖，見 start_f2c)
                 if self.current_mode == 1:
-                    self.call_f2c_planner()
+                    self.start_f2c()
             
             self.stop_robot()
             # 修正：重置 watchdog 計時器，避免切換瞬間報錯

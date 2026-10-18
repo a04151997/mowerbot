@@ -4,8 +4,9 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/R/L/N/O/P/Q/S
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/R/L/N/O/P/Q/S/M
     python3 test/smoke_test.py --phases=S   # 只跑停車機制 (放開 LB、光達中斷、光達停止區；不需要 Gazebo)
+    python3 test/smoke_test.py --phases=M   # 只跑手把三種模式 (LB + A 才建圖、LB + B 先存圖；不需要 Gazebo)
     python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
     python3 test/smoke_test.py --phases=R   # 只跑硬體迴路 (假 C30D，不需要 Gazebo)
     python3 test/smoke_test.py --phases=O   # 只跑臨時障礙物容錯 (固定用 demo_lawn_obstacle.world)
@@ -207,6 +208,7 @@ PHASES = [
     ('P', '狀態發布'),
     ('Q', '真實地圖規劃'),
     ('S', '停車機制'),
+    ('M', '手把模式'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
 
@@ -6224,6 +6226,303 @@ def phase_s():
         rig.close()
 
 
+# --------------------------------------------------------------------------
+# Phase M  手把三種模式 (2026-10-18 will)：LB + X 手動、LB + A 才開始建圖、LB + B 先存圖再規劃。
+# 不需要 Gazebo。mower_manager、slam_scan_gate 是真的；存圖服務 (map_autosave) 與
+# F2C (generate_coverage_path) 由測試扮演，F2C 只計次數、回傳失敗。
+#
+#   M0  launch 預設值：模擬關、實車開；bringup_real 強制開，而且一起開 Nav2
+#   M1  slam_scan_gate：切到建圖 (mode 0) 之前 /scan_slam 一筆都沒有；之後轉送；切回手動照樣轉送
+#   M2  對照組：存圖成功 → 呼叫 F2C (管道是通的，M3 ~ M5 的「沒呼叫」才算數)
+#   M3  存圖失敗 → 不呼叫 F2C、任務 ABORTED、訊息寫存圖失敗
+#   M4  存圖服務沒開 → 不呼叫 F2C、任務 ABORTED
+#   M5  存圖中途切回手動 → 存好之後也不呼叫 F2C
+# --------------------------------------------------------------------------
+M_FAKE_AUTOSAVE = r"""
+import sys, time, rclpy
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+mode, delay = sys.argv[1], float(sys.argv[2])
+rclpy.init()
+n = Node('map_autosave')
+def cb(_req, resp):
+    time.sleep(delay)
+    resp.success = (mode == 'ok')
+    resp.message = '/tmp/smoke_m_map' if resp.success else 'save_map.sh 回傳 1 (測試)'
+    return resp
+n.create_service(Trigger, '~/save', cb)
+rclpy.spin(n)
+"""
+
+
+def m0_launch_defaults():
+    try:
+        _m0_launch_defaults()
+    except Exception as e:
+        record('M', 'M0', 'launch 預設值：模擬關、實車開；bringup_real 強制開、一起開 Nav2', 'FAIL',
+               '%s: %s' % (type(e).__name__, e))
+
+
+def _m0_launch_defaults():
+    from launch import LaunchContext
+    from launch.actions import IncludeLaunchDescription, OpaqueFunction
+    from launch.utilities import perform_substitutions
+
+    def txt(c, x):
+        if isinstance(x, str):
+            return x
+        if isinstance(x, (list, tuple)):
+            return perform_substitutions(c, list(x))
+        return x.perform(c)
+
+    def ctx(**cfg):
+        c = LaunchContext()
+        base = dict(use_sim_time='true', auto_requires_deadman='', auto_requires_scan='',
+                    mapping_on_button='', save_map_before_f2c='', lead_in_length='0.5',
+                    overlap_ratio='0.4')
+        base.update(cfg)
+        for k, v in base.items():
+            c.launch_configurations[k] = v
+        return c
+
+    problems = []
+    mc, _ = _load_launch_module('mowerbot_bringup', 'mower_control.launch.py')
+    ld = mc.generate_launch_description()
+    fns = [e for e in ld.entities if isinstance(e, OpaqueFunction)]
+    for sim, opt, want in (('true', '', False), ('false', '', True),
+                           ('true', 'true', True), ('false', 'false', False)):
+        c = ctx(use_sim_time=sim, mapping_on_button=opt, save_map_before_f2c=opt)
+        execs, scan_topic, manager_save = [], None, None
+        for fn in fns:
+            for a in fn.execute(c) or []:
+                ex = getattr(a, 'node_executable', None)
+                if ex:
+                    execs.append(ex)
+                if isinstance(a, IncludeLaunchDescription):
+                    for k, v in a.launch_arguments:
+                        if txt(c, k) == 'scan_topic':
+                            scan_topic = txt(c, v)
+                if ex == 'mower_manager':
+                    for pdict in a._Node__parameters:
+                        if isinstance(pdict, dict):
+                            for k, v in pdict.items():
+                                if txt(c, k) == 'save_map_before_f2c':
+                                    manager_save = v
+        got = ('slam_scan_gate' in execs, 'map_autosave' in execs,
+               scan_topic == '/scan_slam', manager_save is True)
+        sub('mower_control use_sim_time=%s 選項=%r -> 閘門 %s、存圖節點 %s、SLAM 讀 %s、manager 存圖 %s'
+            % (sim, opt, got[0], got[1], scan_topic, manager_save))
+        if got != (want,) * 4:
+            problems.append('use_sim_time=%s 選項=%r 得到 %s，應全為 %s' % (sim, opt, got, want))
+    try:
+        mc.resolve_mode_options(ctx(use_sim_time='false', mapping_on_button='yes'))
+        problems.append('mapping_on_button:=yes 沒有被拒絕')
+    except RuntimeError as e:
+        sub('mapping_on_button:=yes 被拒絕：%s' % e)
+    _, real_path = _load_launch_module('mowerbot_bringup', 'bringup_real.launch.py')
+    with open(real_path, encoding='utf-8') as fh:
+        src = fh.read()
+    for k in MODE_KEYS:
+        if not re.search(r"'%s':\s*'true'" % k, src):
+            problems.append('bringup_real.launch.py 沒有把 %s 固定成 true' % k)
+    if not re.search(r"navigation\.launch\.py", src) or 'condition=IfCondition(use_nav)' not in src:
+        problems.append('bringup_real.launch.py 沒有 (依 use_nav) include navigation.launch.py')
+    record('M', 'M0', 'launch 預設值：模擬關、實車開；bringup_real 強制開、一起開 Nav2',
+           'FAIL' if problems else 'PASS', '; '.join(problems))
+
+
+MODE_KEYS = ('mapping_on_button', 'save_map_before_f2c')
+
+
+class MRig(object):
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import LaserScan
+        from geometry_msgs.msg import PolygonStamped, Point32
+        from mowerbot_interfaces.msg import MissionStatus
+        from mowerbot_interfaces.srv import SetDriveMode, GenerateCoveragePath
+
+        self.manager = bg_start('M_mower_manager',
+                                ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                                 '--ros-args', '-p', 'use_sim_time:=false',
+                                 '-p', 'save_map_before_f2c:=true']
+                                + _manager_geometry_args())
+        self.gate = bg_start('M_slam_scan_gate',
+                             ['ros2', 'run', 'mowerbot_action', 'slam_scan_gate'])
+        self.autosave = None
+        rclpy.init()
+        self.node = Node('smoke_m')
+        self.LaserScan, self.MissionStatus, self.SetDriveMode = LaserScan, MissionStatus, SetDriveMode
+        self.scan_pub = self.node.create_publisher(LaserScan, '/scan', qos_profile_sensor_data)
+        self.slam_scans = 0
+        self.node.create_subscription(LaserScan, '/scan_slam', self._slam_cb,
+                                      qos_profile_sensor_data)
+        self.mission = None
+        self.node.create_subscription(MissionStatus, '/mission_status',
+                                      lambda m: setattr(self, 'mission', m), 10)
+        self.planner_calls = 0
+        self.node.create_service(GenerateCoveragePath, 'generate_coverage_path', self._plan_cb)
+        self.boundary_pub = self.node.create_publisher(PolygonStamped, '/f2c_boundary', 10)
+        poly = PolygonStamped()
+        poly.header.frame_id = 'map'
+        poly.polygon.points = [Point32(x=float(x), y=float(y))
+                               for x, y in ((0, 0), (10, 0), (10, 8), (0, 8))]
+        self.poly = poly
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        self.node.create_timer(0.1, self._tick)
+
+    def _slam_cb(self, _m):
+        self.slam_scans += 1
+
+    def _plan_cb(self, _req, resp):
+        self.planner_calls += 1
+        resp.success = False
+        return resp
+
+    def _tick(self):
+        m = self.LaserScan()
+        m.header.stamp = self.node.get_clock().now().to_msg()
+        m.header.frame_id = 'radar'
+        m.angle_min, m.angle_increment = -math.pi, math.pi / 180.0
+        m.angle_max = m.angle_min + 359 * m.angle_increment
+        m.range_min, m.range_max = 0.05, 40.0
+        m.ranges = [5.0] * 360
+        self.scan_pub.publish(m)
+        self.boundary_pub.publish(self.poly)
+
+    def start_autosave(self, mode, delay=0.0):
+        self.stop_autosave()
+        self.autosave = bg_start('M_fake_autosave_%s' % mode,
+                                 ['python3', '-c', M_FAKE_AUTOSAVE, mode, str(delay)])
+        cli = self.node.create_client(__import__('std_srvs.srv', fromlist=['Trigger']).Trigger,
+                                      'map_autosave/save')
+        ok = cli.wait_for_service(timeout_sec=20.0)
+        self.node.destroy_client(cli)
+        return ok
+
+    def stop_autosave(self):
+        if self.autosave is not None:
+            self.autosave.stop()
+            self.autosave = None
+            self.spin(1.0)
+
+    def spin(self, seconds):
+        import rclpy
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def set_mode(self, mode):
+        import rclpy
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def close(self):
+        import rclpy
+        self.stop_autosave()
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+
+def phase_m():
+    hdr('Phase M  手把三種模式 (LB + A 才開始建圖、LB + B 先存圖再規劃；不需要 Gazebo)')
+    m0_launch_defaults()
+    rig = MRig()
+    try:
+        if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
+            print(rig.manager.log_tail(30))
+            for cid, name in (('M1', '建圖開關'), ('M2', '對照組'), ('M3', '存圖失敗'),
+                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走')):
+                record('M', cid, name, 'FIXTURE', 'mower_manager 沒起來')
+            return
+
+        # ---- M1 建圖開關 ----
+        hdr('M1  切到建圖之前 /scan_slam 沒有資料；mode 0 之後轉送；切回手動照樣轉送')
+        rig.spin(3.0)
+        before = rig.slam_scans
+        sub('change_mode(2) = %s' % rig.set_mode(2))
+        rig.spin(2.0)
+        manual = rig.slam_scans
+        sub('change_mode(0) = %s' % rig.set_mode(0))
+        rig.spin(2.0)
+        mapping = rig.slam_scans
+        sub('change_mode(2) = %s' % rig.set_mode(2))
+        rig.spin(2.0)
+        after = rig.slam_scans
+        sub('/scan_slam 累計：開機 3 s = %d，手動 2 s = %d，建圖 2 s = %d，切回手動 2 s = %d'
+            % (before, manual, mapping, after))
+        for h in rig.gate.log_grep(r'開始建圖', 2):
+            sub('    %s' % h.strip()[:120])
+        ok = before == 0 and manual == 0 and mapping - manual >= 10 and after - mapping >= 10
+        record('M', 'M1', '建圖開關：切到建圖才轉送光達給 SLAM、之後一直轉送',
+               'PASS' if ok else 'FAIL',
+               '%d / %d / %d / %d' % (before, manual, mapping, after))
+
+        # ---- M2 對照組 ----
+        hdr('M2  對照組：存圖成功 → 呼叫 F2C')
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        n0 = rig.planner_calls
+        sub('change_mode(1) = %s' % rig.set_mode(1))
+        rig.spin(8.0)
+        called = rig.planner_calls - n0
+        sub('F2C 被呼叫 %d 次' % called)
+        rig.set_mode(2)
+        control_ok = called == 1
+        record('M', 'M2', '對照組：存圖成功就呼叫 F2C', 'PASS' if control_ok else 'FIXTURE',
+               '' if control_ok else 'F2C 被呼叫 %d 次 (應為 1)，M3 ~ M5 不算數' % called)
+        later = (('M3', '存圖失敗：不規劃、任務中止'), ('M4', '存圖服務沒開：不規劃、任務中止'),
+                 ('M5', '存圖中途切回手動：存好也不規劃'))
+        if not control_ok:
+            for cid, name in later:
+                record('M', cid, name, 'FIXTURE', '管道沒有驗證 (M2 沒過)')
+            return
+
+        def refused(case, mode, delay, then_manual=False):
+            ready = rig.start_autosave(mode, delay) if mode else (rig.stop_autosave() or True)
+            n0 = rig.planner_calls
+            rig.set_mode(1)
+            if then_manual:
+                rig.spin(1.0)
+                rig.set_mode(2)
+            rig.spin(max(6.0, delay + 4.0))
+            ms = rig.mission
+            sub('%s：服務就緒 %s，F2C 呼叫 %d 次，任務 state %s，訊息 %r'
+                % (case, ready, rig.planner_calls - n0, ms.state if ms else None,
+                   ms.message[:80] if ms else None))
+            res = (rig.planner_calls - n0, ms.state if ms else None, ms.message if ms else '')
+            rig.set_mode(2)
+            rig.spin(0.5)
+            return res
+
+        hdr('M3  存圖失敗 → 不規劃')
+        calls, state, msg = refused('存圖失敗', 'fail', 0.0)
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and '存圖失敗' in msg
+        record('M', 'M3', '存圖失敗：不規劃、任務中止', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s' % (calls, state))
+
+        hdr('M4  存圖服務沒開 → 不規劃')
+        calls, state, msg = refused('存圖服務沒開', None, 0.0)
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and '存圖服務' in msg
+        record('M', 'M4', '存圖服務沒開：不規劃、任務中止', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s' % (calls, state))
+
+        hdr('M5  存圖中途 (存圖要 4 s) 切回手動 → 存好也不規劃')
+        calls, state, msg = refused('存圖中途切走', 'ok', 4.0, then_manual=True)
+        stale = rig.manager.log_grep(r'模式已經切換過', 2)
+        for h in stale:
+            sub('    %s' % h.strip()[:120])
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and bool(stale)
+        record('M', 'M5', '存圖中途切回手動：存好也不規劃', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s、log %s' % (calls, state, bool(stale)))
+    finally:
+        rig.close()
+
+
 def summary():
     hdr('總結報告')
     # 輸出蓋章 (階段 38)：vehicle.yaml 還有暫定值時，摘要第一行標出來、摘要檔名加 _PROVISIONAL。
@@ -6281,10 +6580,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDHRLNOPQS'
+    phases = 'ABCDHRLNOPQSM'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHRLNOPQS'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHRLNOPQSM'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -6414,6 +6713,12 @@ def main():
         if 'S' in phases:
             try:
                 phase_s()
+            finally:
+                bg_stop_all()
+
+        if 'M' in phases:
+            try:
+                phase_m()
             finally:
                 bg_stop_all()
     except KeyboardInterrupt:

@@ -46,6 +46,7 @@ def generate_launch_description():
     allow_provisional = LaunchConfiguration('allow_provisional')
     override_reason = LaunchConfiguration('provisional_override_reason')
     use_lidar = LaunchConfiguration('use_lidar')
+    use_nav = LaunchConfiguration('use_nav')
     lidar_port = LaunchConfiguration('lidar_port')
 
     # ---- 0. 幾何閘門 (階段 38) -------------------------------------------
@@ -157,9 +158,22 @@ def generate_launch_description():
                 # 放開 LB、手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
                 'auto_requires_deadman': 'true',
                 'auto_requires_scan': 'true',
+                # 手把三種模式 (2026-10-18)：LB + A 才開始建圖、LB + B 先存圖再規劃割草
+                'mapping_on_button': 'true',
+                'save_map_before_f2c': 'true',
             }.items()
         )
     ])
+
+    # Nav2 (controller_server + 光達停止區) 也一起開，LB + B 規劃完才走得動 (2026-10-18)。
+    # 以前要另外開 navigation.launch.py (hardware_bringup.md 7-3)，沒開的話 LB + B 只會規劃、
+    # 車子不會走 —— use_nav:=false 保留這個用法 (car-start planonly)。
+    # Nav2 的速度指令一律經過 collision_monitor 與 mower_manager，只有 mode 1 而且按住 LB 才會到底盤。
+    navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_bringup, 'launch', 'navigation.launch.py')),
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
+        condition=IfCondition(use_nav))
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -225,13 +239,22 @@ def generate_launch_description():
         LogInfo(msg=['[bringup_real] 光達 RPLIDAR S3：use_lidar=', use_lidar,
                      ', lidar_port=', lidar_port]),
 
+        DeclareLaunchArgument(
+            'use_nav',
+            default_value='true',
+            description='是否一起啟動 Nav2 (navigation.launch.py)。false = 按 LB + B 只規劃路線、'
+                        '車子不會走 (只看規劃)。'),
+
+        LogInfo(msg=['[bringup_real] Nav2：use_nav=', use_nav]),
+
         geometry_guard,
         RegisterEventHandler(OnProcessExit(
             target_action=geometry_guard,
             on_exit=lambda event, _ctx: (
                 [bridge_node,
                  lidar_node,
-                 mower_control]
+                 mower_control,
+                 navigation]
                 if event.returncode == 0 else
                 [OpaqueFunction(function=_geometry_gate_failed)]))),
     ])

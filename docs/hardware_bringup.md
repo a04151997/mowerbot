@@ -463,6 +463,7 @@ M3 必須先過。
 
 按鍵對應（`mowerbot_bridge/config/joystick.yaml`）：LB = deadman（index 4）、RB = 急停（index 5）、
 A = 建圖模式、B = 自動割草、X = 手動；左搖桿上下 = 前後（全推 0.7 m/s）、左右 = 轉向（全推 1.2 rad/s）。
+實車上（2026-10-18 起）LB + A 才開始建圖、LB + B 先存圖再規劃，見 7-0。
 
 ### 指令
 
@@ -624,6 +625,25 @@ sudo apt install -y ros-humble-rplidar-ros
 **安全前提：落地；急停在手邊；旁邊有第二個人；場地淨空、沒有人或寵物在裡面。
 M0 ~ M6 與 M-1 全部完成、M-1 的結果已經交回來並確認規劃策略可行。**
 
+### 7-0 手把三種模式（2026-10-18）
+
+實車（`bringup_real.launch.py`）開機之後全部用手把切換，都是按住 LB 再按：
+
+| 按鍵 | 模式 | 實車上做什麼 |
+|------|------|--------------|
+| LB + X | 手動（mode 2，開機預設） | 純遙控車。**還沒按過 LB + A 之前沒有地圖** |
+| LB + A | 建圖（mode 0） | 第一次按的時候才開始建圖（`slam_scan_gate` 開始把 `/scan` 轉給 slam_toolbox）。開到要割的地方再按 |
+| LB + B | 自動割草（mode 1） | 先自動存一份地圖（`maps/f2c_<月日>_<時分秒>`，約 10 ~ 30 秒），存成功才規劃路線、開始走；存失敗就不規劃、車子不動。整趟要按住 LB |
+
+- 開始建圖之後就一直建到 bringup 關掉：切回手動或自動割草，SLAM 還是繼續收光達資料，
+  因為它同時負責定位（map -> odom）。要一張新的圖就重開 bringup。
+- 地圖的 map 座標系 = odom 座標系（bringup 開機的位置），從第一次按 LB + A 的地方開始有內容。
+- Nav2（controller_server + 光達停止區）跟著 bringup_real 一起開（`use_nav:=true`，預設）。
+  `use_nav:=false` 時 LB + B 只規劃路線（`/f2c_path` 看得到）、車子不會走。
+- 模擬（`use_sim_time:=true`）維持原樣：一開機就建圖、切 mode 1 直接規劃。
+  兩個開關是 `mower_control.launch.py` 的 `mapping_on_button`、`save_map_before_f2c`。
+- 測試：`python3 test/smoke_test.py --phases=M`（不需要 Gazebo）。
+
 ### 7-1 落地低速
 
 ```bash
@@ -639,14 +659,14 @@ ros2 launch mowerbot_bringup bringup_real.launch.py \
 ### 7-2 SLAM 建圖
 
 ```bash
-# bringup_real 維持開著（它已經包含建圖模式的 slam_toolbox）
+# bringup_real 維持開著（它已經包含 slam_toolbox；實車要按 LB + A 才開始建圖，見 7-0）
 ros2 topic hz /scan                                # 光達有資料
 ros2 run tf2_ros tf2_echo odom base_footprint      # 里程計 TF 有在動
 ros2 run tf2_ros tf2_echo base_link radar          # 光達外參對得上 M5
 rviz2 -d ~/mowerbot/src/mowerbot_description/rviz/mowerbot.rviz
 ```
 
-按住 LB + A 切到建圖模式，慢慢（搖桿推 1/3 以下）沿著場地邊界繞一圈，回到起點。然後存圖：
+按住 LB + A 切到建圖模式（地圖從這裡開始建），慢慢（搖桿推 1/3 以下）沿著場地邊界繞一圈，回到起點。然後存圖：
 
 ```bash
 ros2 run mowerbot_bringup save_map.sh <地圖名稱>
@@ -703,15 +723,15 @@ ros2 run mowerbot_action keepout_tool clear          # 清除禁區
 
 第一次不要直接跑整個覆蓋任務：
 
-1. 先確認 Nav2 起得來：
+1. 先確認 Nav2 起得來（2026-10-18 起 bringup_real 已經一起開 Nav2，不用另外開 navigation.launch.py）：
 
 ```bash
-ros2 launch mowerbot_bringup navigation.launch.py use_sim_time:=false
 ros2 lifecycle get /controller_server              # 要是 active
 ```
 
    這時 log 要有 `光達停止區開啟：車頭前 0.40 m`，`ros2 lifecycle get /collision_monitor` 也要是 active。
-2. 按住 LB + B 切到自動割草（mode 1）。manager 會自己從地圖萃取邊界、呼叫 F2C 規劃、開始執行。
+   第一次只想看規劃、不讓車子走：bringup_real 加 `use_nav:=false`。
+2. 按住 LB + B 切到自動割草（mode 1）。manager 先存一份地圖（7-0），存好才從地圖萃取邊界、呼叫 F2C 規劃、開始執行。
    **整趟都要按住 LB**：放開 LB、手把斷線、光達斷線，車子都會停（`mower_manager` 印 `⏸️ 自動模式暫停`），
    再按住就從原地接著走。停超過 15 秒，那一段會被當成失敗跳過。
 3. **第一趟刀盤不接電**，人跟在車旁邊，手放在急停上。
@@ -729,7 +749,7 @@ DWB 的權重、`xy_goal_tolerance`、跑道長度全部要在實車上重新實
 | 徵狀 | 原因 | 處理 |
 |------|------|------|
 | 建圖時地圖轉一轉就糊掉 | 九成是 M4 的 `wheel_separation_correction` 還不夠準 | 回 M4 用 `--turns=3` 重做原地旋轉 |
-| `controller_server` 卡在 inactive | 已知的 Nav2 生命週期競態（`simulation_results.md` 7.12 節，模擬裡也會發生） | 停掉 navigation.launch.py 重起一次；記下發生次數 |
+| `controller_server` 卡在 inactive | 已知的 Nav2 生命週期競態（`simulation_results.md` 7.12 節，模擬裡也會發生） | 整個 bringup_real 重起一次；記下發生次數 |
 | 每條割草線結尾都 `Failed to make progress`，車子在掉頭處原地打轉或不動 | 原地掉頭做不到或太慢 —— M-1 的情況 | 按急停。這不是調參數能解決的，交回來重新討論規劃策略 |
 
 ---

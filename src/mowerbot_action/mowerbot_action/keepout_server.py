@@ -4,6 +4,7 @@
 發布 (transient local)：
     /keepout_mask   nav_msgs/OccupancyGrid，map 座標系，100 = 禁區、0 = 不是。
                     map_to_boundary 與 local costmap 的 keepout_layer 都讀它。
+                    沒有禁區時是 odom 座標系的 1 x 1 空遮罩 (見 publish_empty)。
 服務 (std_srvs/srv/Trigger)：
     ~/session   回傳這次開機的 session_id (save_map.sh 存圖時記下來)
     ~/load      載入 <keepout_dir>/active.yaml (keepout_tool apply 寫的)
@@ -35,8 +36,10 @@ class KeepoutServer(Node):
         self.declare_parameter('keepout_dir', os.path.expanduser('~/.ros/mowerbot_keepout'))
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('mask_topic', '/keepout_mask')
+        self.declare_parameter('empty_frame', 'odom')
         self.keepout_dir = self.get_parameter('keepout_dir').value
         self.global_frame = self.get_parameter('global_frame').value
+        self.empty_frame = self.get_parameter('empty_frame').value
         mask_topic = self.get_parameter('mask_topic').value
 
         self.session_id = time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
@@ -56,8 +59,12 @@ class KeepoutServer(Node):
             f'要用這次開機存的地圖畫，再用 keepout_tool apply 套用。')
 
     def publish_empty(self):
+        # 空遮罩放在 odom，不放在 map (2026-10-18)：實車要按 LB + A 才開始建圖，在那之前
+        # 沒有 map 座標系。local costmap 的 keepout_layer (StaticLayer) 收到 map 座標系的遮罩
+        # 之後，每次更新都要查 map -> odom，查不到就印一行 ERROR (實測一秒約 3 行，直到開始建圖)。
+        # 空的遮罩放在哪個座標系都一樣是「沒有禁區」，odom 一開機就有。
         msg = OccupancyGrid()
-        msg.header.frame_id = self.global_frame
+        msg.header.frame_id = self.empty_frame
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.info.resolution = 0.05
         msg.info.width = 1
