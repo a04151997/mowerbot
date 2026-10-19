@@ -6354,6 +6354,8 @@ def phase_s():
 #   M3  存圖失敗 → 不呼叫 F2C、任務 ABORTED、訊息寫存圖失敗
 #   M4  存圖服務沒開 → 不呼叫 F2C、任務 ABORTED
 #   M5  存圖中途切回手動 → 存好之後也不呼叫 F2C
+#   M6  規劃好了先停著 (2026-10-19 will)：沒按住 LB 不送路線給 Nav2 (FollowPath 0 個 goal)，
+#       按住 LB 才送。以前算好就送，放開 LB 等超過 15 s 那一段就被 progress checker 判失敗跳過。
 # --------------------------------------------------------------------------
 M_FAKE_AUTOSAVE = r"""
 import sys, time, rclpy
@@ -6458,8 +6460,10 @@ class MRig(object):
         from rclpy.qos import qos_profile_sensor_data
         from sensor_msgs.msg import LaserScan
         from geometry_msgs.msg import PolygonStamped, Point32
-        from mowerbot_interfaces.msg import MissionStatus
+        from mowerbot_interfaces.msg import MissionStatus, JoyStatus
         from mowerbot_interfaces.srv import SetDriveMode, GenerateCoveragePath
+        from nav2_msgs.action import FollowPath
+        from rclpy.action import ActionServer
 
         self.manager = bg_start('M_mower_manager',
                                 ['ros2', 'run', 'mowerbot_action', 'mower_manager',
@@ -6488,6 +6492,16 @@ class MRig(object):
                                for x, y in ((0, 0), (10, 0), (10, 8), (0, 8))]
         self.poly = poly
         self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        # M6：F2C 回一條路線、假 Nav2 只數 FollowPath goal 的個數 (收到就回成功)
+        self.plan_ok = False
+        self.follow_goals = 0
+        self.FollowPath = FollowPath
+        self._follow_srv = ActionServer(self.node, FollowPath, 'follow_path', self._follow_exec,
+                                        goal_callback=self._follow_goal)
+        # None = 不發 /joy_status (M1 ~ M5)；True / False = 手把連著、LB 按住 / 放開
+        self.JoyStatus = JoyStatus
+        self.deadman = None
+        self.joy_pub = self.node.create_publisher(JoyStatus, '/joy_status', 10)
         self.node.create_timer(0.1, self._tick)
 
     def _slam_cb(self, _m):
@@ -6496,7 +6510,26 @@ class MRig(object):
     def _plan_cb(self, _req, resp):
         self.planner_calls += 1
         resp.success = False
+        if self.plan_ok:
+            from geometry_msgs.msg import PoseStamped
+            resp.coverage_path.header.frame_id = 'map'
+            for k in range(61):
+                p = PoseStamped()
+                p.header.frame_id = 'map'
+                p.pose.position.x, p.pose.position.y = 2.0 + 0.1 * k, 4.0
+                p.pose.orientation.w = 1.0
+                resp.coverage_path.poses.append(p)
+            resp.success = True
         return resp
+
+    def _follow_goal(self, _goal):
+        from rclpy.action import GoalResponse
+        self.follow_goals += 1
+        return GoalResponse.ACCEPT
+
+    def _follow_exec(self, handle):
+        handle.succeed()
+        return self.FollowPath.Result()
 
     def _tick(self):
         m = self.LaserScan()
@@ -6508,6 +6541,12 @@ class MRig(object):
         m.ranges = [5.0] * 360
         self.scan_pub.publish(m)
         self.boundary_pub.publish(self.poly)
+        if self.deadman is not None:
+            js = self.JoyStatus()
+            js.header.stamp = m.header.stamp
+            js.connected = True
+            js.deadman_held = bool(self.deadman)
+            self.joy_pub.publish(js)
 
     def start_autosave(self, mode, delay=0.0):
         self.stop_autosave()
@@ -6562,7 +6601,7 @@ def phase_m():
         if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
             print(rig.manager.log_tail(30))
             for cid, name in (('M1', '建圖開關'), ('M2', '對照組'), ('M3', '存圖失敗'),
-                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走')):
+                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走'), ('M6', '規劃好先停著')):
                 record('M', cid, name, 'FIXTURE', 'mower_manager 沒起來')
             return
 
@@ -6601,7 +6640,8 @@ def phase_m():
         record('M', 'M2', '對照組：存圖成功就呼叫 F2C', 'PASS' if control_ok else 'FIXTURE',
                '' if control_ok else 'F2C 被呼叫 %d 次 (應為 1)，M3 ~ M5 不算數' % called)
         later = (('M3', '存圖失敗：不規劃、任務中止'), ('M4', '存圖服務沒開：不規劃、任務中止'),
-                 ('M5', '存圖中途切回手動：存好也不規劃'))
+                 ('M5', '存圖中途切回手動：存好也不規劃'),
+                 ('M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送'))
         if not control_ok:
             for cid, name in later:
                 record('M', cid, name, 'FIXTURE', '管道沒有驗證 (M2 沒過)')
@@ -6644,6 +6684,46 @@ def phase_m():
         ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and bool(stale)
         record('M', 'M5', '存圖中途切回手動：存好也不規劃', 'PASS' if ok else 'FAIL',
                'F2C 呼叫 %d 次、state %s、log %s' % (calls, state, bool(stale)))
+
+        hdr('M6  規劃好了先停著：沒按住 LB 不送路線，按住才送')
+        rig.plan_ok = True
+        # manager 不知道車子在哪裡就不啟動任務：車子放在邊界 (0~10, 0~8) 中間
+        import tf2_ros
+        from geometry_msgs.msg import TransformStamped
+        tf_pub = tf2_ros.StaticTransformBroadcaster(rig.node)
+        t = TransformStamped()
+        t.header.stamp = rig.node.get_clock().now().to_msg()
+        t.header.frame_id, t.child_frame_id = 'map', 'base_footprint'
+        t.transform.translation.x, t.transform.translation.y = 5.0, 4.0
+        t.transform.rotation.w = 1.0
+        tf_pub.sendTransform(t)
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        rig.deadman = False
+        rig.spin(1.0)
+        g0 = rig.follow_goals
+        rig.set_mode(1)
+        t_end = time.time() + 20.0
+        while time.time() < t_end and not (
+                rig.mission and rig.mission.state == rig.MissionStatus.STATE_EXECUTING):
+            rig.spin(0.2)
+        executing = bool(rig.mission and rig.mission.state == rig.MissionStatus.STATE_EXECUTING)
+        rig.spin(5.0)
+        before = rig.follow_goals - g0
+        msg = rig.mission.message if rig.mission else ''
+        sub('LB 放開：任務 EXECUTING = %s，5 s 內 FollowPath goal %d 個，訊息 %r'
+            % (executing, before, msg[:80]))
+        rig.deadman = True
+        rig.spin(3.0)
+        after = rig.follow_goals - g0
+        sub('按住 LB 3 s：FollowPath goal 累計 %d 個' % after)
+        for h in rig.manager.log_grep(r'等按住 LB|按住 LB 了', 3):
+            sub('    %s' % h.strip()[:120])
+        rig.deadman = False
+        rig.set_mode(2)
+        rig.plan_ok = False
+        ok = executing and before == 0 and '按住 LB' in msg and after >= 1
+        record('M', 'M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送', 'PASS' if ok else 'FAIL',
+               'LB 放開 goal %d 個、按住後 %d 個' % (before, after))
     finally:
         rig.close()
 

@@ -284,6 +284,12 @@ class MowerManager(Node):
         self._joy_status_time = None
         self._scan_time = None
         self._auto_block_prev = None    # 上一次的暫停原因，只在變化時印 log
+        # 規劃好之後先等放行條件成立才送第一段 (2026-10-19 will)：只在 auto_requires_deadman 時。
+        # 以前算好就送，沒按住 LB 時車子雖然不動，但 Nav2 的 progress checker 15 s 一到就把那一段
+        # 判失敗跳過，連續 max_consecutive_failures 段整個任務停止，所以沒辦法「先慢慢看路線再出發」。
+        # 還沒送任何一段之前沒有 goal、不會逾時；一成立就送，之後放開 LB 一樣是暫停 (行為不變)。
+        self._wait_deadman_start = False
+        self.create_timer(0.1, self.maybe_start_waiting)
         self.joy_status_sub = self.create_subscription(
             JoyStatus, '/joy_status', self.joy_status_cb, 10)
         if self.auto_requires_scan:
@@ -380,6 +386,8 @@ class MowerManager(Node):
     def joy_status_cb(self, msg):
         self._joy_status = msg
         self._joy_status_time = self.get_clock().now()
+        # LB 一按下 teleop 就立刻發一筆，這裡馬上判斷，不等 0.1 s 的定時器
+        self.maybe_start_waiting()
 
     def scan_cb(self, _msg):
         # 用收到的時間，不用 header.stamp：只要判斷「光達還有沒有在送」，不受光達時間戳影響
@@ -780,6 +788,7 @@ class MowerManager(Node):
         self._align_phase = False
         self._aligned_idx = None
         self._reset_approach_tracking()
+        self._wait_deadman_start = False
 
     def cancel_current_goal(self):
         """取消目前正在執行的 FollowPath goal
@@ -1494,6 +1503,31 @@ class MowerManager(Node):
             f'(往後 {skipped:.2f} m)')
         return sub
 
+    def begin_execution(self):
+        """規劃好了，開始送第一段。實車 (auto_requires_deadman) 放行條件不成立時先等，見 _wait_deadman_start。"""
+        if self.auto_requires_deadman and self.auto_block_reason() is not None:
+            self._wait_deadman_start = True
+            self.set_mission_state(
+                MissionStatus.STATE_EXECUTING,
+                message='路線規劃好了，按住 LB 才開始走（還沒按之前不會出發，可以慢慢看路線）。')
+            self.get_logger().info('🗺️ 路線規劃好了，等按住 LB 才送出第一段。')
+            return
+        self.send_next_swath()
+
+    def maybe_start_waiting(self):
+        """在等按住 LB 的任務，放行條件一成立就送出第一段。"""
+        if not self._wait_deadman_start:
+            return
+        if self.current_mode not in (1, 3) or not self._swath_queue:
+            self._wait_deadman_start = False
+            return
+        if self.auto_block_reason() is not None:
+            return
+        self._wait_deadman_start = False
+        self._mission_message = ''
+        self.get_logger().info('▶️ 按住 LB 了，開始走。')
+        self.send_next_swath()
+
     def send_next_swath(self):
         """送出佇列裡的下一個任務 (approach 或割草線)"""
         self.maybe_insert_approach()
@@ -1867,7 +1901,7 @@ class MowerManager(Node):
                         '📋 佇列 %d/%d [%s] 起點 (%.2f, %.2f) 終點 (%.2f, %.2f) '
                         '長度 %.2f m' % (i + 1, len(queue), lbl,
                                         a.x, a.y, b.x, b.y, length))
-                self.send_next_swath()
+                self.begin_execution()
             else:
                 self.get_logger().error('⚠️ F2C 伺服器回報路徑規劃失敗！')
                 self.set_mission_state(MissionStatus.STATE_ABORTED)
