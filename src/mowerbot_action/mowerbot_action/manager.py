@@ -319,6 +319,8 @@ class MowerManager(Node):
         self.nav_sub = self.create_subscription(Twist, '/cmd_vel_nav', self.nav_vel_cb,10)
         
         self.srv = self.create_service(SetDriveMode,'change_mower_mode',self.change_mode_callback)
+        # 手把 Y 預覽路線 (2026-10-19 will)：照 LB + B 的流程算一次，發到 /f2c_path 給人看，不執行
+        self.preview_srv = self.create_service(Trigger, '~/preview', self.preview_cb)
 
         self.timer = self.create_timer(0.05,self.safety_check)
         # 訂閱最新算出的綠色邊界
@@ -526,18 +528,31 @@ class MowerManager(Node):
         """隨時更新作業區內部的障礙物輪廓"""
         self.latest_obstacles = list(msg.polygons)
 
-    def call_f2c_planner(self):
-        """打包邊界並發送給 C++ 伺服器"""
+    def preview_cb(self, _req, resp):
+        """手把 Y：預覽割草路線。規劃與 LB + B 完全相同 (同一張圖、同一個禁區、同樣的檢查)，
+        只是最後不送給 Nav2：任務回到 IDLE，訊息寫路線摘要。車子不會動。"""
+        if self.current_mode in (1, 3):
+            resp.success, resp.message = False, '自動割草中不預覽'
+        elif self._mission_state == MissionStatus.STATE_PLANNING:
+            resp.success, resp.message = False, '正在規劃，等它算完'
+        else:
+            self.get_logger().info('👀 預覽路線 (手把 Y)：照 LB + B 的流程規劃，不執行。')
+            self.call_f2c_planner(preview=True)
+            resp.success, resp.message = True, '開始規劃預覽'
+        return resp
+
+    def call_f2c_planner(self, preview=False):
+        """打包邊界並發送給 C++ 伺服器。preview = 只算出路線給人看 (手把 Y)，不執行"""
         if self.latest_boundary is None:
             if self._boundary_seen > 0:
-                self.get_logger().error(
-                    f'⚠️ 收過 {self._boundary_seen} 個邊界但都沒通過檢查'
-                    f'（面積至少要 {self.min_boundary_area:.2f} m²、頂點至少 4 個）。'
-                    f'請繼續在建圖模式下把場地繞完，地圖夠大之後邊界才會合理。')
+                text = (f'收過 {self._boundary_seen} 個邊界但都沒通過檢查'
+                        f'（面積至少要 {self.min_boundary_area:.2f} m²、頂點至少 4 個）。'
+                        f'請繼續在建圖模式下把場地繞完，地圖夠大之後邊界才會合理。')
             else:
-                self.get_logger().error(
-                    '⚠️ 尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+                text = '尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。'
+            self.get_logger().error('⚠️ ' + text)
+            # 原因也寫進任務訊息：car-status 看得到，不用翻 log
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             return
 
         # 規劃之前先看車子自己站得下站不下。這一項擋的是「車子當下停的位置」，
@@ -575,7 +590,9 @@ class MowerManager(Node):
             f'🚀 正在將邊界發送給 F2C 伺服器進行運算...'
             f' (內部障礙物 {len(req.obstacles)} 個)')
         future = self.f2c_client.call_async(req)
-        future.add_done_callback(self.f2c_response_callback)
+        # 記下送出時的模式 epoch：規劃結果回來時模式已經切換過就丟掉，不要拿舊的結果開始任務
+        epoch = self._mode_epoch
+        future.add_done_callback(lambda f: self.f2c_response_callback(f, preview, epoch))
 
     # 模式切換服務
     # 模式切換服務
@@ -1807,12 +1824,20 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future):
+    def f2c_response_callback(self, future, preview=False, epoch=None):
         """
-        接收 C++ 算好的路徑並廣播與導航
+        接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
         try:
             response = future.result()
+            if preview and self.current_mode in (1, 3):
+                # 預覽還沒算完就按了 LB + B：真的規劃已經接手，不要蓋掉它的狀態
+                self.get_logger().warn('👀 預覽結果回來了，但已經切到自動割草，丟掉不用。')
+                return
+            if not preview and epoch is not None and epoch != self._mode_epoch:
+                # 規劃中切走 (離開 mode 1 時任務已經標成中止) 或又按了一次 LB + B (新的規劃接手)
+                self.get_logger().warn('🗺️ 規劃結果回來了，但這中間模式已經切換過，不執行。')
+                return
             if response.success:
                 self.get_logger().info(f'🎉 成功拿到 F2C 路徑！總航點數: {len(response.coverage_path.poses)}')
                 # 【關鍵】：把路徑廣播出去給 RViz2 畫圖
@@ -1873,6 +1898,14 @@ class MowerManager(Node):
                 # 現在統一由 send_next_swath() 呼叫 maybe_insert_approach()，
                 # 正常推進、跳過之後、任務開頭全部走同一條路徑。
                 _ = robot_xy
+
+                if preview:
+                    text = ('路線預覽：割草線 %d 條%s，共 %d 段。車子不會動；'
+                            'OK 就按住 LB 再按 B 開始割。'
+                            % (total, '、周邊環繞 %d 段' % n_edges if n_edges else '', len(queue)))
+                    self.get_logger().info('👀 ' + text)
+                    self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
+                    return
 
                 self._swath_queue = queue
                 self._swath_total = total

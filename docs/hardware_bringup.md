@@ -462,8 +462,8 @@ ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{angular: {z: -0.3}}"    
 M3 必須先過。
 
 按鍵對應（`mowerbot_bridge/config/joystick.yaml`）：LB = deadman（index 4）、RB = 急停（index 5）、
-A = 建圖模式、B = 自動割草、X = 手動；左搖桿上下 = 前後（全推 0.7 m/s）、左右 = 轉向（全推 1.2 rad/s）。
-實車上（2026-10-18 起）LB + A 才開始建圖、LB + B 先存圖再規劃，見 7-0。
+A = 建圖模式、B = 自動割草、X = 手動、Y = 存圖 + 預覽割草路線（不用按 LB）；左搖桿上下 = 前後（全推 0.7 m/s）、左右 = 轉向（全推 1.2 rad/s）。
+實車上（2026-10-18 起）LB + A 才開始建圖；2026-10-19 起 Y 存圖 + 預覽、LB + B 直接規劃割草，見 7-0。
 
 ### 指令
 
@@ -627,21 +627,24 @@ M0 ~ M6 與 M-1 全部完成、M-1 的結果已經交回來並確認規劃策略
 
 ### 7-0 手把三種模式（2026-10-18）
 
-實車（`bringup_real.launch.py`）開機之後全部用手把切換，都是按住 LB 再按：
+實車（`bringup_real.launch.py`）開機之後全部用手把切換，模式都是按住 LB 再按（Y 不用按 LB）：
 
 | 按鍵 | 模式 | 實車上做什麼 |
 |------|------|--------------|
 | LB + X | 手動（mode 2，開機預設） | 純遙控車。**還沒按過 LB + A 之前沒有地圖** |
 | LB + A | 建圖（mode 0） | 第一次按的時候才開始建圖（`slam_scan_gate` 開始把 `/scan` 轉給 slam_toolbox）。開到要割的地方再按 |
-| LB + B | 自動割草（mode 1） | 先自動存一份地圖（`maps/f2c_<月日>_<時分秒>`，約 10 ~ 30 秒），存成功才規劃路線、開始走；存失敗就不規劃、車子不動。整趟要按住 LB |
+| Y | （不切模式） | 存一份地圖（`maps/map_<月日>_<時分秒>`，約 10 ~ 30 秒，結果在 `/map_autosave/last`），同時照 LB + B 的流程算一次割草路線發到 `/f2c_path`，**車子不動**、任務回到 IDLE，訊息寫路線摘要。自動割草（mode 1 / 3）中按 Y 不做事 |
+| LB + B | 自動割草（mode 1） | 直接規劃路線（約 1 秒，跟 Y 預覽的同一張圖、同一個禁區）。規劃好之後**要按住 LB 才送第一段**；整趟要按住 LB |
 
 - 開始建圖之後就一直建到 bringup 關掉：切回手動或自動割草，SLAM 還是繼續收光達資料，
   因為它同時負責定位（map -> odom）。要一張新的圖就重開 bringup。
 - 地圖的 map 座標系 = odom 座標系（bringup 開機的位置），從第一次按 LB + A 的地方開始有內容。
 - Nav2（controller_server + 光達停止區）跟著 bringup_real 一起開（`use_nav:=true`，預設）。
   `use_nav:=false` 時 LB + B 只規劃路線（`/f2c_path` 看得到）、車子不會走。
+- 割草範圍只取**車子所在的那一塊**空地（`map_to_boundary` 的 `boundary_region:=robot`，預設）：
+  紅線圍一圈、車子停在圈裡，就只割圈裡面。查不到車子位置時退回取最大的一塊（`boundary_region:=largest` 是舊行為）。
 - 模擬（`use_sim_time:=true`）維持原樣：一開機就建圖、切 mode 1 直接規劃。
-  兩個開關是 `mower_control.launch.py` 的 `mapping_on_button`、`save_map_before_f2c`。
+  開關是 `mower_control.launch.py` 的 `mapping_on_button`、`save_map_before_f2c`（LB + B 先存圖再規劃，2026-10-19 起 bringup_real 關掉，改用 Y 存圖）。
 - 測試：`python3 test/smoke_test.py --phases=M`（不需要 Gazebo）。
 
 ### 7-1 落地低速
@@ -734,8 +737,8 @@ ros2 lifecycle get /controller_server              # 要是 active
 ```
 
    這時 log 要有 `光達停止區開啟：車頭前 0.40 m`，`ros2 lifecycle get /collision_monitor` 也要是 active。
-   第一次只想看規劃、不讓車子走：bringup_real 加 `use_nav:=false`。
-2. 按住 LB + B 切到自動割草（mode 1）。manager 先存一份地圖（7-0），存好才從地圖萃取邊界、呼叫 F2C 規劃、開始執行。
+   第一次只想看規劃、不讓車子走：按 Y 預覽（7-0），或 bringup_real 加 `use_nav:=false`。
+2. 按住 LB + B 切到自動割草（mode 1）。manager 用目前的地圖萃取的邊界呼叫 F2C 規劃，規劃好、LB 按著才開始執行。
    **整趟都要按住 LB**：放開 LB、手把斷線、光達斷線，車子都會停（`mower_manager` 印 `⏸️ 自動模式暫停`），
    再按住就從原地接著走。停超過 15 秒，那一段會被當成失敗跳過。
 3. **第一趟刀盤不接電**，人跟在車旁邊，手放在急停上。

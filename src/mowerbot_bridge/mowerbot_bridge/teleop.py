@@ -33,11 +33,14 @@ class MowerTeleop(Node):
         self.vel_pub = self.create_publisher(Twist,'/cmd_vel_joy',10)
         self.mode_client = self.create_client(SetDriveMode ,'change_mower_mode')
 
-        # ---- Y = 存圖 (2026-10-19 will) ----
-        # 呼叫 /map_autosave/save (save_map.sh，跟 car-savemap 同一支)，存成 map_<月日>_<時分秒>。
+        # ---- Y = 存圖 + 預覽割草路線 (2026-10-19 will) ----
+        # 存圖：呼叫 /map_autosave/save (save_map.sh，跟 car-savemap 同一支)，存成 map_<月日>_<時分秒>。
+        # 預覽：呼叫 /mower_manager/preview，照 LB + B 的流程算一次路線發到 /f2c_path，不執行；
+        # 看了 OK 再按 LB + B 開始割 (同一張圖、同一個禁區，算出來的路線一樣)。
         # 存圖不會讓車子動，所以不用按住 LB；自動割草 (mode 1 / 3) 中不存：存圖時 slam_toolbox
         # 序列化地圖要吃 CPU，不要在車子自己走的時候做。結果寫在 log 與 /map_autosave/last (car-status 看得到)。
         self.save_client = self.create_client(Trigger, 'map_autosave/save')
+        self.preview_client = self.create_client(Trigger, 'mower_manager/preview')
         self._save_future = None
         self._mode = None
         self.create_subscription(MowerStatus, 'mower_status', self._status_cb, 10)
@@ -56,7 +59,7 @@ class MowerTeleop(Node):
         #手把鎖定
         #False表示目前是鎖定
         self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）；'
-                               'Y = 存圖 (不用按 LB)')
+                               'Y = 存圖 + 預覽割草路線 (不用按 LB)')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
 
@@ -97,10 +100,15 @@ class MowerTeleop(Node):
         self._mode = msg.mode
 
     def save_map(self):
-        """Y：存一份地圖。只在這裡判斷能不能存，實際存圖與檢查交給 map_autosave。"""
+        """Y：預覽割草路線 + 存一份地圖。只在這裡判斷能不能做，實際規劃與存圖交給 manager 與 map_autosave。"""
         if self._mode in (1, 3):
             self.get_logger().warn('Y 存圖：自動割草中不存圖。放開 LB 等車停，LB + X 回手動再按 Y。')
             return
+        # 預覽先送：規劃約 1 秒，存圖要 10 ~ 30 秒，路線不用等存圖
+        if self.preview_client.service_is_ready():
+            self.preview_client.call_async(Trigger.Request()).add_done_callback(self._preview_done)
+        else:
+            self.get_logger().error('Y 預覽路線：mower_manager 的預覽服務沒有開。')
         if self._save_future is not None and not self._save_future.done():
             self.get_logger().warn('Y 存圖：上一次還在存，等它存完 (約 10 ~ 30 秒)。')
             return
@@ -110,6 +118,13 @@ class MowerTeleop(Node):
         self.get_logger().info('Y 存圖：開始存圖 (約 10 ~ 30 秒)...')
         self._save_future = self.save_client.call_async(Trigger.Request())
         self._save_future.add_done_callback(self._save_done)
+
+    def _preview_done(self, future):
+        res = future.result()
+        if res is not None and res.success:
+            self.get_logger().info('Y 預覽路線：開始規劃，結果看 /f2c_path 與 car-status 的任務訊息')
+        else:
+            self.get_logger().warn('Y 預覽路線：沒有預覽 (%s)' % (res.message if res is not None else '沒有回應'))
 
     def _save_done(self, future):
         res = future.result()

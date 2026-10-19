@@ -5006,15 +5006,16 @@ def phase_p():
                % (connected_while, deadman_while,
                   after[1] if after else None, after[2] if after else None))
 
-        # ---- P11 手把 Y 鍵沒有繫結 ----
+        # ---- P11 手把 Y 鍵不切模式 ----
         #
         # Y 以前會呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
         # （需要 planner_server + bt_navigator）。階段 23 把那個分支拿掉了，
-        # 這一項確認它真的沒有回來，而且沒有被拿去做別的事。
+        # 這一項確認它真的沒有回來。2026-10-19 起 Y = 存圖 + 預覽割草路線 (will 要的)，
+        # 兩件事都不切模式、車子不動 (Phase M 的 M7 / M8 驗)，所以這一項照樣成立。
         #
         # mode 值 3 本身、manager 對 mode 3 的仲裁、以及 P7 / P9 / N6 那些
         # **用服務**設 mode 3 的測試全部不受影響 —— 它們本來就不經過手把。
-        hdr('P11  按下手把 Y 鍵不會改變模式（Y 未繫結）')
+        hdr('P11  按下手把 Y 鍵不會改變模式（Y = 存圖 + 預覽，不切模式）')
         # 按鈕順序 = [A, B, X, Y, LB(deadman), 急停]
         JOY_NONE = [0, 0, 0, 0, 1, 0]            # 只按住 LB
         JOY_Y    = [0, 0, 0, 1, 1, 0]            # LB + Y
@@ -6612,7 +6613,7 @@ def phase_m():
             print(rig.manager.log_tail(30))
             for cid, name in (('M1', '建圖開關'), ('M2', '對照組'), ('M3', '存圖失敗'),
                               ('M4', '存圖服務沒開'), ('M5', '存圖中途切走'), ('M6', '規劃好先停著'),
-                              ('M7', '手把 Y 存圖')):
+                              ('M7', '手把 Y 存圖'), ('M8', '手把 Y 預覽路線')):
                 record('M', cid, name, 'FIXTURE', 'mower_manager 沒起來')
             return
 
@@ -6653,7 +6654,8 @@ def phase_m():
         later = (('M3', '存圖失敗：不規劃、任務中止'), ('M4', '存圖服務沒開：不規劃、任務中止'),
                  ('M5', '存圖中途切回手動：存好也不規劃'),
                  ('M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送'),
-                 ('M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫'))
+                 ('M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫'),
+                 ('M8', '手把 Y 預覽路線：只算路線不出發 (LB 按著也不動)、之後 LB + B 照常割'))
         if not control_ok:
             for cid, name in later:
                 record('M', cid, name, 'FIXTURE', '管道沒有驗證 (M2 沒過)')
@@ -6778,10 +6780,47 @@ def phase_m():
         refused = teleop.log_grep(r'自動割草中不存圖', 2)
         sub('手動模式按 Y (沒按 LB)：存圖服務被呼叫 %d 次' % manual)
         sub('自動割草 (mode 1) 按 Y：存圖服務被呼叫 %d 次；teleop log %s' % (auto, bool(refused)))
-        teleop.stop()
         ok = manual == 1 and auto == 0 and bool(refused)
         record('M', 'M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫', 'PASS' if ok else 'FAIL',
                '手動 %d 次、自動割草 %d 次' % (manual, auto))
+
+        hdr('M8  手把 Y = 存圖 + 預覽路線：只算路線、發 /f2c_path，LB 按著車子也不動；之後 LB + B 照常割')
+        from nav_msgs.msg import Path
+        paths = []
+        rig.node.create_subscription(Path, '/f2c_path', paths.append, 10)
+        rig.plan_ok = True
+        rig.spin(1.0)
+        n0, g0, p0, c0 = rig.planner_calls, rig.follow_goals, len(paths), calls()
+        press_y()
+        rig.spin(3.0)
+        # 換成「LB 一直按著」：teleop 關掉，改由 rig 發 /joy_status (兩邊一起發會互相蓋掉)
+        teleop.stop()
+        rig.deadman = True
+        rig.spin(5.0)
+        ms = rig.mission
+        msg = ms.message if ms else ''
+        plans, goals, got_path, saves = (rig.planner_calls - n0, rig.follow_goals - g0,
+                                         len(paths) - p0, calls() - c0)
+        sub('手動模式按 Y：F2C 呼叫 %d 次、/f2c_path %d 則、存圖 %d 次；之後 LB 按住 5 s：'
+            'FollowPath goal %d 個，任務 state %s，訊息 %r'
+            % (plans, got_path, saves, goals, ms.state if ms else None, msg[:80]))
+        preview_ok = (plans == 1 and got_path >= 1 and saves == 1 and goals == 0
+                      and ms is not None and ms.state == rig.MissionStatus.STATE_IDLE
+                      and '路線預覽' in msg)
+        rig.set_mode(1)
+        t_end = time.time() + 15.0
+        while time.time() < t_end and rig.follow_goals - g0 < 1:
+            rig.spin(0.2)
+        mow = rig.follow_goals - g0
+        sub('預覽完 LB + B (LB 按著)：FollowPath goal %d 個' % mow)
+        rig.deadman = False
+        rig.set_mode(2)
+        rig.plan_ok = False
+        ok = preview_ok and mow >= 1
+        record('M', 'M8', '手把 Y 預覽路線：只算路線不出發 (LB 按著也不動)、之後 LB + B 照常割',
+               'PASS' if ok else 'FAIL',
+               'F2C %d 次、路線 %d 則、存圖 %d 次、預覽時 goal %d 個、LB + B 後 %d 個'
+               % (plans, got_path, saves, goals, mow))
     finally:
         rig.close()
 
