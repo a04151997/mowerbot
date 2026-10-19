@@ -11,6 +11,7 @@ from launch.conditions import IfCondition
 from launch_ros.actions import Node, SetParameter
 
 from mowerbot_action.manager import DEFAULT_OVERLAP_RATIO, WAYPOINT_SPACING
+from mowerbot_action import swath_angle
 from mowerbot_description import vehicle_geometry
 
 def check_headland(context, geom, nav2_params_path):
@@ -46,10 +47,11 @@ def launch_bool(value, name):
     raise RuntimeError('%s 只能是 true 或 false，收到 %r' % (name, value))
 
 
-# 自動模式的放行條件 (2026-10-15)：mower_manager 的兩個參數，說明見 manager.py。
+# 自動模式的放行條件 (2026-10-15)：mower_manager 的三個參數，說明見 manager.py。
 # launch 參數留空 = 跟著 use_sim_time 走：實車 (false) 開、模擬 (true) 關。
 # 模擬沒有手把；Gazebo 的既有測試 (Phase C/N/O/P/Q/L) 也都是不按 LB 直接切 mode 1。
-AUTO_GATES = ('auto_requires_deadman', 'auto_requires_scan')
+# auto_requires_joystick (2026-10-19)：手把連著就好、不用按住 LB；bringup_real 用它取代 deadman。
+AUTO_GATES = ('auto_requires_deadman', 'auto_requires_joystick', 'auto_requires_scan')
 
 
 def resolve_sim_default(context, keys):
@@ -65,6 +67,21 @@ def resolve_sim_default(context, keys):
 
 def resolve_auto_gates(context):
     return resolve_sim_default(context, AUTO_GATES)
+
+
+def resolve_swath_angle(context):
+    """割草線方向 (2026-10-19)：auto 或角度 (度)。留空 = 跟著 use_sim_time：實車 auto、模擬 0
+    (Gazebo 的既有測試與報告數據都是沿 x 軸的割草線)。其他值拒絕啟動，不要猜。"""
+    sim = launch_bool(LaunchConfiguration('use_sim_time', default='true').perform(context),
+                      'use_sim_time')
+    v = LaunchConfiguration('swath_angle').perform(context).strip().lower()
+    if v == '':
+        return '0' if sim else 'auto'
+    try:
+        swath_angle.parse_angle(v)
+    except ValueError as e:
+        raise RuntimeError(str(e))
+    return v
 
 
 # 手把模式 (2026-10-18 will)：LB + X 手動 (純遙控車)、LB + A 開始建圖、LB + B 規劃割草、Y 存圖 (10-19)。
@@ -235,10 +252,12 @@ def generate_launch_description():
     def manager_action(context):
         gates = resolve_auto_gates(context)
         gates['save_map_before_f2c'] = resolve_mode_options(context)['save_map_before_f2c']
-        log = LogInfo(msg='[mower_control] 自動模式放行條件：按住 LB = %s，光達 /scan 不中斷 = %s；'
-                          '切到自動割草先存圖 = %s'
-                          % (gates['auto_requires_deadman'], gates['auto_requires_scan'],
-                             gates['save_map_before_f2c']))
+        gates['swath_angle'] = resolve_swath_angle(context)
+        log = LogInfo(msg='[mower_control] 自動模式放行條件：按住 LB = %s，手把連線 = %s，'
+                          '光達 /scan 不中斷 = %s；切到自動割草先存圖 = %s；割草線方向 = %s'
+                          % (gates['auto_requires_deadman'], gates['auto_requires_joystick'],
+                             gates['auto_requires_scan'], gates['save_map_before_f2c'],
+                             gates['swath_angle']))
         manager_node = Node(
             package='mowerbot_action',
             executable='mower_manager',
@@ -258,6 +277,8 @@ def generate_launch_description():
                 'rotation_swept_radius': geom.rotation_swept_radius,
                 'soft_inflation_radius': geom.soft_inflation_radius,
                 'blade_width': geom.blade_width,
+                # 割草線方向 auto 跟 F2C 一樣在扣掉地頭的區域上挑 (2026-10-19)
+                'headland_width': geom.headland_width,
                 # 周邊環繞的轉角偵測 (vehicle_geometry) 與起點 = 終點的判定門檻 (nav2)
                 'perimeter_corner_window': geom.perimeter_corner_window,
                 'perimeter_corner_angle': geom.perimeter_corner_angle,
@@ -303,6 +324,13 @@ def generate_launch_description():
                         '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
         ),
         DeclareLaunchArgument(
+            'auto_requires_joystick',
+            default_value='',
+            description='自動模式 (mode 1/3) 手把要連著才轉發 Nav2 速度指令 (不用按住 LB；'
+                        '斷線過要重新連上再按一下 LB)。auto_requires_deadman 開著時沒有作用。'
+                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+        ),
+        DeclareLaunchArgument(
             'auto_requires_scan',
             default_value='',
             description='自動模式 (mode 1/3) 光達 /scan 中斷超過 0.5 s 就停車。'
@@ -315,6 +343,12 @@ def generate_launch_description():
             default_value='',
             description='按 LB + A (建圖模式) 才開始建圖，在那之前 slam_toolbox 收不到光達資料；'
                         '同時開 map_autosave 給手把 Y 存圖。留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+        ),
+        DeclareLaunchArgument(
+            'swath_angle',
+            default_value='',
+            description='割草線方向：auto = 每次規劃挑掉頭最少的方向，數字 = 固定角度 (度，從 map 的 x 軸量)。'
+                        '留空 = 跟著 use_sim_time：實車 auto、模擬 0。'
         ),
         DeclareLaunchArgument(
             'save_map_before_f2c',

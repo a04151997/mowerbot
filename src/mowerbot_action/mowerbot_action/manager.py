@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import math
+from concurrent.futures import ThreadPoolExecutor
 import tf2_ros
 from action_msgs.msg import GoalStatus
 from rclpy.duration import Duration
 from rclpy.time import Time
-from geometry_msgs.msg import PolygonStamped, PoseStamped
+from geometry_msgs.msg import Point32, Polygon, PolygonStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path
 from mowerbot_interfaces.srv import GenerateCoveragePath
@@ -19,6 +20,8 @@ from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
 from std_srvs.srv import Trigger
+from rcl_interfaces.msg import ParameterDescriptor
+from mowerbot_action import swath_angle
 
 # ---- 跨檔共用的預設值：單一來源 (階段 38 修正 3 原則 7) ----
 # 以前 launch 檔、HMI、smoke_test 各寫一份並註明「要一致」；現在它們都 import 這裡。
@@ -207,6 +210,29 @@ class MowerManager(Node):
                 f'割草線間距 {self.swath_spacing:.3f} m —— 相鄰割草線之間永遠不會插入 approach，'
                 f'每一條割草線都會帶著約 {self.swath_spacing:.2f} m 的側向差起步')
 
+        # ---- 割草線方向 (2026-10-19 will：割草線要順著長邊跑直線、到底再掉頭) ----
+        # f2c_server 固定沿 map 的 x 軸擺割草線；這裡先把邊界轉一個角度再交給它，路線拿回來再轉回去，
+        # 原理與挑法見 swath_angle.py。
+        #   swath_angle     'auto' = 每次規劃挑掉頭最少的方向；數字 = 固定角度 (度，從 map 的 x 軸逆時針量)。
+        #                   節點預設 '0' (= 以前的行為，不轉)；mower_control.launch.py 依 use_sim_time 決定：
+        #                   實車 auto、模擬 0 (Gazebo 的既有測試與報告數據都是沿 x 軸的割草線)。
+        #   headland_width  f2c_server 的地頭寬 (vehicle_geometry，由 launch 傳入)：auto 跟 F2C 一樣
+        #                   在內縮後的區域上數段數。沒傳就用 0 (不內縮)，只影響挑方向的準確度。
+        # auto 在 N150 上要算幾百毫秒，放到另一條執行緒，不要卡住 mower_manager (手動模式的搖桿轉發、
+        # 看門狗都在同一條執行緒上)；算完由 poll_angle_job 接著送給 F2C。
+        self.declare_parameter('swath_angle', '0', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('headland_width', 0.0)
+        self.swath_angle_fixed = swath_angle.parse_angle(self.get_parameter('swath_angle').value)
+        self.headland_width = float(self.get_parameter('headland_width').value)
+        self._angle_executor = None
+        self._angle_job = None
+        self.create_timer(0.05, self.poll_angle_job)
+        if self.swath_angle_fixed is None:
+            self.get_logger().info('🧭 割草線方向：自動 (掉頭最少)')
+        else:
+            self.get_logger().info(
+                '🧭 割草線方向：固定 %.1f°' % math.degrees(self.swath_angle_fixed))
+
         # 淨空門檻：來自 mowerbot_description/vehicle_geometry.py (由 mower_control.launch.py
         # 傳入)，不給預設值，理由同 blade_width。manager 不自己算幾何 (階段 38)。
         # 說明見 lead_in_point_unsafe() 上方。
@@ -274,20 +300,30 @@ class MowerManager(Node):
         # ABORTED，走既有的「跳過這一段」邏輯；連續 max_consecutive_failures 段就整個任務停止。
         # 預設都是 true (安全的方向)。mower_control.launch.py 依 use_sim_time 決定：
         # 實車 (use_sim_time:=false) 開、模擬關 (模擬沒有手把，Gazebo 的既有測試也不按 LB)。
+        #
+        # 2026-10-19 will：LB + B 之後讓車子自己跑，不要一直捏著 LB。所以多一個比較鬆的條件：
+        #   auto_requires_joystick 手把連線中就好，不用按住 LB (auto_requires_deadman 開著時沒有作用)
+        # bringup_real 改成 deadman 關、joystick 開、scan 開。還停得下來的方式：RB 急停、LB + X 回手動、
+        # 關手把 / 手把斷線、光達中斷、光達停止區。手把斷線過一次就「鎖住」：重新連上之後車子不會自己走，
+        # 要按一下 LB 才繼續 (重新連上不代表有人要它走)，見 _joy_lost_latched。
         self.declare_parameter('auto_requires_deadman', True)
+        self.declare_parameter('auto_requires_joystick', True)
         self.declare_parameter('auto_requires_scan', True)
         self.auto_requires_deadman = bool(self.get_parameter('auto_requires_deadman').value)
+        self.auto_requires_joystick = bool(self.get_parameter('auto_requires_joystick').value)
         self.auto_requires_scan = bool(self.get_parameter('auto_requires_scan').value)
+        self._joy_lost_latched = False
         # /joy_status 5 Hz (LB 一變化 teleop 立刻多發一筆)、/scan 10 Hz：0.5 s 內沒有新資料就算中斷
         self.auto_input_timeout = 0.5
         self._joy_status = None
         self._joy_status_time = None
         self._scan_time = None
         self._auto_block_prev = None    # 上一次的暫停原因，只在變化時印 log
-        # 規劃好之後先等放行條件成立才送第一段 (2026-10-19 will)：只在 auto_requires_deadman 時。
+        # 規劃好之後先等放行條件成立才送第一段 (2026-10-19 will)。
         # 以前算好就送，沒按住 LB 時車子雖然不動，但 Nav2 的 progress checker 15 s 一到就把那一段
         # 判失敗跳過，連續 max_consecutive_failures 段整個任務停止，所以沒辦法「先慢慢看路線再出發」。
         # 還沒送任何一段之前沒有 goal、不會逾時；一成立就送，之後放開 LB 一樣是暫停 (行為不變)。
+        # 不用按住 LB (auto_requires_deadman 關) 時通常一規劃好就成立，等的是手把沒連上之類的情況。
         self._wait_deadman_start = False
         self.create_timer(0.1, self.maybe_start_waiting)
         self.joy_status_sub = self.create_subscription(
@@ -297,6 +333,7 @@ class MowerManager(Node):
                 LaserScan, '/scan', self.scan_cb, qos_profile_sensor_data)
         self.get_logger().info(
             f'自動模式放行條件：按住 LB = {self.auto_requires_deadman}，'
+            f'手把連線 = {self.auto_requires_joystick}，'
             f'光達 /scan 不中斷 = {self.auto_requires_scan}')
 
         # ---- 切到自動割草時先存圖 (2026-10-18 will 要的手把三種模式) ----
@@ -403,15 +440,26 @@ class MowerManager(Node):
 
         失效方向是安全的：沒收過、收不到、逾時一律當成不能動。
         """
-        if self.auto_requires_deadman:
+        if self.auto_requires_deadman or self.auto_requires_joystick:
+            joy = None
             if self._joy_status_time is None:
-                return '還沒收到 /joy_status (teleop 沒在跑？)'
-            if self._age(self._joy_status_time) > self.auto_input_timeout:
-                return '/joy_status 中斷 %.1f s (teleop 沒在跑？)' % self._age(self._joy_status_time)
-            if not self._joy_status.connected:
-                return '手把斷線'
-            if not self._joy_status.deadman_held:
-                return '沒有按住 LB'
+                joy = '還沒收到 /joy_status (teleop 沒在跑？)'
+            elif self._age(self._joy_status_time) > self.auto_input_timeout:
+                joy = '/joy_status 中斷 %.1f s (teleop 沒在跑？)' % self._age(self._joy_status_time)
+            elif not self._joy_status.connected:
+                joy = '手把斷線'
+            if joy is not None:
+                # 不用按住 LB 的時候，手把斷線過一次就鎖住 (自動模式中才算，見 __init__ 的說明)
+                if not self.auto_requires_deadman and self.current_mode in (1, 3):
+                    self._joy_lost_latched = True
+                return joy
+            if self.auto_requires_deadman:
+                if not self._joy_status.deadman_held:
+                    return '沒有按住 LB'
+            elif self._joy_lost_latched:
+                if not self._joy_status.deadman_held:
+                    return '手把斷線過，重新連上了，按一下 LB 才繼續走'
+                self._joy_lost_latched = False
         if self.auto_requires_scan:
             if self._scan_time is None:
                 return '還沒收到光達 /scan'
@@ -589,10 +637,72 @@ class MowerManager(Node):
         self.get_logger().info(
             f'🚀 正在將邊界發送給 F2C 伺服器進行運算...'
             f' (內部障礙物 {len(req.obstacles)} 個)')
-        future = self.f2c_client.call_async(req)
         # 記下送出時的模式 epoch：規劃結果回來時模式已經切換過就丟掉，不要拿舊的結果開始任務
         epoch = self._mode_epoch
-        future.add_done_callback(lambda f: self.f2c_response_callback(f, preview, epoch))
+        if self.swath_angle_fixed is None:
+            rings = [[(p.x, p.y) for p in req.boundary.points]]
+            rings += [[(p.x, p.y) for p in o.points] for o in req.obstacles]
+            if self._angle_executor is None:
+                self._angle_executor = ThreadPoolExecutor(max_workers=1)
+            # 只留最新的一個：算到一半又來一次 (預覽中按 LB + B) 時，舊的結果直接不用
+            self._angle_job = (self._angle_executor.submit(
+                swath_angle.choose_angle, rings, self.swath_spacing, self.headland_width),
+                req, preview, epoch)
+            return
+        self.send_f2c_request(req, self.swath_angle_fixed, None, preview, epoch)
+
+    def poll_angle_job(self):
+        """auto 割草線方向算好了就接著送給 F2C (定時器，在 mower_manager 自己的執行緒上)。"""
+        if self._angle_job is None or not self._angle_job[0].done():
+            return
+        job, req, preview, epoch = self._angle_job
+        self._angle_job = None
+        # 與 f2c_response_callback 同樣的檢查：這中間模式切換過就不規劃
+        if preview and self.current_mode in (1, 3):
+            self.get_logger().warn('👀 預覽的割草線方向算好了，但已經切到自動割草，丟掉不用。')
+            return
+        if not preview and epoch != self._mode_epoch:
+            self.get_logger().warn('🧭 割草線方向算好了，但這中間模式已經切換過，不規劃。')
+            return
+        try:
+            angle, info = job.result()
+        except Exception as e:      # 挑不出來就照以前沿 x 軸，不要讓任務因此開不了
+            self.get_logger().error('🧭 自動挑割草線方向失敗 (%s: %s)，這次沿 x 軸 (0°)。'
+                                    % (type(e).__name__, e))
+            angle, info = 0.0, None
+        self.send_f2c_request(req, angle, info, preview, epoch)
+
+    def send_f2c_request(self, req, angle, info, preview, epoch):
+        """邊界與障礙物轉 -angle 之後送給 F2C (它沿 x 軸擺割草線)，路線回來在 f2c_response_callback 轉回 +angle。"""
+        if angle != 0.0:
+            req.boundary = self.rotated_polygon(req.boundary, -angle)
+            req.obstacles = [self.rotated_polygon(o, -angle) for o in req.obstacles]
+        if info is not None:
+            self.get_logger().info(
+                '🧭 割草線方向 %.0f° (自動：%d 段、%d 條線；沿 x 軸 (0°) 要 %d 段)'
+                % (info['deg'], info['segments'], info['lines'], info['segments_at_0']))
+        else:
+            self.get_logger().info('🧭 割草線方向 %.1f°' % math.degrees(angle))
+        future = self.f2c_client.call_async(req)
+        future.add_done_callback(
+            lambda f: self.f2c_response_callback(f, preview, epoch, angle))
+
+    @staticmethod
+    def rotated_polygon(poly, angle):
+        out = Polygon()
+        xy = swath_angle.rotate_xy([(p.x, p.y) for p in poly.points], angle)
+        out.points = [Point32(x=float(x), y=float(y), z=float(p.z))
+                      for (x, y), p in zip(xy, poly.points)]
+        return out
+
+    @staticmethod
+    def rotate_path(path, angle):
+        """路線 (位置與朝向) 繞原點轉 angle。同樣的輸入得到同樣的輸出，周邊環繞「最後一點 = 第 0 點」照樣成立。"""
+        c, s = math.cos(angle), math.sin(angle)
+        for ps in path.poses:
+            p, q = ps.pose.position, ps.pose.orientation
+            p.x, p.y = c * p.x - s * p.y, s * p.x + c * p.y
+            q.x, q.y, q.z, q.w = swath_angle.rotate_quat(q.x, q.y, q.z, q.w, angle)
 
     # 模式切換服務
     # 模式切換服務
@@ -631,6 +741,8 @@ class MowerManager(Node):
     def change_mode_callback(self,request,response):
         if request.mode in self.mode_map:
             self._mode_epoch += 1
+            # 手把斷線的鎖只管這一次自動模式 (見 auto_block_reason)
+            self._joy_lost_latched = False
             previous_mode = self.current_mode
             self.current_mode = request.mode
             mode_name = self.mode_map[self.current_mode]
@@ -697,7 +809,7 @@ class MowerManager(Node):
                 if reason is not None:
                     self.get_logger().warn(f'⏸️ 自動模式暫停：{reason}，車子停住，不轉發 Nav2 速度指令')
                 elif self._auto_block_prev is not None:
-                    self.get_logger().info('▶️ 自動模式恢復：LB 按住、光達正常，繼續轉發 Nav2 速度指令')
+                    self.get_logger().info('▶️ 自動模式恢復：放行條件都成立，繼續轉發 Nav2 速度指令')
                 self._auto_block_prev = reason
             if reason is not None:
                 self.stop_robot()
@@ -1521,18 +1633,21 @@ class MowerManager(Node):
         return sub
 
     def begin_execution(self):
-        """規劃好了，開始送第一段。實車 (auto_requires_deadman) 放行條件不成立時先等，見 _wait_deadman_start。"""
-        if self.auto_requires_deadman and self.auto_block_reason() is not None:
+        """規劃好了，開始送第一段。實車放行條件不成立時先等，見 _wait_deadman_start。"""
+        reason = self.auto_block_reason()
+        if reason is not None:
             self._wait_deadman_start = True
-            self.set_mission_state(
-                MissionStatus.STATE_EXECUTING,
-                message='路線規劃好了，按住 LB 才開始走（還沒按之前不會出發，可以慢慢看路線）。')
-            self.get_logger().info('🗺️ 路線規劃好了，等按住 LB 才送出第一段。')
+            if self.auto_requires_deadman:
+                text = '路線規劃好了，按住 LB 才開始走（還沒按之前不會出發，可以慢慢看路線）。'
+            else:
+                text = '路線規劃好了，還不能出發：%s。' % reason
+            self.set_mission_state(MissionStatus.STATE_EXECUTING, message=text)
+            self.get_logger().info('🗺️ 路線規劃好了，等放行條件成立才送出第一段 (%s)。' % reason)
             return
         self.send_next_swath()
 
     def maybe_start_waiting(self):
-        """在等按住 LB 的任務，放行條件一成立就送出第一段。"""
+        """在等放行條件 (按住 LB / 手把連上) 的任務，一成立就送出第一段。"""
         if not self._wait_deadman_start:
             return
         if self.current_mode not in (1, 3) or not self._swath_queue:
@@ -1542,7 +1657,8 @@ class MowerManager(Node):
             return
         self._wait_deadman_start = False
         self._mission_message = ''
-        self.get_logger().info('▶️ 按住 LB 了，開始走。')
+        self.get_logger().info('▶️ 放行條件成立 (%s)，開始走。'
+                               % ('按住 LB 了' if self.auto_requires_deadman else '手把連著'))
         self.send_next_swath()
 
     def send_next_swath(self):
@@ -1824,7 +1940,7 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future, preview=False, epoch=None):
+    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0):
         """
         接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
@@ -1840,6 +1956,9 @@ class MowerManager(Node):
                 return
             if response.success:
                 self.get_logger().info(f'🎉 成功拿到 F2C 路徑！總航點數: {len(response.coverage_path.poses)}')
+                if angle != 0.0:
+                    # 送出去之前邊界轉了 -angle (send_f2c_request)，路線轉回來
+                    self.rotate_path(response.coverage_path, angle)
                 # 【關鍵】：把路徑廣播出去給 RViz2 畫圖
                 self.path_pub.publish(response.coverage_path)
                 # 先把最前面的周邊環繞那一圈切下來 (沒有環繞時就是空的)，
@@ -1900,9 +2019,10 @@ class MowerManager(Node):
                 _ = robot_xy
 
                 if preview:
-                    text = ('路線預覽：割草線 %d 條%s，共 %d 段。車子不會動；'
-                            'OK 就按住 LB 再按 B 開始割。'
-                            % (total, '、周邊環繞 %d 段' % n_edges if n_edges else '', len(queue)))
+                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s，共 %d 段。車子不會動；'
+                            'OK 就按 LB + B 開始割。'
+                            % (total, math.degrees(angle) % 180.0,
+                               '、周邊環繞 %d 段' % n_edges if n_edges else '', len(queue)))
                     self.get_logger().info('👀 ' + text)
                     self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
                     return

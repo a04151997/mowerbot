@@ -102,7 +102,7 @@ class MowerTeleop(Node):
     def save_map(self):
         """Y：預覽割草路線 + 存一份地圖。只在這裡判斷能不能做，實際規劃與存圖交給 manager 與 map_autosave。"""
         if self._mode in (1, 3):
-            self.get_logger().warn('Y 存圖：自動割草中不存圖。放開 LB 等車停，LB + X 回手動再按 Y。')
+            self.get_logger().warn('Y 存圖：自動割草中不存圖。LB + X 回手動 (車子會停) 再按 Y。')
             return
         # 預覽先送：規劃約 1 秒，存圖要 10 ~ 30 秒，路線不用等存圖
         if self.preview_client.service_is_ready():
@@ -143,7 +143,7 @@ class MowerTeleop(Node):
         self._deadman_held = deadman
         self._stop_pressed = stop
         # LB / 急停鍵一變化就立刻多發一筆 /joy_status，不等 5 Hz timer (最多晚 0.2 s)：
-        # 自動模式放開 LB 要停車，mower_manager 看的就是這個話題 (2026-10-15)
+        # mower_manager 用這個話題判斷自動模式能不能動 (手把連線、LB；2026-10-15 / 10-19)
         if changed:
             self.publish_joy_status()
 

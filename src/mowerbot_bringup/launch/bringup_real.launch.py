@@ -155,9 +155,14 @@ def generate_launch_description():
                 # 實車沒有 gazebo.launch.py 幫忙起 robot_state_publisher
                 'start_rsp': 'true',
                 # 自動模式的放行條件 (2026-10-15 will 決定)：實車一律開，不開放從命令列關掉。
-                # 放開 LB、手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
-                'auto_requires_deadman': 'true',
+                # 手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
+                # 2026-10-19 will：LB + B 之後車子自己跑，不用一直按住 LB —— 按住 LB (deadman) 改成
+                # 「手把連著」(joystick)。手把斷線過要重新連上再按一下 LB 才繼續；RB 急停、LB + X 回手動照舊。
+                'auto_requires_deadman': 'false',
+                'auto_requires_joystick': 'true',
                 'auto_requires_scan': 'true',
+                # 割草線方向 (2026-10-19 will：順著長邊跑直線)：每次規劃挑掉頭最少的方向
+                'swath_angle': 'auto',
                 # 手把模式 (2026-10-18)：LB + A 才開始建圖。10-19 will：LB + B 直接規劃割草
                 # (不再先存圖)，存圖改按 Y
                 'mapping_on_button': 'true',
@@ -169,7 +174,7 @@ def generate_launch_description():
     # Nav2 (controller_server + 光達停止區) 也一起開，LB + B 規劃完才走得動 (2026-10-18)。
     # 以前要另外開 navigation.launch.py (hardware_bringup.md 7-3)，沒開的話 LB + B 只會規劃、
     # 車子不會走 —— use_nav:=false 保留這個用法 (car-start planonly)。
-    # Nav2 的速度指令一律經過 collision_monitor 與 mower_manager，只有 mode 1 而且按住 LB 才會到底盤。
+    # Nav2 的速度指令一律經過 collision_monitor 與 mower_manager，只有 mode 1 而且手把連著才會到底盤。
     navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_bringup, 'launch', 'navigation.launch.py')),
