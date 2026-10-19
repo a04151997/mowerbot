@@ -6517,12 +6517,20 @@ class MRig(object):
                                       'map_autosave/save')
         ok = cli.wait_for_service(timeout_sec=20.0)
         self.node.destroy_client(cli)
+        # 這裡看到了，manager 不一定已經看到 (它只等 1 s)：多等一下讓 discovery 傳過去
+        self.spin(2.0)
         return ok
 
     def stop_autosave(self):
         if self.autosave is not None:
             self.autosave.stop()
             self.autosave = None
+            # 等舊的服務從 ROS graph 消失再往下：不然下一個 start_autosave 會把還沒消失的舊服務
+            # 當成新的已經就緒，manager 卻剛好兩個都看不到 (10-19 M3 偶發「存圖服務沒有開」)
+            t0 = time.time()
+            while time.time() - t0 < 10.0 and any(
+                    n == '/map_autosave/save' for n, _ in self.node.get_service_names_and_types()):
+                self.spin(0.2)
             self.spin(1.0)
 
     def spin(self, seconds):
