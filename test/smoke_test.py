@@ -1289,6 +1289,123 @@ def b9_keepout():
         rclpy.shutdown()
 
 
+
+# B10 (2026-10-19)：割草範圍取車子所在的那一塊 (map_to_boundary 的 boundary_region = robot)。
+# 假地圖與 B8 相同 (自由區域 2.5 ~ 7.5 m)，但 x = B10_WALL_X 有一道貫穿的牆，分成左邊大塊 (約 3.5 m 寬)
+# 與右邊小塊 (約 1.4 m 寬)。同一個節點跑三段 (TF map -> base_footprint 由測試自己發 static)：
+#   ① 還沒有車子位置 (對照組)：取最大的一塊 = 左邊，x 上限 < 牆
+#   ② 車子停在右邊小塊：範圍要整個在牆的右邊
+#   ③ 車子開回左邊：回到左邊
+# 10-19 will 在 lab1 用紅線圍出中間一塊，舊程式 (取最大) 選到紅線外面更大的房間，這一項就是在擋那個情況。
+B10_WALL_X = 6.0
+B10_RIGHT = (6.8, 5.0)
+B10_LEFT = (4.0, 5.0)
+
+
+def b10_robot_region():
+    hdr('B10 割草範圍取車子所在的那一塊 (map_to_boundary + TF，餵假地圖)')
+    import rclpy
+    import tf2_ros
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped, TransformStamped
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    wall_col = int(round(B10_WALL_X / RES))
+    tol = RES
+
+    node_proc = bg_start('B10_map_to_boundary',
+                         ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+                          '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b10')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    tf_pub = tf2_ros.StaticTransformBroadcaster(node)
+    got = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            if col != wall_col:
+                data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def put_car(x, y):
+        t = TransformStamped()
+        t.header.stamp = node.get_clock().now().to_msg()
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'base_footprint'
+        t.transform.translation.x = x
+        t.transform.translation.y = y
+        t.transform.rotation.w = 1.0
+        tf_pub.sendTransform(t)
+        spin_for(1.0)
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary。"""
+        spin_for(1.0)
+        del got[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got:
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        xs = [p.x for p in got[-1].polygon.points]
+        ys = [p.y for p in got[-1].polygon.points]
+        return len(xs), min(xs), max(xs), min(ys), max(ys)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f' % ((tag,) + r))
+
+    try:
+        ctrl = next_boundary()
+        show('① 還沒有車子位置 (對照組，取最大的一塊)', ctrl)
+        put_car(*B10_RIGHT)
+        right = next_boundary()
+        show('② 車子在右邊小塊 (%.1f, %.1f)' % B10_RIGHT, right)
+        put_car(*B10_LEFT)
+        left = next_boundary()
+        show('③ 車子開回左邊 (%.1f, %.1f)' % B10_LEFT, left)
+        if ctrl is None or right is None or left is None:
+            print(node_proc.log_tail(30))
+            record('B', 'B10', '割草範圍取車子所在的那一塊', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        ctrl_ok = ctrl[2] < B10_WALL_X
+        right_ok = right[1] > B10_WALL_X - tol and right[1] < B10_RIGHT[0] < right[2]
+        left_ok = left[2] < B10_WALL_X and all(abs(a - b) <= tol for a, b in zip(left[1:], ctrl[1:]))
+        sub('對照組取到左邊大塊 = %s' % ctrl_ok)
+        sub('車子在右邊時範圍整個在牆右邊、而且包含車子 = %s；開回左邊後回到左邊 = %s' % (right_ok, left_ok))
+        record('B', 'B10', '割草範圍取車子所在的那一塊：右邊小塊也選得到、開回來會換回去；查不到車子時取最大',
+               'PASS' if (ctrl_ok and right_ok and left_ok) else 'FAIL',
+               '對照 x %.2f~%.2f ; 車在右 x %.2f~%.2f ; 車在左 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], right[1], right[2], left[1], left[2]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 # B5 (階段 38)：周邊環繞「實際會開的長度」。
 # 以前的測試只看「周邊環繞有沒有完成」—— 整圈被切成一段、起點 = 終點時，goal checker 在送出的當下
 # 就判定到達，0 秒「完成」、邊緣一公尺都沒割，測試照樣綠。這一項用存檔地圖 (stage29_lawn，進版控)
@@ -6644,6 +6761,10 @@ def main():
                 bg_stop_all()
             try:
                 b9_keepout()
+            finally:
+                bg_stop_all()
+            try:
+                b10_robot_region()
             finally:
                 bg_stop_all()
             b5_perimeter_effective_length()

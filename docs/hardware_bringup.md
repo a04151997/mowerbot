@@ -712,6 +712,10 @@ ros2 run mowerbot_action keepout_tool clear          # 清除禁區
 
 - 只認紅色（R 至少 150、比 G 與 B 都大 80 以上）。地圖本身是灰階，不會被誤認。
   1 像素 = 5 公分；線要從牆畫到牆、中間不能有缺口，否則外面那塊仍然連在一起。
+- **割的是車子所在的那一塊**（2026-10-19 起，`map_to_boundary` 參數 `boundary_region`，預設 `robot`）：
+  用紅線圍一圈、車子停在圈裡，就只割圈裡面。查不到車子位置（map -> base_footprint）時取面積最大的一塊。
+  之前一律取最大的一塊：10-19 在 lab1 用紅線圍出中間 195 m²，程式卻選了紅線外更大的房間（217 m²）。
+  要回到舊行為：把 `map_to_boundary` 的參數 `boundary_region` 設成 `largest`。
 - 套用之後看：RViz / Lichtblick 加 `/keepout_mask`（OccupancyGrid）看禁區位置；
   `/f2c_boundary` 會繞開禁區（禁區在中間就變成內部障礙物，碰到外圈就切掉外圈）。
 - 開機永遠沒有禁區。`keepout_server` 每次啟動產生新的 session，
