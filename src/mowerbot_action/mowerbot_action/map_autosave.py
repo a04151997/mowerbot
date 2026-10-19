@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
-"""切到自動割草 (LB + B) 時先存一份地圖 (2026-10-18，will 要的手把三種模式)。
+"""手把 Y 存圖 (2026-10-19 will)。
 
-mower_manager 切進 mode 1 時呼叫 ~/save，存成功才呼叫 F2C 規劃；存失敗就不規劃、車子不動。
+呼叫的人：teleop 的 Y 鍵；以及 save_map_before_f2c 開著時的 mower_manager (切進 mode 1 先存圖，
+存成功才規劃。2026-10-18 的做法，10-19 起實車預設關掉：will 要 LB + B 直接規劃割草、存圖改按 Y)。
 存圖本身交給 mowerbot_bringup 的 save_map.sh (car-savemap 用的同一支)：重試 save_map、
 free_thresh 改 0.10、記下這次開機的 session 與畫禁區用的圖，全部只有那一處。
 
 服務 (std_srvs/srv/Trigger)：
-    ~/save   存成 <prefix>_<月日>_<時分秒>，成功時 message 是存好的路徑 (不含副檔名)
+    ~/save   存成 <prefix>_<月日>_<時分秒>，成功時 message 是存好的路徑 (不含副檔名)。
+             還沒開始建圖 (/slam_scan_gate/active 是 false) 時直接拒絕。
+話題：
+    ~/last   (std_msgs/String，latched) 最後一次存圖的結果，car-status 顯示這一行
 參數：
     map_dir  存到哪裡；留空 = save_map.sh 自己決定 (原始碼的 maps/，與 car-savemap 相同)
-    prefix   檔名開頭，預設 f2c
+    prefix   檔名開頭，預設 map
     timeout  save_map.sh 最多跑幾秒 (N150 上一次約 10 ~ 30 秒)
 save_map.sh 的完整輸出存在 ~/.ros/mowerbot_autosave/<名稱>.log。
 """
@@ -21,6 +25,8 @@ import time
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 MAP_EXTS = ('pgm', 'yaml', 'posegraph', 'data')
@@ -31,11 +37,18 @@ class MapAutosave(Node):
     def __init__(self):
         super().__init__('map_autosave')
         self.declare_parameter('map_dir', '')
-        self.declare_parameter('prefix', 'f2c')
+        self.declare_parameter('prefix', 'map')
         self.declare_parameter('timeout', 120.0)
         self.declare_parameter('log_dir', os.path.expanduser('~/.ros/mowerbot_autosave'))
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                             reliability=ReliabilityPolicy.RELIABLE)
+        # 建圖開始了沒：slam_scan_gate 的 latched 話題。沒有這個話題 (模擬，一開機就在建圖) = 不擋
+        self.mapping = None
+        self.create_subscription(Bool, '/slam_scan_gate/active',
+                                 lambda m: setattr(self, 'mapping', bool(m.data)), latched)
+        self.last_pub = self.create_publisher(String, '~/last', latched)
         self.create_service(Trigger, '~/save', self.save_cb)
-        self.get_logger().info('💾 自動存圖就緒：切到自動割草時先存圖，存成功才規劃。')
+        self.get_logger().info('💾 存圖就緒：手把按 Y 存一份地圖。')
 
     @staticmethod
     def script_path():
@@ -44,14 +57,19 @@ class MapAutosave(Node):
                             'lib', 'mowerbot_bringup', 'save_map.sh')
 
     def save_cb(self, _req, resp):
-        name = '%s_%s' % (self.get_parameter('prefix').value, time.strftime('%m%d_%H%M%S'))
-        ok, message = self.save(name)
+        if self.mapping is False:
+            ok, message = False, '還沒開始建圖 (按住 LB + A)，沒有地圖可以存'
+        else:
+            name = '%s_%s' % (self.get_parameter('prefix').value, time.strftime('%m%d_%H%M%S'))
+            ok, message = self.save(name)
         resp.success = ok
         resp.message = message
         if ok:
             self.get_logger().info('💾 地圖已存：' + message)
         else:
             self.get_logger().error('⚠️ 存圖失敗：' + message)
+        self.last_pub.publish(String(data='%s %s%s' % (
+            time.strftime('%H:%M:%S'), '✅ 已存 ' if ok else '❌ 失敗：', message)))
         return resp
 
     def save(self, name):

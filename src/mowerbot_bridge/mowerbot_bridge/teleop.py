@@ -4,6 +4,8 @@ from sensor_msgs.msg import Joy                         # 接收手把原始資�
 from geometry_msgs.msg import Twist                     # 發布速度指令 (linear.x, angular.z)
 from mowerbot_interfaces.srv import SetDriveMode        # 自定義的模式切換服務
 from mowerbot_interfaces.msg import JoyStatus           # 手把連線狀態 (給 HMI 看)
+from mowerbot_interfaces.msg import MowerStatus         # 目前模式 (Y 存圖要看)
+from std_srvs.srv import Trigger                        # Y 存圖 (map_autosave)
                                                         
 class MowerTeleop(Node):
     def __init__(self):
@@ -31,6 +33,15 @@ class MowerTeleop(Node):
         self.vel_pub = self.create_publisher(Twist,'/cmd_vel_joy',10)
         self.mode_client = self.create_client(SetDriveMode ,'change_mower_mode')
 
+        # ---- Y = 存圖 (2026-10-19 will) ----
+        # 呼叫 /map_autosave/save (save_map.sh，跟 car-savemap 同一支)，存成 map_<月日>_<時分秒>。
+        # 存圖不會讓車子動，所以不用按住 LB；自動割草 (mode 1 / 3) 中不存：存圖時 slam_toolbox
+        # 序列化地圖要吃 CPU，不要在車子自己走的時候做。結果寫在 log 與 /map_autosave/last (car-status 看得到)。
+        self.save_client = self.create_client(Trigger, 'map_autosave/save')
+        self._save_future = None
+        self._mode = None
+        self.create_subscription(MowerStatus, 'mower_status', self._status_cb, 10)
+
         self.last_button = [0]*12
 
         # ---- 手把連線狀態 (階段 19) ----
@@ -44,11 +55,8 @@ class MowerTeleop(Node):
 
         #手把鎖定
         #False表示目前是鎖定
-        # Y 不列出來：它對應 mode 3，那是保留值、沒有實作(階段 23)。
-        # 按鍵繫結本身沒有動 —— 模式仲裁的行為不在這次的變更範圍內，
-        # 而且 manager 對 mode 3 的處理是定義好而且安全的(擋手把、急停有效)。
-        # 這裡只是不再把它當成一個可用功能宣傳。
-        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）')
+        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）；'
+                               'Y = 存圖 (不用按 LB)')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
 
@@ -85,6 +93,31 @@ class MowerTeleop(Node):
         msg.last_msg_age = float(min(age, 999.0))
         self.joy_status_pub.publish(msg)
 
+    def _status_cb(self, msg):
+        self._mode = msg.mode
+
+    def save_map(self):
+        """Y：存一份地圖。只在這裡判斷能不能存，實際存圖與檢查交給 map_autosave。"""
+        if self._mode in (1, 3):
+            self.get_logger().warn('Y 存圖：自動割草中不存圖。放開 LB 等車停，LB + X 回手動再按 Y。')
+            return
+        if self._save_future is not None and not self._save_future.done():
+            self.get_logger().warn('Y 存圖：上一次還在存，等它存完 (約 10 ~ 30 秒)。')
+            return
+        if not self.save_client.service_is_ready():
+            self.get_logger().error('Y 存圖：存圖服務 (map_autosave) 沒有開。')
+            return
+        self.get_logger().info('Y 存圖：開始存圖 (約 10 ~ 30 秒)...')
+        self._save_future = self.save_client.call_async(Trigger.Request())
+        self._save_future.add_done_callback(self._save_done)
+
+    def _save_done(self, future):
+        res = future.result()
+        if res is not None and res.success:
+            self.get_logger().info('Y 存圖：已存 %s' % res.message)
+        else:
+            self.get_logger().error('Y 存圖：失敗 (%s)' % (res.message if res is not None else '沒有回應'))
+
     def joy_callback(self, data):
         # 先記下狀態再處理控制：下面的急停分支會提早 return，
         # 記在後面的話急停按住期間 /joy_status 就會停在舊資料。
@@ -119,6 +152,11 @@ class MowerTeleop(Node):
             self.last_button = list(data.buttons)
             return
 
+        # Y = 存圖 (按下的瞬間)。跟 LB 無關，所以放在 LB 判斷之前；急停按住時上面已經 return，不會存。
+        if (self._button(data.buttons, self.p['button_y'])
+                and not self._button(self.last_button, self.p['button_y'])):
+            self.save_map()
+
         LB_ishold = data.buttons[self.p['button_deadman']] ==1
         if LB_ishold:            
                 if data.buttons[self.p['button_a']] == 1 and self.last_button[self.p['button_a']] == 0:
@@ -130,14 +168,8 @@ class MowerTeleop(Node):
                 elif data.buttons[self.p['button_x']] == 1 and self.last_button[self.p['button_x']] == 0:
                     self.call_service(2) #手動
                     self.get_logger().info('切換至手動模式')
-                # Y 鍵沒有繫結（階段 23）。
-                # 它以前呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
-                # （需要 planner_server + bt_navigator，見 architecture.md 3.1）。
-                # 留著一顆會把車切進未實作模式的按鍵，等於在實車上提供一個
-                # 沒有人測過用途的入口，所以整個分支拿掉。
-                # **不要拿 Y 去做別的事** —— 按鍵語意改變在實車上比沒有功能危險。
-                # button_y 這個參數本身留著：joystick.yaml 還在宣告它，
-                # 刪掉會讓現有的設定檔變成「未宣告的參數」而啟動失敗。
+                # Y 不切模式：以前 (階段 23 之前) LB + Y 會切到沒有實作的 mode 3，已經拿掉。
+                # 2026-10-19 will 決定 Y 改成存圖 (見上面 save_map)，不會讓車子動。
 
                 #處理速度輸出：只有按住 LB (deadman) 時才把搖桿值算進 twist
                 twist = Twist()

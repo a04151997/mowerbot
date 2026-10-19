@@ -67,15 +67,21 @@ def resolve_auto_gates(context):
     return resolve_sim_default(context, AUTO_GATES)
 
 
-# 手把三種模式 (2026-10-18 will)：LB + X 手動 (純遙控車)、LB + A 開始建圖、LB + B 先存圖再規劃割草。
-# 留空 = 跟著 use_sim_time：實車開、模擬關 (模擬的既有測試一開始就要有地圖，也不需要存圖)。
-#   mapping_on_button    slam_toolbox 讀 /scan_slam，slam_scan_gate 等第一次切到建圖模式才轉送 /scan
-#   save_map_before_f2c  mower_manager 切進 mode 1 先呼叫 map_autosave 存圖，存成功才規劃
-MODE_OPTIONS = ('mapping_on_button', 'save_map_before_f2c')
+# 手把模式 (2026-10-18 will)：LB + X 手動 (純遙控車)、LB + A 開始建圖、LB + B 規劃割草、Y 存圖 (10-19)。
+#   mapping_on_button    slam_toolbox 讀 /scan_slam，slam_scan_gate 等第一次切到建圖模式才轉送 /scan；
+#                        同時開 map_autosave 給 Y 存圖。留空 = 跟著 use_sim_time：實車開、模擬關
+#                        (模擬的既有測試一開始就要有地圖)。
+#   save_map_before_f2c  mower_manager 切進 mode 1 先呼叫 map_autosave 存圖，存成功才規劃。
+#                        10-18 的做法；10-19 will 改成 LB + B 直接規劃、存圖按 Y，所以預設 false
+#                        (留空 = false，不跟著 use_sim_time)。
+MODE_OPTIONS = ('mapping_on_button',)
 
 
 def resolve_mode_options(context):
-    return resolve_sim_default(context, MODE_OPTIONS)
+    opts = resolve_sim_default(context, MODE_OPTIONS)
+    v = LaunchConfiguration('save_map_before_f2c').perform(context)
+    opts['save_map_before_f2c'] = False if v.strip() == '' else launch_bool(v, 'save_map_before_f2c')
+    return opts
 
 
 def generate_launch_description():
@@ -141,8 +147,8 @@ def generate_launch_description():
                 output='screen',
                 parameters=[{'use_sim_time': use_sim_time,
                              'input_topic': '/scan', 'output_topic': '/scan_slam'}]))
-        if opts['save_map_before_f2c']:
-            # 切到自動割草時先存圖 (mower_manager 呼叫 /map_autosave/save)
+        if on or opts['save_map_before_f2c']:
+            # 手把 Y 存圖 (teleop 呼叫 /map_autosave/save)；save_map_before_f2c 時 mower_manager 也呼叫
             actions.append(Node(
                 package='mowerbot_action',
                 executable='map_autosave',
@@ -303,18 +309,18 @@ def generate_launch_description():
                         '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
         ),
 
-        # 手把三種模式 (2026-10-18)，留空 = 實車開、模擬關 (見 MODE_OPTIONS 的註解)
+        # 手把模式 (2026-10-18 / 10-19)，見 MODE_OPTIONS 的註解
         DeclareLaunchArgument(
             'mapping_on_button',
             default_value='',
-            description='按 LB + A (建圖模式) 才開始建圖，在那之前 slam_toolbox 收不到光達資料。'
-                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+            description='按 LB + A (建圖模式) 才開始建圖，在那之前 slam_toolbox 收不到光達資料；'
+                        '同時開 map_autosave 給手把 Y 存圖。留空 = 跟著 use_sim_time：實車 true、模擬 false。'
         ),
         DeclareLaunchArgument(
             'save_map_before_f2c',
             default_value='',
             description='切到自動割草 (mode 1) 先存一份地圖，存成功才規劃。'
-                        '留空 = 跟著 use_sim_time：實車 true、模擬 false。'
+                        '留空 = false (2026-10-19 起存圖改按手把 Y)。'
         ),
 
         # F2C 地頭 (headland) 寬度：階段 38 起不再是 launch 參數，由車輛幾何推導

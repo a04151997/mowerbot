@@ -158,9 +158,10 @@ def generate_launch_description():
                 # 放開 LB、手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
                 'auto_requires_deadman': 'true',
                 'auto_requires_scan': 'true',
-                # 手把三種模式 (2026-10-18)：LB + A 才開始建圖、LB + B 先存圖再規劃割草
+                # 手把模式 (2026-10-18)：LB + A 才開始建圖。10-19 will：LB + B 直接規劃割草
+                # (不再先存圖)，存圖改按 Y
                 'mapping_on_button': 'true',
-                'save_map_before_f2c': 'true',
+                'save_map_before_f2c': 'false',
             }.items()
         )
     ])

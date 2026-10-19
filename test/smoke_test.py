@@ -6356,6 +6356,8 @@ def phase_s():
 #   M5  存圖中途切回手動 → 存好之後也不呼叫 F2C
 #   M6  規劃好了先停著 (2026-10-19 will)：沒按住 LB 不送路線給 Nav2 (FollowPath 0 個 goal)，
 #       按住 LB 才送。以前算好就送，放開 LB 等超過 15 s 那一段就被 progress checker 判失敗跳過。
+#   M7  手把 Y = 存圖 (2026-10-19 will)：真的 teleop，手動模式按 Y (沒按 LB) 呼叫存圖服務一次；
+#       自動割草 (mode 1) 按 Y 不呼叫
 # --------------------------------------------------------------------------
 M_FAKE_AUTOSAVE = r"""
 import sys, time, rclpy
@@ -6365,6 +6367,7 @@ mode, delay = sys.argv[1], float(sys.argv[2])
 rclpy.init()
 n = Node('map_autosave')
 def cb(_req, resp):
+    print('CALL', flush=True)
     time.sleep(delay)
     resp.success = (mode == 'ok')
     resp.message = '/tmp/smoke_m_map' if resp.success else 'save_map.sh 回傳 1 (測試)'
@@ -6408,9 +6411,14 @@ def _m0_launch_defaults():
     mc, _ = _load_launch_module('mowerbot_bringup', 'mower_control.launch.py')
     ld = mc.generate_launch_description()
     fns = [e for e in ld.entities if isinstance(e, OpaqueFunction)]
-    for sim, opt, want in (('true', '', False), ('false', '', True),
-                           ('true', 'true', True), ('false', 'false', False)):
-        c = ctx(use_sim_time=sim, mapping_on_button=opt, save_map_before_f2c=opt)
+    # (use_sim_time, mapping_on_button, save_map_before_f2c) -> (閘門 + SLAM 讀 /scan_slam, 存圖節點, manager 先存圖)
+    # 10-19 起 save_map_before_f2c 留空 = false (不跟 use_sim_time)；存圖節點跟著 mapping_on_button (給 Y 存圖)
+    for sim, opt, save, want in (('true', '', '', (False, False, False)),
+                                 ('false', '', '', (True, True, False)),
+                                 ('true', 'true', '', (True, True, False)),
+                                 ('false', 'false', '', (False, False, False)),
+                                 ('true', '', 'true', (False, True, True))):
+        c = ctx(use_sim_time=sim, mapping_on_button=opt, save_map_before_f2c=save)
         execs, scan_topic, manager_save = [], None, None
         for fn in fns:
             for a in fn.execute(c) or []:
@@ -6427,12 +6435,12 @@ def _m0_launch_defaults():
                             for k, v in pdict.items():
                                 if txt(c, k) == 'save_map_before_f2c':
                                     manager_save = v
-        got = ('slam_scan_gate' in execs, 'map_autosave' in execs,
-               scan_topic == '/scan_slam', manager_save is True)
-        sub('mower_control use_sim_time=%s 選項=%r -> 閘門 %s、存圖節點 %s、SLAM 讀 %s、manager 存圖 %s'
-            % (sim, opt, got[0], got[1], scan_topic, manager_save))
-        if got != (want,) * 4:
-            problems.append('use_sim_time=%s 選項=%r 得到 %s，應全為 %s' % (sim, opt, got, want))
+        gate = 'slam_scan_gate' in execs and scan_topic == '/scan_slam'
+        got = (gate, 'map_autosave' in execs, manager_save is True)
+        sub('mower_control use_sim_time=%s 建圖選項=%r 先存圖選項=%r -> 閘門 %s (SLAM 讀 %s)、存圖節點 %s、'
+            'manager 先存圖 %s' % (sim, opt, save, got[0], scan_topic, got[1], manager_save))
+        if got != want:
+            problems.append('use_sim_time=%s 選項=%r/%r 得到 %s，應為 %s' % (sim, opt, save, got, want))
     try:
         mc.resolve_mode_options(ctx(use_sim_time='false', mapping_on_button='yes'))
         problems.append('mapping_on_button:=yes 沒有被拒絕')
@@ -6444,13 +6452,15 @@ def _m0_launch_defaults():
     for k in MODE_KEYS:
         if not re.search(r"'%s':\s*'true'" % k, src):
             problems.append('bringup_real.launch.py 沒有把 %s 固定成 true' % k)
+    if re.search(r"'save_map_before_f2c':\s*'true'", src):
+        problems.append('bringup_real.launch.py 還把 save_map_before_f2c 開著 (10-19 起 LB + B 直接規劃)')
     if not re.search(r"navigation\.launch\.py", src) or 'condition=IfCondition(use_nav)' not in src:
         problems.append('bringup_real.launch.py 沒有 (依 use_nav) include navigation.launch.py')
     record('M', 'M0', 'launch 預設值：模擬關、實車開；bringup_real 強制開、一起開 Nav2',
            'FAIL' if problems else 'PASS', '; '.join(problems))
 
 
-MODE_KEYS = ('mapping_on_button', 'save_map_before_f2c')
+MODE_KEYS = ('mapping_on_button',)
 
 
 class MRig(object):
@@ -6601,7 +6611,8 @@ def phase_m():
         if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
             print(rig.manager.log_tail(30))
             for cid, name in (('M1', '建圖開關'), ('M2', '對照組'), ('M3', '存圖失敗'),
-                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走'), ('M6', '規劃好先停著')):
+                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走'), ('M6', '規劃好先停著'),
+                              ('M7', '手把 Y 存圖')):
                 record('M', cid, name, 'FIXTURE', 'mower_manager 沒起來')
             return
 
@@ -6641,7 +6652,8 @@ def phase_m():
                '' if control_ok else 'F2C 被呼叫 %d 次 (應為 1)，M3 ~ M5 不算數' % called)
         later = (('M3', '存圖失敗：不規劃、任務中止'), ('M4', '存圖服務沒開：不規劃、任務中止'),
                  ('M5', '存圖中途切回手動：存好也不規劃'),
-                 ('M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送'))
+                 ('M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送'),
+                 ('M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫'))
         if not control_ok:
             for cid, name in later:
                 record('M', cid, name, 'FIXTURE', '管道沒有驗證 (M2 沒過)')
@@ -6724,6 +6736,52 @@ def phase_m():
         ok = executing and before == 0 and '按住 LB' in msg and after >= 1
         record('M', 'M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送', 'PASS' if ok else 'FAIL',
                'LB 放開 goal %d 個、按住後 %d 個' % (before, after))
+
+        hdr('M7  手把 Y = 存圖：手動模式按 Y 存一次，自動割草中按 Y 不存')
+        from sensor_msgs.msg import Joy
+        joy_pub = rig.node.create_publisher(Joy, '/joy', 10)
+
+        def joy_frames(y, n=4):
+            for _ in range(n):
+                m = Joy()
+                m.header.stamp = rig.node.get_clock().now().to_msg()
+                m.axes = [0.0] * 6
+                m.buttons = [0] * 11
+                m.buttons[3] = 1 if y else 0
+                joy_pub.publish(m)
+                rig.spin(0.05)
+
+        def press_y():
+            joy_frames(False)
+            joy_frames(True)
+            joy_frames(False)
+
+        def calls():
+            return len(rig.autosave.log_grep(r'^CALL', 1000))
+
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        teleop = bg_start('M_teleop', ['ros2', 'run', 'mowerbot_bridge', 'teleop_node'])
+        rig.spin(4.0)
+        rig.set_mode(2)
+        rig.spin(1.0)
+        n0 = calls()
+        press_y()
+        rig.spin(2.0)
+        manual = calls() - n0
+        rig.set_mode(1)
+        rig.spin(8.0)              # mower_manager 自己 (save_map_before_f2c) 也會呼叫一次，先等它結束
+        n1 = calls()
+        press_y()
+        rig.spin(2.0)
+        auto = calls() - n1
+        rig.set_mode(2)
+        refused = teleop.log_grep(r'自動割草中不存圖', 2)
+        sub('手動模式按 Y (沒按 LB)：存圖服務被呼叫 %d 次' % manual)
+        sub('自動割草 (mode 1) 按 Y：存圖服務被呼叫 %d 次；teleop log %s' % (auto, bool(refused)))
+        teleop.stop()
+        ok = manual == 1 and auto == 0 and bool(refused)
+        record('M', 'M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫', 'PASS' if ok else 'FAIL',
+               '手動 %d 次、自動割草 %d 次' % (manual, auto))
     finally:
         rig.close()
 
