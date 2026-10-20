@@ -22,13 +22,21 @@ from mowerbot_description import vehicle_geometry
 # min_speed_theta 掃描 15 次全部量到 0.0 的行為，就是這個 (stage38_decisions.md 15、16 節)。
 ALIGN_OWNED_SCALARS = ('critics', 'max_vel_x', 'xy_goal_tolerance')
 
+# 跟著 speed_scale 降的速度上限 (2026-10-20 will 同意 D1)。car-start 的「速度上限」以前只在 bridge
+# 把每個指令乘上去，Nav2 不知道，還以為是全速：快轉到位時的減速又被乘一次，0.25 時原地對正轉不完。
+# 現在 Nav2 自己的上限乘 speed_scale，bridge 不縮放，車子實際的最高速跟以前一樣。
+# 加速度不跟著降 (理想底盤模擬：0.25 時 90° 7.0 s、180° 11.6 s，review/drive.md)。
+SPEED_SCALED_KEYS = ('max_vel_x', 'max_speed_xy', 'max_vel_theta')
+
 
 def _align_owned(key):
     return key in ALIGN_OWNED_SCALARS or '.' in key
 
 
-def controller_injection(params_path, geom):
+def controller_injection(params_path, geom, speed_scale=1.0):
     """回傳 (要排在 params_file 後面的 controller_server 參數, 啟動警告字串)。
+
+    speed_scale：FollowPath 的 SPEED_SCALED_KEYS 乘上它 (AlignController 跟著繼承)。
 
     每一個注入值和參數檔裡既有的值不同時印一行 WARN「注入覆寫 ...」——
     即使是正常情況 (max_vel_x 0.70 → 0.0) 也印，讓覆寫永遠看得見。
@@ -39,6 +47,20 @@ def controller_injection(params_path, geom):
     follow = cs['FollowPath']
     xy_goal_tolerance = float(cs['general_goal_checker']['xy_goal_tolerance'])
     file_align = cs.get('AlignController', {}) or {}
+    speed_scale = float(speed_scale)
+    if not 0.05 <= speed_scale <= 1.0:
+        raise RuntimeError('speed_scale 要在 0.05 ~ 1.0 之間，收到 %r' % speed_scale)
+    scaled = {}
+    for k in SPEED_SCALED_KEYS:
+        if k in file_align:
+            raise RuntimeError('參數檔的 AlignController 自己寫了 %s，speed_scale 管不到它：'
+                               '刪掉讓它繼承 FollowPath 的值' % k)
+        old = float(follow[k])
+        new = round(old * speed_scale, 4)
+        if new != old:
+            log.warning('注入覆寫 FollowPath.%s：%r → %r (speed_scale %.2f)' % (k, old, new, speed_scale))
+            follow[k] = new                       # AlignController 從這裡繼承
+            scaled[k] = new
     owned = {k: copy.deepcopy(v) for k, v in follow.items() if _align_owned(k)}
     owned['max_vel_x'] = 0.0
     owned['xy_goal_tolerance'] = xy_goal_tolerance
@@ -65,7 +87,7 @@ def controller_injection(params_path, geom):
         log.info('align_controller 保留參數檔的設定 (不歸注入管)：%s'
                  % ', '.join('%s=%r' % (k, file_align[k]) for k in kept))
     injected = {'AlignController': align,
-                'FollowPath': {'xy_goal_tolerance': xy_goal_tolerance}}
+                'FollowPath': dict(scaled, xy_goal_tolerance=xy_goal_tolerance)}
     old = follow.get('xy_goal_tolerance')
     if old is not None and old != xy_goal_tolerance:
         log.warning('注入覆寫 FollowPath.xy_goal_tolerance：%r → %r' % (old, xy_goal_tolerance))
@@ -218,7 +240,8 @@ def generate_launch_description():
     def nav_nodes_action(context):
         # 注入要以「這次實際用的參數檔」為準 (params_file 可能是實驗用的檔案)，所以延到 launch 執行時才算
         params_path = params_file.perform(context)
-        injected, align_warning = controller_injection(params_path, geom)
+        injected, align_warning = controller_injection(
+            params_path, geom, LaunchConfiguration('speed_scale', default='1.0').perform(context))
         inj_file = tempfile.NamedTemporaryFile(
             mode='w', prefix='mowerbot_controller_inject_', suffix='.yaml', delete=False)
         yaml.safe_dump({'controller_server': {'ros__parameters': injected}}, inj_file)
@@ -333,6 +356,11 @@ def generate_launch_description():
             'stop_zone_length',
             default_value=str(STOP_ZONE_LENGTH),
             description='停止區從車頭前緣往前的長度 (m)。'),
+        DeclareLaunchArgument(
+            'speed_scale',
+            default_value='1.0',
+            description='自動割草的速度上限比例 (0.05 ~ 1.0)：FollowPath 的 max_vel_x、max_speed_xy、'
+                        'max_vel_theta 乘上它，AlignController 跟著繼承。實車由 car-start 的速度上限傳進來。'),
 
         nav_nodes,
     ])

@@ -43,6 +43,7 @@ def generate_launch_description():
     driver_type = LaunchConfiguration('driver_type')
     serial_port = LaunchConfiguration('serial_port')
     max_vel_scale = LaunchConfiguration('max_vel_scale')
+    speed_scale = LaunchConfiguration('speed_scale', default='1.0')
     allow_provisional = LaunchConfiguration('allow_provisional')
     override_reason = LaunchConfiguration('provisional_override_reason')
     use_lidar = LaunchConfiguration('use_lidar')
@@ -167,6 +168,7 @@ def generate_launch_description():
                 # (不再先存圖)，存圖改按 Y
                 'mapping_on_button': 'true',
                 'save_map_before_f2c': 'false',
+                'speed_scale': speed_scale,
             }.items()
         )
     ])
@@ -178,7 +180,7 @@ def generate_launch_description():
     navigation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_bringup, 'launch', 'navigation.launch.py')),
-        launch_arguments={'use_sim_time': use_sim_time}.items(),
+        launch_arguments={'use_sim_time': use_sim_time, 'speed_scale': speed_scale}.items(),
         condition=IfCondition(use_nav))
 
     return LaunchDescription([
@@ -213,13 +215,21 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_vel_scale',
             default_value='1.0',
-            description='/cmd_vel 的等比例縮放 (乘在 linear.x 與 angular.z 上)。'
-                        '實機階段 2 用 0.2 之類的值。急停永遠是零。'),
+            description='/cmd_vel 的等比例縮放 (乘在 linear.x 與 angular.z 上)。急停永遠是零。'
+                        '2026-10-20 起 car-start 不用它 (用 speed_scale)：在這裡縮放 Nav2 不知道，'
+                        '快轉到位的減速又被乘一次，慢速時原地對正轉不完。'),
+
+        DeclareLaunchArgument(
+            'speed_scale',
+            default_value='1.0',
+            description='速度上限比例 (0.05 ~ 1.0，2026-10-20 D1)：手把 (joystick.yaml 的 scale) 和 '
+                        'Nav2 (FollowPath 的 max_vel_x / max_speed_xy / max_vel_theta) 各自乘上它，'
+                        'bridge 不縮放。car-start 的速度上限就是這個。'),
 
         LogInfo(msg=['[bringup_real] 啟動實車節點 (driver_type=', driver_type,
                      ', encoder_ticks_per_rev=', ticks_per_rev,
                      ', serial_port=', serial_port,
-                     ', max_vel_scale=', max_vel_scale, ')']),
+                     ', max_vel_scale=', max_vel_scale, ', speed_scale=', speed_scale, ')']),
         DeclareLaunchArgument(
             'allow_provisional',
             default_value='false',

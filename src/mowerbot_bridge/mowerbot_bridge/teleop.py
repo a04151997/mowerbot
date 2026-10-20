@@ -15,6 +15,7 @@ class MowerTeleop(Node):
             namespace='',
             parameters=[
                 ('scale_linear', 0.7),('scale_angular', 1.2),
+                ('speed_scale', 1.0),
                 ('axis_linear', 1),('axis_angular',0),
                 ('button_a', 0),('button_b', 1),('button_x',2),('button_y',3),('button_deadman',4),('button_stop',5)
             ]
@@ -26,6 +27,15 @@ class MowerTeleop(Node):
          'button_a' , 'button_b' , 'button_x' , 'button_y' , 'button_deadman','button_stop'
         ]
         }
+        # 速度上限比例 (2026-10-20 D1)：car-start 的速度上限以前在 bridge 乘，現在手把和 Nav2 各自乘，
+        # bridge 不縮放。joystick.yaml 不用改 (N150 上有 will 自己改過的版本)。
+        speed_scale = float(self.get_parameter('speed_scale').value)
+        if not 0.05 <= speed_scale <= 1.0:
+            raise ValueError('speed_scale 要在 0.05 ~ 1.0 之間，收到 %r' % speed_scale)
+        self.p['scale_linear'] *= speed_scale
+        self.p['scale_angular'] *= speed_scale
+        self.get_logger().info('手把推到底：%.3f m/s、%.3f rad/s (speed_scale %.2f)'
+                               % (self.p['scale_linear'], self.p['scale_angular'], speed_scale))
 
         # 訂閱 joy 話題，讀取手把硬體狀態
         self.joy_sub = self.create_subscription(Joy,'joy',self.joy_callback,10)

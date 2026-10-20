@@ -9,6 +9,7 @@ from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
 # 注意：SetParameter 位於 launch_ros.actions 之中
 from launch_ros.actions import Node, SetParameter
+from launch_ros.parameter_descriptions import ParameterValue
 
 from mowerbot_action.manager import DEFAULT_OVERLAP_RATIO, WAYPOINT_SPACING
 from mowerbot_action import swath_angle
@@ -226,7 +227,9 @@ def generate_launch_description():
         output='screen',
         parameters=[
             os.path.join(bridge_dir, 'config', 'joystick.yaml'),
-            {'use_sim_time': use_sim_time}
+            {'use_sim_time': use_sim_time,
+             # 速度上限比例 (2026-10-20 D1)：乘在 joystick.yaml 的 scale_linear / scale_angular 上
+             'speed_scale': ParameterValue(LaunchConfiguration('speed_scale', default='1.0'), value_type=float)}
         ]
     )
 
@@ -291,6 +294,11 @@ def generate_launch_description():
 
     # 4. 回傳 LaunchDescription
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'speed_scale',
+            default_value='1.0',
+            description='手把速度比例 (0.05 ~ 1.0)，乘在 joystick.yaml 的 scale_linear / scale_angular 上。'
+                        '實車由 car-start 的速度上限傳進來；Nav2 那邊是 navigation.launch.py 的 speed_scale。'),
         # 模擬時預設不啟動 robot_state_publisher (由 gazebo.launch.py 負責)
         DeclareLaunchArgument(
             'start_rsp',

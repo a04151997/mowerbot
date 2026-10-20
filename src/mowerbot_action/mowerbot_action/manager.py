@@ -39,7 +39,7 @@ MAP_SAVE_MAX = 150.0
 F2C_TIMEOUT = 20.0
 # 「任務中止」訊息裡每一種失敗的白話說明 (原始的 status 名稱留在 log)
 FAIL_TEXT = {
-    'ALIGN_TIMEOUT': '原地轉 15 秒沒轉完',
+    'ALIGN_TIMEOUT': '原地轉卡住（15 秒轉不到 30°）',
     'ABORTED': '導航判失敗 (卡住或被擋)',
     'CANCELED': '被取消',
 }
@@ -1872,11 +1872,12 @@ class MowerManager(Node):
                 self.send_path_to_nav2(path, label)
                 return
             # 對正失敗 = 該段失敗，走下面既有的跳過邏輯 (計入 max_consecutive_failures)。
-            # 原地旋轉不平移，progress checker (只看平移) 15 s 一到就判 ABORTED —— 這幾乎一定是對正超時。
+            # 2026-10-20 起 progress checker 是 PoseProgressChecker：轉了 0.5 rad 也算進展，
+            # 所以對正中被判 ABORTED = 15 s 內位置和角度都沒什麼動 (轉不動、或一直暫停)。
             status_name = 'ALIGN_TIMEOUT'
             self.get_logger().error(
-                f'⏱️ [{label}] 對正超時 (原地旋轉 15 s 內沒有完成；progress checker 只看平移，'
-                f'原地旋轉期間永遠看不到進展) —— 視為這一段失敗')
+                f'⏱️ [{label}] 對正超時 (原地旋轉 15 s 內轉不到 0.5 rad：轉不動，或停止區 / 手把斷線一直暫停)'
+                f' —— 視為這一段失敗')
         self._align_phase = False
 
         # ---- 1. 主動取消：維持原本的行為與訊息 ----
