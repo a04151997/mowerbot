@@ -1,0 +1,1301 @@
+<title>割草機人機界面</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="icon" href="data:,">
+<style>
+/* Layout: status bar across the top, nav rail on the left (bottom bar on phones), one working view.
+   ISA-101 style: gray field, normal states stay neutral, color only marks abnormal states and the stop key.
+   Fonts are system stacks on purpose: the N150 hotspot has no internet, so nothing may load from outside. */
+:root {
+  --bg: #d3d6d9;
+  --panel: #e4e6e8;
+  --sunk: #c7cbcf;
+  --line: #a3a9ae;
+  --fg: #1c2024;
+  --fg-2: #4a5158;
+  --fg-3: #6b737a;
+  --sel: #2d556f;
+  --sel-fg: #ffffff;
+  --p1: #c3161d;
+  --p1-fg: #ffffff;
+  --p2: #e07800;
+  --p2-fg: #1c2024;
+  --p3: #dcbc00;
+  --p3-fg: #1c2024;
+  --stop: #b5121b;
+  --stop-fg: #ffffff;
+  --map-unknown: #b8bec4;
+  --map-free: #edeff1;
+  --map-occ: #2b3034;
+  --mown: rgba(74, 81, 88, 0.22);
+  --route: #4a5158;
+  --car: #1c2024;
+  --shade: rgba(28, 32, 36, 0.10);
+  --font-ui: -apple-system, BlinkMacSystemFont, "PingFang TC", "Noto Sans TC", "Noto Sans CJK TC", "Microsoft JhengHei", system-ui, sans-serif;
+  --font-num: ui-monospace, "SF Mono", Menlo, "Noto Sans Mono", Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #25292d; --panel: #2f3439; --sunk: #1f2326; --line: #474e55;
+    --fg: #e2e5e8; --fg-2: #a9b0b6; --fg-3: #7f878e;
+    --sel: #6d9cc0; --sel-fg: #0e1215;
+    --p1: #e5484d; --p1-fg: #ffffff; --p2: #f08a1c; --p2-fg: #14171a; --p3: #e6cc2c; --p3-fg: #14171a;
+    --stop: #cf2129; --stop-fg: #ffffff;
+    --map-unknown: #1c2023; --map-free: #3a4045; --map-occ: #cfd4d8;
+    --mown: rgba(207, 212, 216, 0.16); --route: #c3c9ce; --car: #f1f3f4; --shade: rgba(0, 0, 0, 0.30);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #25292d; --panel: #2f3439; --sunk: #1f2326; --line: #474e55;
+  --fg: #e2e5e8; --fg-2: #a9b0b6; --fg-3: #7f878e;
+  --sel: #6d9cc0; --sel-fg: #0e1215;
+  --p1: #e5484d; --p1-fg: #ffffff; --p2: #f08a1c; --p2-fg: #14171a; --p3: #e6cc2c; --p3-fg: #14171a;
+  --stop: #cf2129; --stop-fg: #ffffff;
+  --map-unknown: #1c2023; --map-free: #3a4045; --map-occ: #cfd4d8;
+  --mown: rgba(207, 212, 216, 0.16); --route: #c3c9ce; --car: #f1f3f4; --shade: rgba(0, 0, 0, 0.30);
+  color-scheme: dark;
+}
+
+html, body { height: 100%; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--fg); font: 14px/1.45 var(--font-ui); -webkit-font-smoothing: antialiased; }
+button { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--sel); outline-offset: 2px; }
+.num { font-family: var(--font-num); font-variant-numeric: tabular-nums; }
+.muted { color: var(--fg-3); }
+kbd { font-family: var(--font-num); font-size: 11px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 3px; padding: 0 4px; background: var(--panel); color: var(--fg-2); white-space: nowrap; }
+
+.app { height: 100%; display: grid; grid-template-columns: auto minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr); }
+
+/* ---- status bar ---- */
+.bar { grid-column: 1 / -1; background: var(--panel); border-bottom: 1px solid var(--line);
+  padding-block: 8px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-wrap: wrap; align-items: stretch; gap: 8px 18px; }
+.unit { display: flex; flex-direction: column; justify-content: center; padding-right: 16px; border-right: 1px solid var(--line); }
+.unit .eyebrow { font-size: 11px; letter-spacing: .08em; color: var(--fg-3); }
+.unit strong { font-size: 16px; letter-spacing: .02em; }
+.cell { display: flex; flex-direction: column; justify-content: center; min-width: 0; }
+.cell .k { font-size: 11px; color: var(--fg-3); letter-spacing: .06em; }
+.cell .v { font-size: 15px; font-weight: 600; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.tag { display: inline-flex; align-items: center; gap: 5px; padding: 0 7px; border-radius: 3px; font-weight: 700; }
+.tag.p1 { background: var(--p1); color: var(--p1-fg); }
+.tag.p2 { background: var(--p2); color: var(--p2-fg); }
+.tag.sel { background: var(--sel); color: var(--sel-fg); }
+.linkish { background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline; text-decoration-color: var(--line); text-underline-offset: 3px; }
+.alm-sum { flex: 1 1 280px; min-width: 0; display: flex; align-items: center; gap: 10px; background: var(--sunk); border: 1px solid var(--line); border-radius: 4px; padding: 4px 10px; text-align: left; cursor: pointer; }
+.alm-sum .counts { display: flex; gap: 8px; flex: none; }
+.alm-sum .counts span { display: inline-flex; align-items: center; gap: 3px; font-family: var(--font-num); font-size: 13px; }
+.alm-sum .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-size: 13px; }
+.alm-sum.quiet .txt { color: var(--fg-3); }
+.stop { margin-left: auto; background: var(--stop); color: var(--stop-fg); border: 0; border-radius: 6px; padding: 6px 22px; display: flex; flex-direction: column; align-items: center; justify-content: center; cursor: pointer; min-height: 52px; min-width: 112px; box-shadow: inset 0 -3px 0 rgba(0,0,0,.28); }
+.stop:active { box-shadow: inset 0 2px 0 rgba(0,0,0,.28); }
+.stop span { font-size: 20px; font-weight: 800; letter-spacing: .3em; padding-left: .3em; }
+.stop small { font-size: 11px; opacity: .92; }
+
+/* ---- demo strip (only in the mockup) ---- */
+.demo { grid-column: 1 / -1; background: var(--sunk); border-bottom: 1px solid var(--line); font-size: 12px; color: var(--fg-2);
+  padding-block: 6px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; }
+.demo strong { color: var(--fg); margin-right: 4px; }
+.demo button { border: 1px solid var(--line); background: var(--panel); border-radius: 3px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
+.demo button:hover { border-color: var(--fg-3); }
+
+/* ---- nav ---- */
+.nav { grid-row: 3; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px;
+  padding-block: 10px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: 10px; }
+.nav button { position: relative; display: flex; flex-direction: column; align-items: center; gap: 3px; width: 70px; padding: 8px 4px; border: 0; border-radius: 4px; background: transparent; cursor: pointer; color: var(--fg-2); font-size: 12px; }
+.nav button:hover { background: var(--sunk); }
+.nav button[aria-current="page"] { background: var(--sel); color: var(--sel-fg); }
+.nav svg { width: 22px; height: 22px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.nav .badge { position: absolute; top: 3px; right: 8px; min-width: 16px; height: 16px; border-radius: 8px; background: var(--p1); color: var(--p1-fg); font: 700 10px/16px var(--font-num); text-align: center; padding: 0 4px; }
+
+/* ---- work area ---- */
+.work { grid-row: 3; position: relative; min-width: 0; min-height: 0; }
+main { height: 100%; overflow: auto; padding-block: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+.stale { position: absolute; inset: 0; z-index: 5; display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px;
+  background: repeating-linear-gradient(135deg, var(--shade) 0 10px, transparent 10px 20px); }
+.stale .msg { background: var(--panel); border: 2px solid var(--p1); border-radius: 6px; padding: 14px 18px; max-width: 460px; display: flex; gap: 12px; align-items: flex-start; }
+.stale .msg strong { display: block; font-size: 16px; margin-bottom: 2px; }
+
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; min-width: 0; }
+.panel > h2 { font-size: 12px; letter-spacing: .08em; color: var(--fg-3); font-weight: 600; margin: 0; padding: 9px 12px 7px; border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+.panel > h2 .r { letter-spacing: 0; font-weight: 400; }
+.pbody { padding: 10px 12px 12px; }
+.view-h { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0 0 12px; }
+.view-h h1 { font-size: 18px; margin: 0; text-wrap: balance; }
+.view-h p { margin: 0; color: var(--fg-3); font-size: 13px; }
+
+/* overview */
+.ov { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; min-height: 100%; }
+.ov-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.mapbox { position: relative; background: var(--map-unknown); border: 1px solid var(--line); border-radius: 4px; min-height: 440px; overflow: hidden; }
+#map { position: absolute; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+.map-tools { position: absolute; top: 10px; left: 10px; display: flex; gap: 4px; }
+.map-tools button { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; padding: 3px 9px; font-size: 12px; cursor: pointer; }
+.map-tools button[aria-pressed="true"] { background: var(--sel); color: var(--sel-fg); border-color: var(--sel); }
+.map-legend { position: absolute; left: 10px; bottom: 10px; right: 10px; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; color: var(--fg-2); pointer-events: none; }
+.map-legend > span { display: inline-flex; align-items: center; gap: 5px; background: var(--panel); padding: 1px 6px; border-radius: 3px; }
+.map-legend i { display: inline-block; width: 16px; height: 8px; }
+.map-scale { position: absolute; right: 10px; top: 10px; background: var(--panel); border-radius: 3px; padding: 3px 7px 4px; font-size: 11px; color: var(--fg-2); text-align: center; }
+.map-scale .rule { height: 5px; border: 1.5px solid var(--fg-2); border-top: 0; margin-top: 2px; }
+.map-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center; padding: 24px; color: var(--fg-2); pointer-events: none; }
+.map-empty div { background: var(--panel); border-radius: 4px; padding: 10px 14px; max-width: 320px; }
+
+.why { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; }
+.why strong { display: block; font-size: 15px; }
+.why p { margin: 2px 0 0; color: var(--fg-2); font-size: 13px; }
+.dot-run { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--fg-2); flex: none; margin-top: 4px; }
+.dot-run.on { background: var(--fg-2); }
+
+.il { display: grid; grid-template-columns: minmax(0, 1fr) auto; }
+.il > div { padding: 6px 12px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 8px; min-width: 0; }
+.il > div:nth-child(-n+2) { border-top: 0; }
+.il .name { color: var(--fg-2); }
+.il .val { justify-content: flex-end; font-weight: 600; white-space: nowrap; }
+.il .val.ok { color: var(--fg-3); font-weight: 400; }
+
+.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 13px; margin: 0; }
+.kv dt { color: var(--fg-3); }
+.kv dd { margin: 0; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.prog { height: 10px; background: var(--sunk); border-radius: 2px; overflow: hidden; margin: 8px 0 6px; border: 1px solid var(--line); }
+.prog > div { height: 100%; background: var(--fg-2); width: 0; transition: width .3s; }
+.mission-msg { margin: 8px 0 0; font-size: 13px; color: var(--fg-2); background: var(--sunk); border-radius: 3px; padding: 6px 8px; }
+
+/* operation */
+.ops { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+.ops-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.tiles { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; padding: 12px; }
+.tile { position: relative; text-align: left; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 12px 12px 10px; cursor: pointer; display: flex; flex-direction: column; gap: 4px; min-height: 118px; }
+.tile:hover:not(:disabled) { border-color: var(--fg-3); }
+.tile .t { font-size: 17px; font-weight: 700; }
+.tile .d { font-size: 13px; color: var(--fg-2); }
+.tile .j { font-size: 12px; color: var(--fg-3); margin-top: auto; }
+.tile .now { position: absolute; top: 10px; right: 10px; }
+.tile.current { border: 2px solid var(--sel); padding: 11px 11px 9px; }
+.tile.armed { outline: 3px solid var(--sel); outline-offset: 2px; }
+.tile:disabled { cursor: not-allowed; opacity: .55; }
+.tile .why-not { font-size: 12px; color: var(--fg); }
+.auth-note { margin: 0 12px 12px; padding: 8px 10px; background: var(--sunk); border-radius: 3px; font-size: 13px; display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.btnrow { display: flex; gap: 8px; flex-wrap: wrap; }
+.btn { border: 1px solid var(--line); background: var(--bg); border-radius: 4px; padding: 7px 14px; cursor: pointer; font-weight: 600; }
+.btn:hover:not(:disabled) { border-color: var(--fg-3); }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn.go { background: var(--sel); color: var(--sel-fg); border-color: var(--sel); }
+.note { font-size: 12px; color: var(--fg-3); margin: 8px 0 0; }
+.out { margin: 8px 0 0; padding: 8px 10px; background: var(--sunk); border-radius: 3px; font: 12px/1.4 var(--font-num); white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; }
+.safety { font-size: 13px; color: var(--fg-2); margin: 0; padding-left: 18px; display: grid; gap: 4px; }
+
+.confirm { position: sticky; bottom: 0; z-index: 3; margin-top: 16px; background: var(--panel); border: 2px solid var(--sel); border-radius: 6px; padding: 12px 14px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; box-shadow: 0 -6px 18px var(--shade); }
+.confirm .q { flex: 1 1 260px; min-width: 0; }
+.confirm .q strong { display: block; font-size: 16px; }
+.confirm .q span { font-size: 13px; color: var(--fg-2); }
+
+/* tables */
+.tbl-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th { text-align: left; font-size: 11px; letter-spacing: .06em; color: var(--fg-3); font-weight: 600; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+td { padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+tr:last-child td { border-bottom: 0; }
+td.t { white-space: nowrap; }
+tr.rtn td { color: var(--fg-3); }
+.state-pill { display: inline-block; font-size: 12px; padding: 0 6px; border-radius: 3px; border: 1px solid var(--line); white-space: nowrap; }
+.state-pill.unack { border-color: var(--fg); font-weight: 700; }
+.tabs { display: flex; gap: 4px; }
+.tabs button { border: 1px solid var(--line); background: var(--panel); border-radius: 3px; padding: 3px 10px; font-size: 12px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--sel); color: var(--sel-fg); border-color: var(--sel); }
+.src { display: inline-block; font-size: 11px; padding: 0 6px; border-radius: 3px; background: var(--sunk); color: var(--fg-2); white-space: nowrap; }
+.empty-row { color: var(--fg-3); text-align: center; padding: 18px; }
+
+/* diagnostics */
+.diag { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; align-items: start; }
+.diag .wide { grid-column: 1 / -1; }
+.rate { display: grid; grid-template-columns: minmax(0, 1fr) 64px 90px; gap: 6px 10px; align-items: center; font-size: 13px; }
+.rate .bar-s { height: 6px; background: var(--sunk); border-radius: 2px; overflow: hidden; }
+.rate .bar-s > div { height: 100%; background: var(--fg-3); }
+.rate .bad .bar-s > div, .rate .bar-s.bad > div { background: var(--p1); }
+#trend { width: 100%; height: 190px; display: block; }
+.trend-key { display: flex; gap: 14px; font-size: 12px; color: var(--fg-2); padding: 0 12px 10px; flex-wrap: wrap; }
+.trend-key i { display: inline-block; width: 18px; height: 0; border-top: 2px solid var(--sel); vertical-align: middle; margin-right: 5px; }
+.trend-key i.dash { border-top: 2px dashed var(--fg-3); }
+
+@media (prefers-reduced-motion: no-preference) {
+  .blink { animation: blink 1s steps(2, start) infinite; }
+  @keyframes blink { to { visibility: hidden; } }
+}
+
+@media (max-width: 1060px) {
+  .ov { grid-template-columns: minmax(0, 1fr); min-height: 0; }
+  .mapbox { min-height: 0; aspect-ratio: 4 / 3; max-width: 100%; }
+  .ops { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto auto minmax(0, 1fr) auto; }
+  .bar { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; gap: 6px 14px; }
+  .unit { grid-column: 1 / 4; border-right: 0; padding-right: 0; flex-direction: row; justify-content: flex-start; gap: 8px; align-items: baseline; }
+  .stop { grid-column: 4; grid-row: 1 / 3; min-width: 96px; padding: 6px 12px; margin-left: 0; }
+  .cell.hide-s { display: none; }
+  .cell .v { font-size: 14px; }
+  .alm-sum { grid-column: 1 / -1; }
+  .nav { grid-row: 4; flex-direction: row; border-right: 0; border-top: 1px solid var(--line); padding-block: 4px; padding-right: max(16px, env(safe-area-inset-right, 0px)); gap: 2px; }
+  .nav button { flex: 1; width: auto; padding: 5px 2px; font-size: 11px; }
+  .nav .badge { right: calc(50% - 22px); }
+  .work { grid-row: 3; }
+  .tiles { grid-template-columns: minmax(0, 1fr); }
+  .tile { min-height: 0; }
+  .rate { grid-template-columns: minmax(0, 1fr) 56px 64px; }
+}
+</style>
+
+<div class="app" id="app">
+  <header class="bar">
+    <div class="unit"><span class="eyebrow">XLK X2RS</span><strong>割草機</strong></div>
+    <div class="cell"><span class="k">模式</span><span class="v" id="vMode">—</span></div>
+    <div class="cell"><span class="k">任務</span><span class="v" id="vMission">—</span></div>
+    <div class="cell"><span class="k">通訊</span><span class="v num" id="vLink">—</span></div>
+    <div class="cell hide-s"><span class="k">操作權</span><span class="v" id="vAuth">—</span></div>
+    <button class="alm-sum" id="almSum" type="button" aria-label="打開警報清單">
+      <span class="counts" id="almCounts"></span>
+      <span class="txt" id="almTop">沒有警報</span>
+    </button>
+    <div class="cell hide-s"><span class="k" id="vDate">—</span><span class="v num" id="vClock">—</span></div>
+    <button class="stop" id="btnStop" type="button"><span>停止</span><small>跟按 RB 一樣</small></button>
+  </header>
+
+  <div class="demo" id="demo" hidden>
+    <strong>畫面草稿・模擬資料</strong>
+    <span>試試看：</span>
+    <button type="button" data-demo="obstacle">前方放東西</button>
+    <button type="button" data-demo="joy">關手把</button>
+    <button type="button" data-demo="lb" hidden>手把按一下 LB</button>
+    <button type="button" data-demo="rb">手把按 RB</button>
+    <button type="button" data-demo="link">網頁斷線 6 秒</button>
+    <button type="button" data-demo="auth">另一台搶操作權</button>
+    <button type="button" data-demo="reset">從頭開始</button>
+    <span class="muted">車子走 6 倍速</span>
+  </div>
+
+  <nav class="nav" aria-label="畫面">
+    <button type="button" data-view="overview" aria-current="page">
+      <svg viewBox="0 0 24 24"><path d="M3 6l6-2 6 2 6-2v14l-6 2-6-2-6 2z"/><path d="M9 4v14M15 6v14"/></svg>總覽</button>
+    <button type="button" data-view="ops">
+      <svg viewBox="0 0 24 24"><path d="M5 4v16M12 4v16M19 4v16"/><rect x="3" y="7" width="4" height="3"/><rect x="10" y="13" width="4" height="3"/><rect x="17" y="9" width="4" height="3"/></svg>操作</button>
+    <button type="button" data-view="alarms">
+      <svg viewBox="0 0 24 24"><path d="M12 3l9 16H3z"/><path d="M12 10v4M12 17v.5"/></svg>警報<span class="badge" id="navBadge" hidden>0</span></button>
+    <button type="button" data-view="diag">
+      <svg viewBox="0 0 24 24"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg>診斷</button>
+    <button type="button" data-view="log">
+      <svg viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12"/><path d="M4 6h.5M4 12h.5M4 18h.5"/></svg>紀錄</button>
+  </nav>
+
+  <div class="work">
+    <main id="main">
+      <!-- 總覽 -->
+      <section class="view" id="view-overview">
+        <div class="ov">
+          <div class="mapbox" id="mapbox">
+            <canvas id="map"></canvas>
+            <div class="map-tools">
+              <button type="button" id="mapFit" aria-pressed="true">全圖</button>
+              <button type="button" id="mapFollow" aria-pressed="false">跟著車子</button>
+            </div>
+            <div class="map-scale" id="mapScale"><span id="mapScaleTxt">1 m</span><div class="rule" id="mapScaleRule" style="width:40px"></div></div>
+            <div class="map-legend">
+              <span><i style="border-top:2px solid var(--fg)"></i>割草範圍</span>
+              <span><i style="background:repeating-linear-gradient(135deg,var(--fg-3) 0 2px,transparent 2px 5px)"></i>禁區</span>
+              <span><i style="background:var(--mown)"></i>已割</span>
+              <span><i style="border-top:1.5px dashed var(--route)"></i>還沒割</span>
+              <span><i style="border-top:2.5px solid var(--sel)"></i>現在這段</span>
+              <span><i style="border:1.5px dashed var(--fg-3)"></i>停止區 0.4 m</span>
+            </div>
+            <div class="map-empty" id="mapEmpty" hidden><div id="mapEmptyTxt"></div></div>
+          </div>
+          <div class="ov-side">
+            <div class="panel">
+              <div class="why" id="why"></div>
+            </div>
+            <div class="panel">
+              <h2>出發條件<span class="r muted">全部正常車子才會走</span></h2>
+              <div class="il" id="interlocks"></div>
+            </div>
+            <div class="panel">
+              <h2>任務<span class="r num" id="mDir"></span></h2>
+              <div class="pbody">
+                <dl class="kv">
+                  <dt>狀態</dt><dd id="mState">—</dd>
+                  <dt>現在這段</dt><dd id="mLabel">—</dd>
+                </dl>
+                <div class="prog" aria-hidden="true"><div id="mBar"></div></div>
+                <dl class="kv">
+                  <dt>進度</dt><dd class="num" id="mCount">—</dd>
+                  <dt>跳過</dt><dd id="mSkip">—</dd>
+                </dl>
+                <p class="mission-msg" id="mMsg" hidden></p>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>車況</h2>
+              <div class="pbody">
+                <dl class="kv">
+                  <dt>速度</dt><dd class="num" id="cSpeed">—</dd>
+                  <dt>轉向</dt><dd class="num" id="cTurn">—</dd>
+                  <dt>位置</dt><dd class="num" id="cPose">—</dd>
+                  <dt>電池</dt><dd class="muted">控制板沒有回報</dd>
+                </dl>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 操作 -->
+      <section class="view" id="view-ops" hidden>
+        <div class="view-h"><h1>操作</h1><p>會讓車子動的按鍵都要按兩次：先選，再按確認。停止只要按一次。</p></div>
+        <div class="ops">
+          <div class="ops-col">
+            <div class="panel">
+              <h2>模式<span class="r" id="opsAuth"></span></h2>
+              <div class="tiles" id="tiles"></div>
+              <div class="auth-note" id="authNote" hidden>
+                <span>操作權在另一台裝置，這台只能看。停止鍵哪一台都能按。</span>
+                <button type="button" class="btn" id="btnTakeAuth">改由這台操作</button>
+              </div>
+            </div>
+          </div>
+          <div class="ops-col">
+            <div class="panel">
+              <h2>車上程式<span class="r" id="progState"></span></h2>
+              <div class="pbody">
+                <dl class="kv" id="progKv"></dl>
+                <div class="btnrow" style="margin-top:10px">
+                  <button type="button" class="btn" id="btnStart">啟動</button>
+                  <button type="button" class="btn" id="btnShutdown">關閉</button>
+                </div>
+                <p class="note">跟 car-start、car-stop 一樣。關閉時會先切到停止，輪子停了才關。</p>
+                <pre class="out" id="progOut" hidden></pre>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>地圖</h2>
+              <div class="pbody">
+                <dl class="kv">
+                  <dt>目前地圖</dt><dd id="mapName">—</dd>
+                </dl>
+                <div class="btnrow" style="margin-top:10px">
+                  <button type="button" class="btn" id="btnSaveMap">存地圖</button>
+                  <button type="button" class="btn" disabled>畫禁區（下一版）</button>
+                </div>
+                <p class="note">存的地圖跟 car-savemap 在同一個資料夾。</p>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>安全</h2>
+              <div class="pbody">
+                <ul class="safety">
+                  <li>真正的急停是馬達總開關。網頁的停止要靠 Wi-Fi，跟 RB 一樣是軟體停止。</li>
+                  <li>網頁不能開車。手動開車只用手把。</li>
+                  <li>網頁斷線車子不會停。自動割草時要停車：停止鍵、RB、LB + X，或關手把。</li>
+                </ul>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 警報 -->
+      <section class="view" id="view-alarms" hidden>
+        <div class="view-h">
+          <h1>警報</h1>
+          <div class="btnrow">
+            <div class="tabs" role="group" aria-label="顯示">
+              <button type="button" data-almtab="active" aria-pressed="true">進行中</button>
+              <button type="button" data-almtab="history" aria-pressed="false">歷史</button>
+            </div>
+            <button type="button" class="btn" id="btnAckAll">全部確認</button>
+          </div>
+        </div>
+        <div class="panel tbl-wrap">
+          <table>
+            <thead><tr><th>等級</th><th>發生</th><th>恢復</th><th>內容</th><th>狀態</th><th></th></tr></thead>
+            <tbody id="almRows"></tbody>
+          </table>
+        </div>
+        <p class="note">等級 1 要馬上處理（車子已經停了），2 要注意，3 是提醒。閃爍代表還沒確認。確認只是表示看到了，不會讓車子動。</p>
+      </section>
+
+      <!-- 診斷 -->
+      <section class="view" id="view-diag" hidden>
+        <div class="view-h"><h1>診斷</h1><p>資料更新率低於下限會標紅。</p></div>
+        <div class="diag">
+          <div class="panel wide">
+            <h2>速度（最近 60 秒）<span class="r num muted" id="trendNow"></span></h2>
+            <canvas id="trend"></canvas>
+            <div class="trend-key"><span><i class="dash"></i>導航想要的速度</span><span><i></i>實際送給底盤的速度</span><span class="muted">兩條分開 = 出發條件把車子擋下來了</span></div>
+          </div>
+          <div class="panel">
+            <h2>資料更新率<span class="r muted">Hz</span></h2>
+            <div class="pbody rate" id="rates"></div>
+          </div>
+          <div class="panel">
+            <h2>程式</h2>
+            <div class="il" id="nodes"></div>
+          </div>
+          <div class="panel">
+            <h2>N150</h2>
+            <div class="pbody"><dl class="kv" id="sys"></dl></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 紀錄 -->
+      <section class="view" id="view-log" hidden>
+        <div class="view-h"><h1>紀錄</h1><p>誰在什麼時候按了什麼，系統發生了什麼。</p></div>
+        <div class="panel tbl-wrap">
+          <table>
+            <thead><tr><th>時間</th><th>來源</th><th>內容</th></tr></thead>
+            <tbody id="logRows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <div class="confirm" id="confirm" hidden>
+        <div class="q"><strong id="cfTitle"></strong><span id="cfDetail"></span></div>
+        <div class="btnrow">
+          <button type="button" class="btn go" id="cfGo">確認執行</button>
+          <button type="button" class="btn" id="cfCancel">取消</button>
+        </div>
+      </div>
+    </main>
+    <div class="stale" id="stale" hidden>
+      <div class="msg"><span id="staleIcon"></span><div><strong id="staleTitle">連線中</strong><span id="staleTxt"></span></div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+'use strict';
+// N150 上的伺服器 (mowerbot_hmi/web.py) 送這一頁時會先設 window.MOWER_LIVE = true。
+// 沒有設 = 畫面草稿，用下面的模擬車子。
+const LIVE = !!window.MOWER_LIVE;
+const $ = s => document.querySelector(s);
+const $$ = s => Array.from(document.querySelectorAll(s));
+const DEG = Math.PI / 180;
+const pad2 = n => String(n).padStart(2, '0');
+const hms = t => { const d = new Date(t); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); };
+const fx = (n, d = 2) => (n == null || !isFinite(n)) ? '—' : Number(n).toFixed(d);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const tok = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+// 內容沒變就不重畫：每 200 ms 重建按鈕的話，按下和放開剛好跨過重建時點擊會不見
+const setHTML = (el, html) => { if (el._h !== html) { el.innerHTML = html; el._h = html; } };
+
+// 這台裝置的代號：操作權認的是它。重新整理頁面不換 (sessionStorage)，關掉分頁就換。
+let CLIENT = '';
+try { CLIENT = sessionStorage.getItem('mowerClient') || ''; } catch (e) { /* 私密瀏覽 */ }
+if (!CLIENT) { CLIENT = Math.random().toString(36).slice(2, 10); try { sessionStorage.setItem('mowerClient', CLIENT); } catch (e) { /* 沒關係 */ } }
+const UA = navigator.userAgent;
+const LABEL = /iPhone/.test(UA) ? 'iPhone' : /iPad/.test(UA) ? 'iPad' : /Android/.test(UA) ? 'Android 手機' : /Macintosh/.test(UA) ? 'Mac' : '電腦';
+
+const MODE_NAME = { 0: '建圖', 1: '自動割草', 2: '手動', 3: '保留', 4: '停止中' };
+const MSTATE = { 0: '待命', 1: '規劃中', 2: '執行中', 3: '割完了', 4: '已中止' };
+// 車子尺寸的備用值 (src/mowerbot_description/config/vehicle.yaml)；N150 會送 vehicle_geometry 算出來的值
+const VEH0 = { front: 0.975, rear: 0.155, half: 0.42, bladeX: 0.375, bladeR: 0.25, lidarX: 0.30, zoneLen: 0.40, zoneSide: 0.05, zoneMax: 3 };
+
+function almIcon(p, extra = '') {
+  const c = 'var(--p' + p + ')', fg = 'var(--p' + p + '-fg)';
+  const shape = p === 1 ? '<rect x="1" y="1" width="16" height="16" rx="1.5" fill="' + c + '"/>'
+    : p === 2 ? '<path d="M9 1l8.5 15.5H.5z" fill="' + c + '"/>'
+    : '<path d="M9 17L.5 1.5h17z" fill="' + c + '"/>';
+  const ty = p === 2 ? 14 : p === 3 ? 10.5 : 13.2;
+  return '<svg class="' + extra + '" width="18" height="18" viewBox="0 0 18 18" aria-label="等級 ' + p + '" role="img">' + shape +
+    '<text x="9" y="' + ty + '" text-anchor="middle" font-size="' + (p === 3 ? 9 : 10.5) + '" font-weight="800" font-family="system-ui,sans-serif" fill="' + fg + '">' + p + '</text></svg>';
+}
+
+// 地圖格子編碼 (跟 web.py 一樣)：0 沒掃過、1 空地、2 障礙物、3 禁區
+// PNG 裡存成 0 / 85 / 170 / 255，讀回來用門檻分，瀏覽器就算動到一點顏色也不會分錯。
+const CELL_LEVELS = [0, 85, 170, 255];
+function decodeCell(v) { return v < 43 ? 0 : v < 128 ? 1 : v < 213 ? 2 : 3; }
+
+// ===================================================================
+// 資料來源：N150 (LIVE) 或模擬車子 (畫面草稿)
+// 兩個都提供 start(onFrame)、send(cmd, arg) -> Promise<{ok, text}>、raster(meta) -> Promise<{vals, w, h}>
+// ===================================================================
+const Source = LIVE ? liveSource() : demoSource();
+
+function liveSource() {
+  let es = null;
+  return {
+    start(onFrame) {
+      const open = () => {
+        es = new EventSource('/api/stream?client=' + encodeURIComponent(CLIENT) + '&label=' + encodeURIComponent(LABEL));
+        es.onmessage = ev => { try { onFrame(JSON.parse(ev.data)); } catch (e) { /* 壞掉的一筆就跳過 */ } };
+        // EventSource 自己會重連；伺服器重開時 readyState 變 CLOSED 才要自己再開
+        es.onerror = () => { if (es.readyState === 2) setTimeout(open, 2000); };
+      };
+      open();
+    },
+    send(cmd, arg) {
+      return fetch('/api/cmd', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cmd, arg, client: CLIENT, label: LABEL }),
+      }).then(r => r.json()).catch(() => ({ ok: false, text: '送不到車子（網路斷了？）' }));
+    },
+    raster(meta) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => {
+          const c = document.createElement('canvas'); c.width = img.width; c.height = img.height;
+          const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+          const d = g.getImageData(0, 0, c.width, c.height).data, vals = new Uint8Array(c.width * c.height);
+          for (let i = 0; i < vals.length; i++) vals[i] = decodeCell(d[i * 4]);
+          resolve({ vals, w: c.width, h: c.height });
+        };
+        img.onerror = reject;
+        img.src = '/api/map.png?v=' + meta.ver;
+      });
+    },
+  };
+}
+
+function demoSource() {
+  // 模擬場地：12 x 6 m 的草地，斜 32°，右上角有一塊禁區（缺一角）
+  const SITE = (() => {
+    const th = 32 * DEG, C = [5.5, 3.5];
+    const W = (u, v) => [C[0] + u * Math.cos(th) - v * Math.sin(th), C[1] + u * Math.sin(th) + v * Math.cos(th)];
+    const lawn = [[-6, -3], [6, -3], [6, 1.8], [4.8, 1.8], [4.8, 3], [-6, 3]].map(p => W(...p));
+    const keepout = [[4.8, 1.8], [6.7, 1.8], [6.7, 3.7], [4.8, 3.7]].map(p => W(...p));
+    const peri = [[-5.4, -2.4], [5.4, -2.4], [5.4, 1.2], [4.2, 1.2], [4.2, 2.4], [-5.4, 2.4]];
+    const fenceUV = [[-9.5, -6], [9.5, -6], [9.5, 6], [-9.5, 6]];
+    const walls = [];
+    for (let i = 0; i < 4; i++) {
+      const a = W(...fenceUV[i]), b = W(...fenceUV[(i + 1) % 4]);
+      if (i === 3) { const m1 = W(-9.5, 1.5), m2 = W(-9.5, -1.0); walls.push([a[0], a[1], m1[0], m1[1]], [m2[0], m2[1], b[0], b[1]]); }
+      else walls.push([a[0], a[1], b[0], b[1]]);
+    }
+    const trees = [[-8, 4.6, 0.3], [7.8, -4.9, 0.35], [0.5, 5.1, 0.25]].map(([u, v, r]) => { const p = W(u, v); return { x: p[0], y: p[1], r }; });
+    const s = W(-3.6, -0.4);
+    const free = [[-9.4, -5.9], [9.4, -5.9], [9.4, 5.9], [-9.4, 5.9]].map(p => W(...p));
+    const fenceW = fenceUV.map(p => W(...p));
+    return { W, lawn, keepout, peri, walls, trees, start: { x: s[0], y: s[1], yaw: th + 0.4 }, free, fenceW, deg: 32 };
+  })();
+  const RB = (() => { const xs = SITE.fenceW.map(p => p[0]), ys = SITE.fenceW.map(p => p[1]); return { x0: Math.min(...xs) - 1.5, x1: Math.max(...xs) + 1.5, y0: Math.min(...ys) - 1.5, y1: Math.max(...ys) + 1.5 }; })();
+  const RES = 0.05, RW = Math.ceil((RB.x1 - RB.x0) / RES), RH = Math.ceil((RB.y1 - RB.y0) / RES);
+  const SPEED = 0.25, SPEEDUP = 6, SKIP_AFTER = 15, V = VEH0;
+
+  function buildRoute(from) {
+    const { W, peri } = SITE, segs = [], P0 = W(...peri[0]);
+    segs.push({ label: 'approach', pts: [[from.x, from.y], P0] });
+    for (let i = 0; i < peri.length; i++) segs.push({ label: '周邊環繞 ' + (i + 1) + '/' + peri.length, pts: [W(...peri[i]), W(...peri[(i + 1) % peri.length])] });
+    const lines = [];
+    for (let k = 0; k < 12; k++) { const v = -1.65 + 0.3 * k, uEnd = v > 0.6 ? 3.6 : 4.8; lines.push(k % 2 === 0 ? [[-4.8, v], [uEnd, v]] : [[uEnd, v], [-4.8, v]]); }
+    segs.push({ label: '銜接', pts: [P0, W(...lines[0][0])] });
+    lines.forEach((ln, k) => {
+      segs.push({ label: '割草線 ' + (k + 1) + '/12', pts: ln.map(p => W(...p)) });
+      if (k < 11) {
+        const [ue, ve] = ln[1], next = lines[k + 1][0];
+        const sg = ue > 0 ? 1 : -1, cu = ue + sg * 0.35, cv = (ve + next[1]) / 2, r = (next[1] - ve) / 2, pts = [W(ue, ve)];
+        for (let j = 0; j <= 10; j++) { const a = -Math.PI / 2 + Math.PI * j / 10; pts.push(W(cu + sg * r * Math.cos(a), cv + r * Math.sin(a))); }
+        pts.push(W(next[0], next[1]));
+        segs.push({ label: '掉頭 ' + (k + 1) + '/11', pts });
+      }
+    });
+    const P = [], S = [], segStart = [];
+    let acc = 0;
+    segs.forEach(sg => {
+      segStart.push(acc);
+      sg.pts.forEach((p, j) => {
+        if (P.length && j === 0) { const q = P[P.length - 1]; if (Math.hypot(p[0] - q[0], p[1] - q[1]) < 1e-9) return; }
+        if (P.length) { const q = P[P.length - 1]; acc += Math.hypot(p[0] - q[0], p[1] - q[1]); }
+        P.push(p); S.push(acc);
+      });
+    });
+    return { segs, P, S, segStart, total: acc };
+  }
+  function poseAt(R, s) {
+    s = Math.max(0, Math.min(R.total, s));
+    let lo = 0, hi = R.S.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (R.S[m] <= s) lo = m; else hi = m; }
+    const a = R.P[lo], b = R.P[hi], L = R.S[hi] - R.S[lo] || 1e-9, t = (s - R.S[lo]) / L;
+    return { x: a[0] + (b[0] - a[0]) * t, y: a[1] + (b[1] - a[1]) * t, yaw: Math.atan2(b[1] - a[1], b[0] - a[0]) };
+  }
+  function segAt(R, s) { let g = 0; for (let i = 0; i < R.segStart.length; i++) if (R.segStart[i] <= s + 1e-9) g = i; return g; }
+  function polyRange(R, a, b) {
+    const out = [];
+    if (b <= a) return out;
+    const pa = poseAt(R, a); out.push([pa.x, pa.y]);
+    for (let i = 0; i < R.S.length; i++) if (R.S[i] > a && R.S[i] < b) out.push(R.P[i]);
+    const pb = poseAt(R, b); out.push([pb.x, pb.y]);
+    return out;
+  }
+  function rayHits(px, py, circles) {
+    const pts = [], N = 240, RMAX = 20;
+    for (let i = 0; i < N; i++) {
+      const a = i * 2 * Math.PI / N, dx = Math.cos(a), dy = Math.sin(a);
+      let best = RMAX;
+      for (const [ax, ay, bx, by] of SITE.walls) {
+        const ex = bx - ax, ey = by - ay, den = dx * ey - dy * ex;
+        if (Math.abs(den) < 1e-9) continue;
+        const t = ((ax - px) * ey - (ay - py) * ex) / den, u = ((ax - px) * dy - (ay - py) * dx) / den;
+        if (t > 0 && u >= 0 && u <= 1 && t < best) best = t;
+      }
+      for (const c of circles) {
+        const fx_ = px - c.x, fy_ = py - c.y, b = fx_ * dx + fy_ * dy, cc = fx_ * fx_ + fy_ * fy_ - c.r * c.r, disc = b * b - cc;
+        if (disc < 0) continue;
+        const t = -b - Math.sqrt(disc);
+        if (t > 0 && t < best) best = t;
+      }
+      if (best < RMAX) pts.push(px + dx * best, py + dy * best);
+    }
+    return pts;
+  }
+
+  const T0 = Date.now(), ago = m => T0 - m * 60e3;
+  const sim = {};
+  let seq = 1;
+  function logEv(src, text) { sim.events.unshift({ t: Date.now(), src, text }); if (sim.events.length > 200) sim.events.pop(); }
+  function setAlarm(key, on, p, text) {
+    const a = sim.alarms.find(x => x.key === key && x.active);
+    if (on && !a) sim.alarms.unshift({ id: seq++, key, p, text, tIn: Date.now(), tOut: null, active: true, acked: false });
+    else if (on && a) a.text = text;
+    else if (!on && a) { a.active = false; a.tOut = Date.now(); }
+  }
+  function mapName(t) { return 'map_1020_' + hms(t).replace(/:/g, ''); }
+  function reset() {
+    Object.assign(sim, {
+      running: true, since: ago(24), busy: null, mapping: true, mapName: mapName(ago(9)),
+      mode: 1, mstate: 2, msg: '', route: buildRoute(SITE.start), routeShown: true, s: 0, mown: [],
+      v: SPEED, w: 0, navV: SPEED, pose: { ...SITE.start }, joy: { connected: true, latched: false },
+      obstacle: null, blockedFor: 0, skipped: [], authority: 'here', freezeUntil: 0, alarms: [], events: [], scan: [], zoneN: 0,
+    });
+    const R = sim.route, g = R.segs.findIndex(sg => sg.label === '割草線 4/12');
+    sim.s = R.segStart[g] + 2.2; sim.mown = [[0, sim.s]]; sim.pose = poseAt(R, sim.s);
+    sim.events = [
+      { t: ago(24), src: '系統', text: '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s）' },
+      { t: ago(21), src: '手把', text: 'LB + A 開始建圖' },
+      { t: ago(9), src: '手把', text: 'Y 存地圖 ' + sim.mapName + '，路線預覽：割草線 12 條（方向 32°），共 ' + R.segs.length + ' 段' },
+      { t: ago(6), src: '網頁 (Mac)', text: '自動割草（確認）' },
+      { t: ago(4.2), src: '系統', text: '手把斷線，車子停在原地' },
+      { t: ago(4.1), src: '系統', text: '手把重新連上，等按一下 LB' },
+      { t: ago(4.0), src: '手把', text: '按一下 LB，繼續割' },
+      { t: ago(2.1), src: '系統', text: '前方停止區有東西，暫停 12 秒後繼續' },
+    ].reverse();
+    sim.alarms = [
+      { id: seq++, key: 'joy', p: 1, text: '手把斷線，車子停在原地', tIn: ago(4.2), tOut: ago(4.1), active: false, acked: true },
+      { id: seq++, key: 'zone', p: 2, text: '前方停止區有東西，車子暫停', tIn: ago(2.1), tOut: ago(1.9), active: false, acked: false },
+    ];
+  }
+  function blockReason() {
+    if (!sim.running || sim.mode !== 1 || sim.mstate !== 2) return null;
+    if (!sim.joy.connected) return { key: 'joy', p: 1, text: '手把斷線', hint: '打開手把，連上之後按一下 LB 才會繼續走。' };
+    if (sim.joy.latched) return { key: 'latch', p: 2, text: '手把斷線過，要按一下 LB', hint: '手把已經重新連上了。按一下 LB 車子才繼續走。' };
+    if (sim.zoneN > V.zoneMax) return { key: 'zone', p: 2, text: '前方停止區有東西', hint: '東西拿走就會接著走。停超過 15 秒這一段會跳過（還剩 ' + Math.max(0, SKIP_AFTER - sim.blockedFor).toFixed(0) + ' 秒）。' };
+    return null;
+  }
+  function step(dt) {
+    if (!sim.running) { sim.v = 0; sim.navV = 0; sim.scan = []; return; }
+    const R = sim.route, c = Math.cos(sim.pose.yaw), sn = Math.sin(sim.pose.yaw);
+    sim.scan = rayHits(sim.pose.x + V.lidarX * c, sim.pose.y + V.lidarX * sn, SITE.trees.concat(sim.obstacle ? [sim.obstacle] : []));
+    let n = 0;
+    for (let i = 0; i < sim.scan.length; i += 2) {
+      const dx = sim.scan[i] - sim.pose.x, dy = sim.scan[i + 1] - sim.pose.y, lx = dx * c + dy * sn, ly = -dx * sn + dy * c;
+      if (lx >= V.front && lx <= V.front + V.zoneLen && Math.abs(ly) <= V.half + V.zoneSide) n++;
+    }
+    sim.zoneN = n;
+    const executing = sim.mode === 1 && sim.mstate === 2, br = blockReason(), prevYaw = sim.pose.yaw;
+    sim.navV = executing ? SPEED : 0;
+    if (executing && !br) {
+      sim.blockedFor = 0;
+      sim.s += SPEED * SPEEDUP * dt;
+      sim.mown[sim.mown.length - 1][1] = sim.s;
+      sim.v = SPEED;
+      if (sim.s >= R.total) {
+        sim.s = R.total; sim.mstate = 3; sim.v = 0; sim.navV = 0;
+        sim.msg = '割完了：' + R.segs.length + ' 段，跳過 ' + sim.skipped.length + ' 段。車子停在最後一條線的尾巴。';
+        logEv('系統', sim.msg);
+      }
+      sim.pose = poseAt(R, sim.s);
+    } else {
+      sim.v = 0;
+      if (br && br.key === 'zone') {
+        sim.blockedFor += dt;
+        if (sim.blockedFor >= SKIP_AFTER) {
+          const g = segAt(R, sim.s), sg = R.segs[g];
+          sim.skipped.push(sg.label + ' (' + sim.pose.x.toFixed(2) + ', ' + sim.pose.y.toFixed(2) + ')');
+          setAlarm('skip' + g, true, 3, sg.label + ' 被擋超過 15 秒，已跳過'); setAlarm('skip' + g, false);
+          logEv('系統', sg.label + ' 被擋超過 15 秒，跳過，從下一段繼續');
+          sim.obstacle = null; sim.blockedFor = 0;
+          sim.s = R.segStart[Math.min(g + 1, R.segs.length - 1)];
+          sim.mown.push([sim.s, sim.s]);
+          sim.pose = poseAt(R, sim.s);
+        }
+      } else sim.blockedFor = 0;
+    }
+    let dy = sim.pose.yaw - prevYaw; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
+    sim.w = Math.max(-1.2, Math.min(1.2, dt > 0 ? dy / (dt * SPEEDUP) : 0));
+    setAlarm('estop', sim.mode === 4, 1, '停止中。到「操作」按手動，或手把 LB + X 解除');
+    setAlarm('joy', !sim.joy.connected, 1, executing ? '手把斷線，車子停在原地' : '手把斷線');
+    setAlarm('latch', sim.joy.latched && sim.joy.connected, 2, '手把重新連上了，按一下 LB 車子才繼續走');
+    setAlarm('zone', !!br && br.key === 'zone', 2, '前方停止區有東西，車子暫停');
+  }
+  function frame() {
+    const R = sim.route, g = segAt(R, sim.s), up = sim.running;
+    const executing = sim.mode === 1 && sim.mstate === 2;
+    const completed = sim.mstate === 3 ? R.segs.length : (sim.mode === 1 || sim.mstate === 4) && sim.mstate !== 0 ? g : 0;
+    const n = (base, spread) => base + (Math.random() - 0.5) * spread;
+    const segEnd = g + 1 < R.segStart.length ? R.segStart[g + 1] : R.total;
+    return {
+      stamp: Date.now(),
+      program: { running: up, busy: sim.busy, since: sim.since, lidar: true, scale: 0.25, output: '' },
+      manager: up, mode: up ? sim.mode : null,
+      authority: { holder: sim.authority === 'here' ? CLIENT : sim.authority === 'other' ? 'other' : null, label: sim.authority === 'other' ? 'Mac' : LABEL },
+      mission: {
+        state: sim.mstate, total: sim.routeShown ? R.segs.length : 0, completed, skipped: sim.skipped.length,
+        label: executing ? R.segs[g].label : '', skipped_labels: sim.skipped.slice(), message: sim.msg,
+        swath_deg: sim.routeShown ? SITE.deg : null, lines: 12,
+      },
+      block: blockReason(),
+      joy: { connected: sim.joy.connected, latched: sim.joy.latched },
+      lidar_hz: up ? n(10, 0.15) : 0, nav_ready: up,
+      zone: { n: sim.zoneN, blocked: sim.zoneN > V.zoneMax },
+      pose: up ? { x: sim.pose.x, y: sim.pose.y, yaw: sim.pose.yaw, frame: 'map' } : null,
+      vel: { v: sim.v, w: sim.w, nav: sim.navV, out: sim.v },
+      map: { ready: up && sim.mapping, name: sim.mapping ? sim.mapName : null, ver: up && sim.mapping ? 1 : 0, res: RES, x0: RB.x0, y0: RB.y0, w: RW, h: RH },
+      saving: up && Date.now() < (sim.savingUntil || 0),
+      geo: {
+        boundary: up && sim.mapping ? SITE.lawn : null,
+        route: up && sim.routeShown ? polyRange(R, sim.s, R.total) : null,
+        current: up && executing ? polyRange(R, sim.s, segEnd) : null,
+        trail: up && sim.routeShown ? sim.mown.map(([a, b]) => polyRange(R, a, b)).filter(p => p.length > 1) : null,
+        scan: sim.scan,
+      },
+      vehicle: VEH0,
+      alarms: sim.alarms, events: sim.events,
+      diag: {
+        topics: [
+          { name: '/scan', hz: up ? n(10, 0.15) : 0, min: 8 }, { name: '/odom', hz: up ? n(30, 0.3) : 0, min: 10 },
+          { name: '/joy', hz: up && sim.joy.connected ? n(20, 0.2) : 0, min: 10 }, { name: '/joy_status', hz: up ? n(5, 0.05) : 0, min: 3 },
+          { name: '/mower_status', hz: up ? n(5, 0.05) : 0, min: 3 }, { name: '/cmd_vel', hz: up ? n(20, 0.3) : 0, min: 10 },
+        ],
+        nodes: [['/mower_bridge', '控制板'], ['/mower_manager', '模式與任務'], ['/mower_teleop', '手把'], ['/rplidar_node', '光達'],
+          ['/slam_toolbox', '建圖與定位'], ['/controller_server', '導航'], ['/collision_monitor', '停止區'], ['/f2c_server', '割草路線'],
+          ['/keepout_server', '禁區'], ['/map_autosave', '存地圖']].map(([name, what]) => ({ name, what, ok: up })),
+        sys: { cpu: up ? n(36, 6) : n(4, 2), temp: up ? n(61, 1.5) : n(47, 1), mem: up ? 23 : 9, disk: 141.6, clients: 1, uptime: Date.now() - ago(31) },
+      },
+    };
+  }
+  const C = {
+    stop(src) {
+      if (!sim.running) return { ok: false, text: '車上程式沒在跑' };
+      const was = sim.mode; sim.mode = 4;
+      if (sim.mstate === 2 || sim.mstate === 1) { sim.mstate = 4; sim.msg = ''; }
+      sim.joy.latched = false;
+      logEv(src, (src === '手把' ? 'RB' : '停止鍵') + '：' + MODE_NAME[was] + ' → 停止中');
+      return { ok: true };
+    },
+    mode(m) {
+      if (!sim.running) return { ok: false, text: '車上程式沒在跑' };
+      if (sim.mode === 4 && m !== 2) return { ok: false, text: '停止中只能先切手動' };
+      if (m === 1 && !sim.mapping) return { ok: false, text: '還沒有地圖：先開始建圖，把範圍開一圈' };
+      if (m === 1 && Date.now() < (sim.savingUntil || 0)) return { ok: false, text: '正在存地圖，存好再開始' };
+      if (m === sim.mode) return { ok: false, text: '已經是' + MODE_NAME[m] + '了' };
+      const was = sim.mode;
+      if (was === 1 && m !== 1 && (sim.mstate === 2 || sim.mstate === 1)) sim.mstate = 4;
+      sim.joy.latched = false;
+      if (m === 0) sim.mapping = true;
+      if (m === 1) {
+        sim.route = buildRoute(sim.pose); sim.routeShown = true; sim.s = 0; sim.mown = [[0, 0]]; sim.skipped = []; sim.mstate = 1; sim.msg = '';
+        setTimeout(() => { if (sim.mode === 1 && sim.mstate === 1) { sim.mstate = 2; logEv('系統', '路線規劃好了：割草線 12 條（方向 32°），共 ' + sim.route.segs.length + ' 段，出發'); } }, 1200);
+      }
+      sim.mode = m;
+      logEv('網頁 (' + LABEL + ')', MODE_NAME[was] + ' → ' + MODE_NAME[m]);
+      return { ok: true };
+    },
+    preview() {
+      if (!sim.running || !sim.mapping) return { ok: false, text: '還沒有地圖' };
+      if (sim.mode === 1) return { ok: false, text: '自動割草中不能預覽，先切手動' };
+      sim.mapName = mapName(Date.now()); sim.savingUntil = Date.now() + 12000;
+      sim.route = buildRoute(sim.pose); sim.routeShown = true; sim.s = 0; sim.mown = [[0, 0]]; sim.skipped = []; sim.mstate = 0;
+      sim.msg = '路線預覽：割草線 12 條 (方向 32°)，共 ' + sim.route.segs.length + ' 段。車子不會動；OK 就按「自動割草」。';
+      logEv('網頁 (' + LABEL + ')', '預覽路線，存地圖 ' + sim.mapName);
+      return { ok: true };
+    },
+    savemap() {
+      if (!sim.running || !sim.mapping) return { ok: false, text: '還沒有地圖' };
+      if (sim.mode === 1) return { ok: false, text: '自動割草中不存地圖；先切手動' };
+      if (Date.now() < (sim.savingUntil || 0)) return { ok: false, text: '上一次還在存，等它存完' };
+      sim.mapName = mapName(Date.now()); sim.savingUntil = Date.now() + 12000;
+      logEv('網頁 (' + LABEL + ')', '存地圖 ' + sim.mapName);
+      return { ok: true, text: '存地圖中（大約 10～30 秒）' };
+    },
+    start() {
+      if (sim.running) return { ok: false, text: '已經在跑了' };
+      sim.busy = 'starting';
+      setTimeout(() => {
+        Object.assign(sim, { running: true, busy: null, since: Date.now(), mode: 2, mstate: 0, msg: '', mapping: false, mapName: null, routeShown: false, s: 0, mown: [[0, 0]], skipped: [], pose: { ...SITE.start }, obstacle: null });
+        sim.route = buildRoute(sim.pose);
+        logEv('系統', '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s）');
+      }, 2500);
+      logEv('網頁 (' + LABEL + ')', '啟動車上程式');
+      return { ok: true, text: '啟動中（N150 上大約 20～40 秒）' };
+    },
+    shutdown() {
+      if (!sim.running) return { ok: false, text: '本來就沒在跑' };
+      C.stop('網頁 (' + LABEL + ')');
+      sim.busy = 'stopping';
+      setTimeout(() => { sim.running = false; sim.busy = null; logEv('系統', '車上程式關掉了'); }, 2000);
+      logEv('網頁 (' + LABEL + ')', '關閉車上程式（先切停止，輪子停了才關）');
+      return { ok: true, text: '關閉中' };
+    },
+    ack(id) { const a = sim.alarms.find(x => x.id === id); if (a) a.acked = true; return { ok: true }; },
+    ackAll() { sim.alarms.forEach(a => { a.acked = true; }); logEv('網頁 (' + LABEL + ')', '確認全部警報'); return { ok: true }; },
+    takeAuth() { sim.authority = 'here'; logEv('網頁 (' + LABEL + ')', '操作權改到這台'); return { ok: true }; },
+  };
+  const ALLOWED_WITHOUT_AUTH = ['stop', 'ack', 'ackAll', 'takeAuth'];
+  let push = null;
+  function publish() { if (push && Date.now() >= sim.freezeUntil) push(frame()); }
+  function demoButtons() {
+    $('[data-demo="obstacle"]').textContent = sim.obstacle ? '拿走前方的東西' : '前方放東西';
+    $('[data-demo="joy"]').textContent = sim.joy.connected ? '關手把' : '開手把';
+    $('[data-demo="lb"]').hidden = !sim.joy.latched || !sim.joy.connected;
+    $('[data-demo="auth"]').textContent = sim.authority === 'here' ? '另一台搶操作權' : '另一台交回操作權';
+  }
+  $$('[data-demo]').forEach(b => b.onclick = () => {
+    const a = b.dataset.demo;
+    if (a === 'obstacle') {
+      if (sim.obstacle) { sim.obstacle = null; logEv('系統', '前方的東西拿走了'); }
+      else { const p = poseAt(sim.route, Math.min(sim.route.total, sim.s + V.front + 0.9)); sim.obstacle = { x: p.x, y: p.y, r: 0.14 }; }
+    } else if (a === 'joy') {
+      sim.joy.connected = !sim.joy.connected;
+      if (!sim.joy.connected) { if (sim.mode === 1) sim.joy.latched = true; logEv('系統', '手把斷線'); }
+      else logEv('系統', '手把重新連上' + (sim.joy.latched ? '，等按一下 LB' : ''));
+    } else if (a === 'lb') { sim.joy.latched = false; logEv('手把', '按一下 LB，繼續割'); }
+    else if (a === 'rb') C.stop('手把');
+    else if (a === 'link') sim.freezeUntil = Date.now() + 6000;
+    else if (a === 'auth') { sim.authority = sim.authority === 'here' ? 'other' : 'here'; logEv('網頁', sim.authority === 'here' ? '操作權交回這台' : '操作權改到另一台（Mac）'); }
+    else if (a === 'reset') reset();
+    demoButtons(); publish();
+  });
+  function buildRaster() {
+    const c = document.createElement('canvas'); c.width = RW; c.height = RH;
+    const g = c.getContext('2d'), tx = x => (x - RB.x0) / RES, ty = y => (RB.y1 - y) / RES;
+    const lv = i => 'rgb(' + CELL_LEVELS[i] + ',' + CELL_LEVELS[i] + ',' + CELL_LEVELS[i] + ')';
+    const poly = pts => { g.beginPath(); pts.forEach(([x, y], i) => i ? g.lineTo(tx(x), ty(y)) : g.moveTo(tx(x), ty(y))); g.closePath(); };
+    g.imageSmoothingEnabled = false;
+    g.fillStyle = lv(0); g.fillRect(0, 0, RW, RH);
+    g.fillStyle = lv(1); poly(SITE.free); g.fill();
+    g.fillStyle = lv(3); poly(SITE.keepout); g.fill();
+    g.strokeStyle = lv(2); g.lineWidth = 0.1 / RES;
+    SITE.walls.forEach(([ax, ay, bx, by]) => { g.beginPath(); g.moveTo(tx(ax), ty(ay)); g.lineTo(tx(bx), ty(by)); g.stroke(); });
+    g.fillStyle = lv(2);
+    SITE.trees.forEach(t => { g.beginPath(); g.arc(tx(t.x), ty(t.y), t.r / RES, 0, 2 * Math.PI); g.fill(); });
+    const d = g.getImageData(0, 0, RW, RH).data, vals = new Uint8Array(RW * RH);
+    for (let i = 0; i < vals.length; i++) vals[i] = decodeCell(d[i * 4]);
+    return { vals, w: RW, h: RH };
+  }
+  reset();
+  $('#demo').hidden = false;
+  return {
+    start(onFrame) {
+      push = onFrame;
+      let tPrev = performance.now();
+      setInterval(() => { const t = performance.now(); step(Math.min(0.5, (t - tPrev) / 1000)); tPrev = t; }, 100);
+      setInterval(() => { publish(); demoButtons(); }, 200);
+      publish();
+    },
+    send(cmd, arg) {
+      if (sim.authority !== 'here' && !ALLOWED_WITHOUT_AUTH.includes(cmd)) return Promise.resolve({ ok: false, text: '操作權在另一台' });
+      let r;
+      if (cmd === 'stop') r = C.stop('網頁 (' + LABEL + ')');
+      else if (cmd === 'mode') r = C.mode(arg);
+      else if (C[cmd]) r = C[cmd](arg);
+      else r = { ok: false, text: '不認得的指令' };
+      setTimeout(publish, 0);
+      return Promise.resolve(r);
+    },
+    raster() { return Promise.resolve(buildRaster()); },
+  };
+}
+
+// ===================================================================
+// 畫面
+// ===================================================================
+let last = null, lastRx = 0, view = 'overview', almTab = 'active', pending = null, everRx = false;
+const cache = { alarms: [], events: [], route: null, boundary: null, trail: null, current: null };
+const trendBuf = []; for (let i = 0; i < 300; i++) trendBuf.push([0, 0]);
+
+// 大的欄位 (警報、紀錄、路線、軌跡) N150 只在有變的時候送；沒送就沿用上一次的
+function onFrame(f) {
+  for (const k of ['alarms', 'events']) if (f[k] !== undefined) cache[k] = f[k];
+  if (f.geo) for (const k of ['route', 'boundary', 'trail', 'current']) if (f.geo[k] !== undefined) cache[k] = f.geo[k];
+  f.alarms = cache.alarms; f.events = cache.events;
+  f.geo = Object.assign({}, f.geo || {}, { route: cache.route, boundary: cache.boundary, trail: cache.trail, current: cache.current });
+  trendBuf.push([f.vel ? f.vel.nav || 0 : 0, f.vel ? f.vel.out || 0 : 0]); if (trendBuf.length > 300) trendBuf.shift();
+  last = f; lastRx = Date.now(); everRx = true;
+  render(f);
+}
+
+function isHolder(st) { return !st.authority || st.authority.holder == null || st.authority.holder === CLIENT; }
+function linkOk() { return Date.now() - lastRx < 1500; }
+
+const MODE_TILES = [
+  { m: 2, t: '手動', d: '用手把開車。開機就是這個模式。', j: '手把 <kbd>LB</kbd> + <kbd>X</kbd>' },
+  { m: 0, t: '開始建圖', d: '從車子現在的位置開始建地圖。把要割的範圍慢慢開一圈。', j: '手把 <kbd>LB</kbd> + <kbd>A</kbd>' },
+  { m: 'preview', t: '預覽路線', d: '存地圖並算出割草路線，畫在總覽的地圖上。車子不會動。', j: '手把 <kbd>Y</kbd>' },
+  { m: 1, t: '自動割草', d: '照路線出發，之後不用按 LB。手指放在停止鍵或 RB 上。', j: '手把 <kbd>LB</kbd> + <kbd>B</kbd>' },
+];
+function tileBlock(tile, st) {
+  if (!isHolder(st)) return '操作權在另一台';
+  if (!st.program.running) return '車上程式沒在跑，先按「啟動」';
+  if (!st.manager) return '模式程式 (mower_manager) 沒有回應';
+  if (st.mode === 4 && tile.m !== 2) return '停止中：先按「手動」解除';
+  if ((tile.m === 1 || tile.m === 'preview') && !st.map.ready) return '還沒有地圖：先「開始建圖」，把範圍開一圈';
+  const busy = st.mode === 1 && (st.mission.state === 1 || st.mission.state === 2);
+  if (tile.m === 1 && busy) return '正在割';
+  if (tile.m === st.mode) return tile.m === 1 ? '這一趟結束了；要再割一次先切手動' : '已經是這個模式';
+  if (tile.m === 1 && st.saving) return '正在存地圖，存好（大約 10～30 秒）才能開始';
+  if (tile.m === 1 && !st.joy.connected) return '手把沒連上：自動割草要手把連著';
+  if (tile.m === 1 && !st.nav_ready) return '導航 (Nav2) 還沒準備好';
+  if (tile.m === 'preview' && st.mode === 1) return '自動割草中不能預覽，先切手動';
+  return null;
+}
+function confirmText(tile) {
+  switch (tile.m) {
+    case 1: return ['開始自動割草？', '車子會規劃路線後直接出發。確認旁邊有人顧馬達總開關、場地裡沒有人和寵物。'];
+    case 0: return ['開始建圖？', '從車子現在的位置開始建圖，之後一直建到關閉車上程式。'];
+    case 2: return [last && last.mode === 4 ? '解除停止，切到手動？' : '切到手動？', last && last.mode === 1 ? '自動割草這一趟會取消，車子停下來。' : '之後用手把開車。'];
+    case 'preview': return ['預覽割草路線？', '存地圖並算出路線，車子不會動。'];
+  }
+  return ['', ''];
+}
+function ask(kind, tile) {
+  let title, detail, run;
+  if (kind === 'tile') { [title, detail] = confirmText(tile); run = () => tile.m === 'preview' ? Source.send('preview') : Source.send('mode', tile.m); }
+  else if (kind === 'start') { title = '啟動車上程式？'; detail = '跟 car-start 一樣：光達開、速度上限 0.25（最快約 0.17 m/s），大約 20～40 秒。後輪要架高，或旁邊有人顧馬達總開關。'; run = () => Source.send('start'); }
+  else if (kind === 'shutdown') { title = '關閉車上程式？'; detail = '會先切到停止，輪子停了才關（跟 car-stop 一樣）。地圖和禁區要重新建、重新畫。'; run = () => Source.send('shutdown'); }
+  else if (kind === 'savemap') { title = '存地圖？'; detail = '大約 10～30 秒，車子不會停。'; run = () => Source.send('savemap'); }
+  pending = { kind, tile, detail, run, until: Date.now() + 10000 };
+  $('#cfTitle').textContent = title;
+  $('#cfGo').hidden = false; $('#cfCancel').textContent = '取消';
+  $('#confirm').hidden = false;
+  renderConfirm();
+  if (last) renderOps(last);
+  $('#cfGo').focus({ preventScroll: true });
+}
+function notice(text) {
+  pending = { kind: 'notice', until: Date.now() + 6000 };
+  $('#cfTitle').textContent = text; $('#cfDetail').textContent = '';
+  $('#cfGo').hidden = true; $('#cfCancel').textContent = '知道了'; $('#confirm').hidden = false;
+}
+function renderConfirm() {
+  if (!pending) { $('#confirm').hidden = true; return; }
+  const left = Math.ceil((pending.until - Date.now()) / 1000);
+  if (left <= 0) { pending = null; $('#confirm').hidden = true; if (last) renderOps(last); return; }
+  if (pending.kind === 'notice') return;
+  $('#cfDetail').textContent = pending.detail + '（' + left + ' 秒內沒按確認就取消）';
+}
+function report(r) { if (r && !r.ok) notice('沒有執行：' + r.text); else if (r && r.text) notice(r.text); }
+$('#cfGo').onclick = () => {
+  if (!pending || pending.kind === 'notice' || !linkOk()) return;
+  const p = pending; pending = null; $('#confirm').hidden = true;
+  p.run().then(report);
+};
+$('#cfCancel').onclick = () => { pending = null; $('#confirm').hidden = true; if (last) renderOps(last); };
+$('#btnStop').onclick = () => {
+  if (pending && pending.kind !== 'notice') { pending = null; $('#confirm').hidden = true; }
+  if (!linkOk()) return;
+  Source.send('stop').then(r => { if (r && !r.ok) notice('停止沒有送到：' + r.text + '。用手把 RB 或馬達總開關。'); });
+};
+$('#btnStart').onclick = () => ask('start');
+$('#btnShutdown').onclick = () => ask('shutdown');
+$('#btnSaveMap').onclick = () => ask('savemap');
+$('#btnTakeAuth').onclick = () => Source.send('takeAuth').then(report);
+$('#btnAckAll').onclick = () => Source.send('ackAll');
+$('#almSum').onclick = () => show('alarms');
+$('#tiles').addEventListener('click', e => { const el = e.target.closest('[data-tile]'); if (el && !el.disabled) ask('tile', MODE_TILES[+el.dataset.tile]); });
+$('#almRows').addEventListener('click', e => { const el = e.target.closest('[data-ack]'); if (el) Source.send('ack', +el.dataset.ack); });
+$$('[data-almtab]').forEach(b => b.onclick = () => { almTab = b.dataset.almtab; $$('[data-almtab]').forEach(x => x.setAttribute('aria-pressed', String(x === b))); if (last) renderAlarms(last); });
+
+function show(v) {
+  view = v;
+  $$('.view').forEach(s => { s.hidden = s.id !== 'view-' + v; });
+  $$('.nav button').forEach(b => { if (b.dataset.view === v) b.setAttribute('aria-current', 'page'); else b.removeAttribute('aria-current'); });
+  try { history.replaceState(null, '', '#' + v); } catch (e) { /* 不讓改網址就算了 */ }
+  if (v === 'overview') { sizeCanvas(); drawMap(); }
+  if (v === 'diag') { sizeTrend(); drawTrend(); }
+  if (last) render(last);
+}
+$$('.nav button').forEach(b => b.onclick = () => show(b.dataset.view));
+
+function render(st) {
+  renderBar(st);
+  if (view === 'overview') renderOverview(st);
+  if (view === 'ops') renderOps(st);
+  if (view === 'alarms') renderAlarms(st);
+  if (view === 'diag') renderDiag(st);
+  if (view === 'log') renderLog(st);
+}
+function activeAlarms(st) { return st.alarms.filter(a => a.active || !a.acked); }
+
+function renderBar(st) {
+  const m = st.mode, ms = st.mission;
+  setHTML($('#vMode'), !st.program.running ? '<span class="muted">' + (st.program.busy === 'starting' ? '啟動中' : '程式沒在跑') + '</span>'
+    : m == null ? '<span class="tag p2">沒有回應</span>' : m === 4 ? '<span class="tag p1">停止中</span>' : esc(MODE_NAME[m]));
+  setHTML($('#vMission'), ms.total ? esc(MSTATE[ms.state]) + ' <span class="num">' + ms.completed + '/' + ms.total + '</span>' : '<span class="muted">' + esc(MSTATE[ms.state] || '—') + '</span>');
+  const h = st.authority && st.authority.holder;
+  setHTML($('#vAuth'), h == null ? '<span class="muted">沒有人</span>' : h === CLIENT ? '這台' : '<span class="muted">' + esc(st.authority.label || '另一台') + '</span>');
+  const act = activeAlarms(st), cnt = [1, 2, 3].map(p => act.filter(a => a.p === p).length);
+  setHTML($('#almCounts'), cnt.map((c, i) => c ? '<span>' + almIcon(i + 1) + c + '</span>' : '').join(''));
+  const top = act.slice().sort((a, b) => (a.active === b.active ? 0 : a.active ? -1 : 1) || a.p - b.p || b.tIn - a.tIn)[0];
+  if (top) { $('#almSum').classList.remove('quiet'); $('#almTop').textContent = hms(top.tIn) + '　' + top.text + (top.active ? '' : '（已恢復，未確認）'); }
+  else { $('#almSum').classList.add('quiet'); $('#almTop').textContent = '沒有警報'; }
+  const unack = act.filter(a => !a.acked).length;
+  $('#navBadge').hidden = !unack; $('#navBadge').textContent = unack;
+}
+
+function renderOverview(st) {
+  const b = st.block, ms = st.mission, why = $('#why');
+  let html;
+  if (!st.program.running) html = '<span class="dot-run"></span><div><strong>' + (st.program.busy === 'starting' ? '車上程式啟動中' : '車上程式沒在跑') + '</strong><p>' + (st.program.busy === 'starting' ? '等一下，啟動好了這裡會變。' : '到「操作」按「啟動」，或在 N150 打 car-start。') + '</p></div>';
+  else if (!st.manager) html = almIcon(1) + '<div><strong>模式程式沒有回應</strong><p>mower_manager 沒有在發狀態。看「診斷」，或到 N150 看 car-status。</p></div>';
+  else if (st.mode === 4) html = almIcon(1) + '<div><strong>停止中</strong><p>輪子一直收到零速度。到「操作」按「手動」或手把 LB + X 解除。</p></div>';
+  else if (b) html = almIcon(b.p) + '<div><strong>車子暫停：' + esc(b.text) + '</strong><p>' + esc(b.hint || '') + '</p></div>';
+  else if (st.mode === 1 && ms.state === 2) html = '<span class="dot-run on"></span><div><strong>自動割草中</strong><p>放開 LB 不會停。要停：停止鍵、RB、LB + X。</p></div>';
+  else if (st.mode === 1 && ms.state === 1) html = '<span class="dot-run on"></span><div><strong>規劃路線中</strong><p>算好就出發。</p></div>';
+  else html = '<span class="dot-run"></span><div><strong>' + esc(MODE_NAME[st.mode]) + '</strong><p>' + (st.mode === 0 ? '建圖中，用手把開。' : st.mode === 1 ? '自動割草，' + esc(MSTATE[ms.state]) + '。' : '車子只聽手把。') + '</p></div>';
+  setHTML(why, html);
+
+  if (!st.program.running) {
+    setHTML($('#interlocks'), ['手把', '光達', '前方停止區', '導航', '停止'].map(n => '<div class="name">' + n + '</div><div class="val ok">—</div>').join(''));
+  } else {
+    const rows = [];
+    const il = (name, ok, okText, badText, p) => rows.push('<div class="name">' + name + '</div><div class="val' + (ok ? ' ok' : '') + '">' + (ok ? okText : almIcon(p) + esc(badText)) + '</div>');
+    il('手把', st.joy.connected && !st.joy.latched, '已連線', !st.joy.connected ? '斷線' : '要按一下 LB', st.joy.connected ? 2 : 1);
+    if (st.program.lidar === false) rows.push('<div class="name">光達</div><div class="val ok">沒接（nolidar）</div>');
+    else il('光達', st.lidar_hz > 5, '<span class="num">' + fx(st.lidar_hz, 1) + ' Hz</span>', '沒有資料', 1);
+    il('前方停止區', !st.zone.blocked, '淨空', '有東西（' + st.zone.n + ' 點）', 2);
+    il('導航', st.nav_ready, '就緒', '沒在跑', 1);
+    il('停止', st.mode !== 4, '沒有按', '停止中', 1);
+    setHTML($('#interlocks'), rows.join(''));
+  }
+  $('#mState').textContent = MSTATE[ms.state] || '—';
+  $('#mLabel').textContent = ms.label || '—';
+  $('#mCount').textContent = ms.total ? ms.completed + ' / ' + ms.total + ' 段' : '—';
+  $('#mBar').style.width = ms.total ? (100 * ms.completed / ms.total) + '%' : '0';
+  setHTML($('#mSkip'), ms.skipped ? almIcon(3) + ' ' + ms.skipped + ' 段：' + esc(ms.skipped_labels.join('、')) : '<span class="muted">沒有</span>');
+  $('#mDir').textContent = ms.swath_deg != null ? (ms.lines ? '割草線 ' + ms.lines + ' 條・' : '') + '方向 ' + ms.swath_deg + '°' : '';
+  const mm = $('#mMsg'); mm.hidden = !ms.message; mm.textContent = ms.message || '';
+  const up = st.program.running;
+  $('#cSpeed').textContent = up && st.vel ? fx(st.vel.v, 2) + ' m/s（最快 ' + fx(0.7 * (st.program.scale || 1), 2) + '）' : '—';
+  $('#cTurn').textContent = up && st.vel ? fx(st.vel.w, 2) + ' rad/s' : '—';
+  $('#cPose').textContent = st.pose ? 'x ' + fx(st.pose.x, 2) + '　y ' + fx(st.pose.y, 2) + '　' + fx(((st.pose.yaw / DEG) % 360 + 360) % 360, 0) + '°' + (st.pose.frame === 'odom' ? '（odom）' : '') : '—';
+}
+
+function renderOps(st) {
+  const here = isHolder(st);
+  setHTML($('#opsAuth'), here ? '操作權：這台' : '<span class="muted">只能看</span>');
+  $('#authNote').hidden = here;
+  setHTML($('#tiles'), MODE_TILES.map((t, i) => {
+    const why = tileBlock(t, st), current = st.program.running && t.m === st.mode;
+    const armed = pending && pending.kind === 'tile' && pending.tile === t;
+    return '<button type="button" class="tile' + (current ? ' current' : '') + (armed ? ' armed' : '') + '" data-tile="' + i + '"' + (why ? ' disabled' : '') + '>' +
+      (current ? '<span class="now tag sel">目前</span>' : '') + '<span class="t">' + t.t + '</span><span class="d">' + t.d + '</span>' +
+      (why ? '<span class="why-not">' + esc(why) + '</span>' : '') + '<span class="j">' + t.j + '</span></button>';
+  }).join(''));
+  const p = st.program;
+  setHTML($('#progState'), p.busy === 'starting' ? '啟動中' : p.busy === 'stopping' ? '關閉中' : p.running ? '執行中' : '<span class="muted">沒在跑</span>');
+  setHTML($('#progKv'), p.running
+    ? '<dt>開始</dt><dd class="num">' + (p.since ? hms(p.since) : '—') + '</dd><dt>光達</dt><dd>' + (p.lidar ? '開' : '關') + '</dd><dt>速度上限</dt><dd class="num">' + fx(p.scale, 2) + '（最快約 ' + fx(0.7 * (p.scale || 1), 2) + ' m/s）</dd>'
+    : '<dt>狀態</dt><dd>' + (p.busy === 'starting' ? '啟動中，N150 上大約 20～40 秒。' : '沒在跑。啟動之後是手動模式，要重新建圖。') + '</dd>');
+  const out = $('#progOut'); out.hidden = !p.output; out.textContent = p.output || '';
+  $('#btnStart').disabled = p.running || !!p.busy || !here;
+  $('#btnShutdown').disabled = !p.running || !!p.busy || !here;
+  $('#btnSaveMap').disabled = !st.map.ready || !here || !!st.saving || st.mode === 1;
+  $('#mapName').textContent = st.saving ? '存地圖中…（大約 10～30 秒）' : st.map.name || (st.map.ready ? '還沒存過' : '還沒有（先開始建圖）');
+}
+
+function renderAlarms(st) {
+  const list = almTab === 'active' ? activeAlarms(st) : st.alarms;
+  const rows = list.map(a => {
+    const state = a.active ? (a.acked ? '已確認' : '未確認') : (a.acked ? '已恢復' : '已恢復，未確認');
+    return '<tr class="' + (a.active ? '' : 'rtn') + '"><td>' + almIcon(a.p, (a.active && !a.acked) ? 'blink' : '') + '</td><td class="t num">' + hms(a.tIn) + '</td><td class="t num">' + (a.tOut ? hms(a.tOut) : '—') + '</td><td>' + esc(a.text) + '</td><td><span class="state-pill' + (a.acked ? '' : ' unack') + '">' + state + '</span></td><td>' + (!a.acked ? '<button type="button" class="btn" data-ack="' + a.id + '">確認</button>' : '') + '</td></tr>';
+  });
+  setHTML($('#almRows'), rows.length ? rows.join('') : '<tr><td colspan="6" class="empty-row">' + (almTab === 'active' ? '沒有進行中的警報' : '還沒有警報紀錄') + '</td></tr>');
+  $('#btnAckAll').disabled = !st.alarms.some(a => !a.acked);
+}
+
+function renderDiag(st) {
+  setHTML($('#rates'), st.diag.topics.map(t => {
+    const bad = st.program.running && t.hz < t.min, pct = Math.min(100, 100 * t.hz / (t.min * 2.5));
+    return '<span class="num">' + t.name + '</span><span class="num" style="text-align:right">' + (bad ? almIcon(2) + ' ' : '') + fx(t.hz, t.hz < 1 ? 2 : 1) + '</span><div class="bar-s' + (bad ? ' bad' : '') + '" title="下限 ' + t.min + '"><div style="width:' + pct.toFixed(0) + '%"></div></div>';
+  }).join(''));
+  setHTML($('#nodes'), st.diag.nodes.map(n => '<div class="name"><span class="num">' + n.name + '</span><span class="muted">' + n.what + '</span></div><div class="val' + (n.ok || !st.program.running ? ' ok' : '') + '">' + (n.ok ? '運作中' : st.program.running ? almIcon(2) + '沒在跑' : '沒在跑') + '</div>').join(''));
+  const s = st.diag.sys, upm = Math.floor(s.uptime / 60e3);
+  setHTML($('#sys'), '<dt>CPU</dt><dd class="num">' + fx(s.cpu, 0) + ' %</dd><dt>溫度</dt><dd class="num">' + (s.temp == null ? '—' : fx(s.temp, 0) + ' °C') + '</dd><dt>記憶體</dt><dd class="num">' + fx(s.mem, 0) + ' %</dd><dt>SSD 剩下</dt><dd class="num">' + fx(s.disk, 1) + ' GB</dd><dt>開著這個網頁的裝置</dt><dd class="num">' + s.clients + '</dd><dt>開機多久</dt><dd class="num">' + Math.floor(upm / 60) + ' 小時 ' + (upm % 60) + ' 分</dd>');
+  $('#trendNow').textContent = '現在 ' + fx(trendBuf[trendBuf.length - 1][1], 2) + ' m/s';
+  drawTrend();
+}
+
+function renderLog(st) {
+  setHTML($('#logRows'), st.events.length ? st.events.map(e => '<tr><td class="t num">' + hms(e.t) + '</td><td><span class="src">' + esc(e.src) + '</span></td><td>' + esc(e.text) + '</td></tr>').join('')
+    : '<tr><td colspan="3" class="empty-row">還沒有紀錄</td></tr>');
+}
+
+// ---- 地圖 ----
+const cv = $('#map'), cx = cv.getContext('2d');
+let mapMode = 'fit', vw = { k: 30, ox: 0, oy: 0 };
+let rasterData = null, rasterVer = -1, rasterLoading = false, rasterImg = null, rasterKey = '';
+
+function rgba(color) {
+  const c = document.createElement('canvas'); c.width = c.height = 1;
+  const g = c.getContext('2d'); g.fillStyle = color; g.fillRect(0, 0, 1, 1);
+  return Array.from(g.getImageData(0, 0, 1, 1).data);
+}
+function colorize() {
+  const R = rasterData, c = document.createElement('canvas'); c.width = R.w; c.height = R.h;
+  const g = c.getContext('2d'), img = g.createImageData(R.w, R.h), d = img.data;
+  const cols = [rgba(tok('--map-unknown')), rgba(tok('--map-free')), rgba(tok('--map-occ')), rgba(tok('--fg-3'))];
+  for (let i = 0; i < R.vals.length; i++) {
+    let v = R.vals[i];
+    if (v === 3) { const x = i % R.w, y = (i / R.w) | 0; if ((x + y) % 6 >= 2) v = 1; }  // 禁區畫斜線
+    const col = cols[v]; d[i * 4] = col[0]; d[i * 4 + 1] = col[1]; d[i * 4 + 2] = col[2]; d[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  rasterImg = c; rasterKey = themeKey();
+}
+function themeKey() { return tok('--map-free') + tok('--map-occ') + tok('--map-unknown'); }
+function ensureRaster(meta) {
+  if (!meta || !meta.ready || !meta.ver) return;
+  if (meta.ver !== rasterVer && !rasterLoading) {
+    rasterLoading = true;
+    const want = meta.ver;
+    Source.raster(meta).then(R => { rasterData = Object.assign(R, { meta }); rasterVer = want; colorize(); })
+      .catch(() => { /* 下一輪再試 */ }).finally(() => { rasterLoading = false; });
+  }
+  if (rasterData && rasterKey !== themeKey()) colorize();
+}
+function sizeCanvas() {
+  const r = cv.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
+  if (!r.width) return;
+  cv.width = Math.round(r.width * dpr); cv.height = Math.round(r.height * dpr);
+}
+function bbox(pts, m) { const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]); return { x0: Math.min(...xs) - m, x1: Math.max(...xs) + m, y0: Math.min(...ys) - m, y1: Math.max(...ys) + m }; }
+function computeView(st) {
+  const r = cv.getBoundingClientRect(), W = r.width, H = r.height;
+  if (mapMode === 'follow' && st.pose) {
+    const k = Math.min(W, H) / 7;
+    vw = { k, ox: W / 2 - k * st.pose.x, oy: H / 2 + k * st.pose.y };
+    return;
+  }
+  let B;
+  const g = st.geo;
+  if (g.boundary && g.boundary.length > 2) B = bbox(g.boundary, 1.6);
+  else if (st.map.ready && st.map.w) B = { x0: st.map.x0, y0: st.map.y0, x1: st.map.x0 + st.map.w * st.map.res, y1: st.map.y0 + st.map.h * st.map.res };
+  else if (st.pose) B = { x0: st.pose.x - 5, x1: st.pose.x + 5, y0: st.pose.y - 5, y1: st.pose.y + 5 };
+  else B = { x0: -5, x1: 5, y0: -5, y1: 5 };
+  const k = Math.min(W / (B.x1 - B.x0), H / (B.y1 - B.y0));
+  vw = { k, ox: (W - k * (B.x1 - B.x0)) / 2 - k * B.x0, oy: (H + k * (B.y1 - B.y0)) / 2 + k * B.y0 };
+}
+function line(pts, close) { cx.beginPath(); pts.forEach(([x, y], i) => i ? cx.lineTo(x, y) : cx.moveTo(x, y)); if (close) cx.closePath(); }
+
+function drawMap() {
+  const st = last;
+  if (view !== 'overview' || !st) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width === 0) sizeCanvas();
+  computeView(st);
+  const { k, ox, oy } = vw, px = n => n / k, V = Object.assign({}, VEH0, st.vehicle || {});
+  cx.setTransform(1, 0, 0, 1, 0, 0);
+  cx.fillStyle = tok('--map-unknown'); cx.fillRect(0, 0, cv.width, cv.height);
+  const hasMap = st.map.ready;
+  ensureRaster(st.map);
+  $('#mapEmpty').hidden = hasMap && !!st.pose;
+  $('#mapEmptyTxt').textContent = !st.program.running ? '車上程式沒在跑' : !st.pose ? '還不知道車子在哪（等 TF）' : '還沒有地圖。到「操作」按「開始建圖」，或手把 LB + A。';
+  if (hasMap && rasterImg && rasterData) {
+    const m = rasterData.meta;
+    cx.setTransform(k * dpr * m.res, 0, 0, k * dpr * m.res, (ox + k * m.x0) * dpr, (oy - k * (m.y0 + m.h * m.res)) * dpr);
+    cx.imageSmoothingEnabled = false;
+    cx.drawImage(rasterImg, 0, 0);
+  }
+  cx.setTransform(k * dpr, 0, 0, -k * dpr, ox * dpr, oy * dpr);
+  cx.lineCap = 'round'; cx.lineJoin = 'round';
+  const g = st.geo;
+  if (hasMap && g.boundary && g.boundary.length > 2) { line(g.boundary, true); cx.strokeStyle = tok('--fg'); cx.lineWidth = px(2); cx.stroke(); }
+  if (hasMap && g.trail) { cx.strokeStyle = tok('--mown'); cx.lineWidth = V.bladeR * 2; g.trail.forEach(p => { if (p.length > 1) { line(p); cx.stroke(); } }); }
+  if (hasMap && g.route && g.route.length > 1) { cx.strokeStyle = tok('--route'); cx.lineWidth = px(1.1); cx.setLineDash([px(4), px(3)]); line(g.route); cx.stroke(); cx.setLineDash([]); }
+  if (hasMap && g.current && g.current.length > 1) { cx.strokeStyle = tok('--sel'); cx.lineWidth = px(2.6); line(g.current); cx.stroke(); }
+  if (g.scan && g.scan.length && st.pose) {
+    cx.fillStyle = tok('--fg-2');
+    const r = px(1.6);
+    for (let i = 0; i < g.scan.length; i += 2) cx.fillRect(g.scan[i] - r, g.scan[i + 1] - r, 2 * r, 2 * r);
+  }
+  if (st.pose) {
+    const { x, y, yaw } = st.pose, hw = V.half + V.zoneSide;
+    cx.save(); cx.translate(x, y); cx.rotate(yaw);
+    cx.beginPath(); cx.rect(V.front, -hw, V.zoneLen, 2 * hw);
+    if (st.zone && st.zone.blocked) { cx.fillStyle = tok('--p2'); cx.globalAlpha = 0.45; cx.fill(); cx.globalAlpha = 1; cx.strokeStyle = tok('--p2'); cx.lineWidth = px(2); }
+    else { cx.strokeStyle = tok('--fg-3'); cx.setLineDash([px(3), px(2)]); cx.lineWidth = px(1.2); }
+    cx.stroke(); cx.setLineDash([]);
+    cx.fillStyle = tok('--car'); cx.globalAlpha = 0.88;
+    cx.beginPath(); cx.rect(-V.rear, -V.half, V.rear + V.front, 2 * V.half); cx.fill(); cx.globalAlpha = 1;
+    cx.strokeStyle = tok('--panel'); cx.lineWidth = px(1.2); cx.setLineDash([px(2), px(2)]);
+    cx.beginPath(); cx.arc(V.bladeX, 0, V.bladeR, 0, 2 * Math.PI); cx.stroke(); cx.setLineDash([]);
+    cx.fillStyle = tok('--panel');
+    cx.beginPath(); cx.moveTo(V.front - 0.06, 0); cx.lineTo(V.front - 0.3, 0.17); cx.lineTo(V.front - 0.3, -0.17); cx.closePath(); cx.fill();
+    cx.restore();
+  }
+  const opts = [0.5, 1, 2, 5, 10, 20]; let L = opts[0];
+  opts.forEach(o => { if (k * o <= 110) L = o; });
+  $('#mapScaleRule').style.width = (k * L) + 'px';
+  $('#mapScaleTxt').textContent = L + ' m';
+}
+$('#mapFit').onclick = () => { mapMode = 'fit'; $('#mapFit').setAttribute('aria-pressed', 'true'); $('#mapFollow').setAttribute('aria-pressed', 'false'); drawMap(); };
+$('#mapFollow').onclick = () => { mapMode = 'follow'; $('#mapFollow').setAttribute('aria-pressed', 'true'); $('#mapFit').setAttribute('aria-pressed', 'false'); drawMap(); };
+
+// ---- 速度趨勢 ----
+const tc = $('#trend'), tg = tc.getContext('2d');
+function sizeTrend() { const r = tc.getBoundingClientRect(), dpr = window.devicePixelRatio || 1; if (!r.width) return; tc.width = Math.round(r.width * dpr); tc.height = Math.round(r.height * dpr); }
+function drawTrend() {
+  if (view !== 'diag') return;
+  if (!tc.width) sizeTrend();
+  const dpr = window.devicePixelRatio || 1, W = tc.width / dpr, H = tc.height / dpr;
+  const L = 44, Rr = 14, T = 12, B = 26, pw = W - L - Rr, ph = H - T - B;
+  const peak = Math.max(0.3, ...trendBuf.map(p => Math.max(Math.abs(p[0]), Math.abs(p[1]))));
+  const ymax = Math.ceil(peak * 10) / 10, step = ymax > 0.6 ? 0.2 : 0.1;
+  const g = tg; g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+  g.font = '11px ' + tok('--font-num'); g.fillStyle = tok('--fg-3'); g.strokeStyle = tok('--line'); g.lineWidth = 1;
+  for (let v = 0; v <= ymax + 1e-9; v += step) { const y = T + ph - ph * v / ymax; g.beginPath(); g.moveTo(L, y + .5); g.lineTo(L + pw, y + .5); g.stroke(); g.textAlign = 'right'; g.textBaseline = 'middle'; g.fillText(v.toFixed(1), L - 6, y); }
+  g.textAlign = 'center'; g.textBaseline = 'top';
+  [-60, -45, -30, -15, 0].forEach(s => { g.fillText(s === 0 ? '現在' : s + ' s', L + pw * (s + 60) / 60, T + ph + 6); });
+  g.save(); g.translate(12, T + ph / 2); g.rotate(-Math.PI / 2); g.textBaseline = 'middle'; g.fillText('m/s', 0, 0); g.restore();
+  const n = trendBuf.length, yOf = v => T + ph - ph * Math.max(0, Math.min(Math.abs(v), ymax)) / ymax;
+  const plot = (idx, color, dash, w) => { g.strokeStyle = color; g.lineWidth = w; g.setLineDash(dash); g.beginPath(); trendBuf.forEach((p, i) => { const x = L + pw * i / (n - 1); i ? g.lineTo(x, yOf(p[idx])) : g.moveTo(x, yOf(p[idx])); }); g.stroke(); g.setLineDash([]); };
+  plot(0, tok('--fg-3'), [5, 4], 1.5);
+  plot(1, tok('--sel'), [], 2);
+  g.fillStyle = tok('--sel'); g.beginPath(); g.arc(L + pw, yOf(trendBuf[n - 1][1]), 3.5, 0, 2 * Math.PI); g.fill();
+}
+
+// ---- 計時 ----
+setInterval(() => {
+  const now = Date.now(), d = new Date(now);
+  $('#vClock').textContent = hms(now);
+  $('#vDate').textContent = (d.getMonth() + 1) + '/' + d.getDate();
+  const age = (now - lastRx) / 1000, ok = linkOk();
+  setHTML($('#vLink'), ok ? '正常' : !everRx ? '<span class="tag p2">連線中</span>' : '<span class="tag p1">中斷 ' + age.toFixed(1) + ' s</span>');
+  $('#stale').hidden = ok;
+  if (!ok) {
+    setHTML($('#staleIcon'), almIcon(everRx ? 1 : 2));
+    $('#staleTitle').textContent = everRx ? '與車子失去聯繫' : '連線中';
+    $('#staleTxt').textContent = everRx ? '畫面不是即時狀態，按鈕已停用。要停車用手把 RB 或馬達總開關；車上的停車條件照常有效。'
+      : (LIVE ? '正在連 N150。一直停在這裡的話，確認 Mac 或手機連的是 mowerbot-n150 熱點。' : '');
+  }
+  $('#btnStop').disabled = !ok;
+  renderConfirm();
+}, 250);
+(function loop() { drawMap(); setTimeout(() => requestAnimationFrame(loop), 90); })();
+if (window.ResizeObserver) { new ResizeObserver(() => { sizeCanvas(); drawMap(); }).observe($('#mapbox')); new ResizeObserver(() => { sizeTrend(); drawTrend(); }).observe(tc); }
+else window.addEventListener('resize', () => { sizeCanvas(); sizeTrend(); });
+
+Source.start(onFrame);
+const want = (location.hash || '').slice(1);
+show(['overview', 'ops', 'alarms', 'diag', 'log'].includes(want) ? want : 'overview');
+})();
+</script>
