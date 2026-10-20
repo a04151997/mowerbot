@@ -144,6 +144,7 @@ main { height: 100%; overflow: auto; padding-block: 16px; padding-left: max(16px
 .why { display: flex; gap: 10px; align-items: flex-start; padding: 10px 12px; }
 .why strong { display: block; font-size: 15px; }
 .why p { margin: 2px 0 0; color: var(--fg-2); font-size: 13px; }
+.why-act { padding: 0 12px 10px 34px; }
 .dot-run { width: 12px; height: 12px; border-radius: 50%; border: 2px solid var(--fg-2); flex: none; margin-top: 4px; }
 .dot-run.on { background: var(--fg-2); }
 
@@ -301,6 +302,8 @@ tr.rtn td { color: var(--fg-3); }
             <div class="map-scale" id="mapScale"><span id="mapScaleTxt">1 m</span><div class="rule" id="mapScaleRule" style="width:40px"></div></div>
             <div class="map-legend">
               <span><i style="border-top:2px solid var(--fg)"></i>割草範圍</span>
+              <span id="lgLawn" hidden><i style="border-top:2px dotted var(--fg-2)"></i>草地邊界</span>
+              <span id="lgRec" hidden><i style="border-top:2.5px solid var(--sel)"></i>記錄中的邊界</span>
               <span><i style="background:repeating-linear-gradient(135deg,var(--fg-3) 0 2px,transparent 2px 5px)"></i>禁區</span>
               <span><i style="background:var(--mown)"></i>已割</span>
               <span><i style="border-top:1.5px dashed var(--route)"></i>還沒割</span>
@@ -312,6 +315,8 @@ tr.rtn td { color: var(--fg-3); }
           <div class="ov-side">
             <div class="panel">
               <div class="why" id="why"></div>
+              <!-- 按鈕不放在 #why 裡：#why 每 0.2 秒重畫，手指按下去的時候按鈕被換掉就按不到 -->
+              <div class="why-act" id="whyAct" hidden><button type="button" class="btn" id="btnWhyLawnStop">完成記錄邊界</button></div>
             </div>
             <div class="panel">
               <h2>出發條件<span class="r muted">全部正常車子才會走</span></h2>
@@ -385,6 +390,20 @@ tr.rtn td { color: var(--fg-3); }
                   <button type="button" class="btn" disabled>畫禁區（下一版）</button>
                 </div>
                 <p class="note">存的地圖跟 car-savemap 在同一個資料夾。</p>
+              </div>
+            </div>
+            <div class="panel">
+              <h2>草地邊界<span class="r" id="lawnState"></span></h2>
+              <div class="pbody">
+                <dl class="kv" id="lawnKv"></dl>
+                <div class="btnrow" style="margin-top:10px">
+                  <button type="button" class="btn" id="btnLawnStart">開始記錄</button>
+                  <button type="button" class="btn" id="btnLawnStop">完成</button>
+                  <button type="button" class="btn" id="btnLawnCancel">取消這次</button>
+                  <button type="button" class="btn" id="btnLawnClear">清除邊界</button>
+                </div>
+                <p class="note" id="lawnWhy" hidden></p>
+                <p class="note">草地旁邊沒有牆（水泥地、步道）就要記，不然會割到草地外面。建圖中把車開到草地邊上，按「開始記錄」，用手把沿著草地邊緣開一圈，開回起點（總覽地圖上的虛線圓）按「完成」。之後預覽和自動割草只在這一圈裡面。關閉車上程式之後要重記。</p>
               </div>
             </div>
             <div class="panel">
@@ -760,6 +779,7 @@ function demoSource() {
       vel: { v: sim.v, w: sim.w, nav: sim.navV, out: sim.v },
       map: { ready: up && sim.mapping, name: sim.mapping ? sim.mapName : null, ver: up && sim.mapping ? 1 : 0, res: RES, x0: RB.x0, y0: RB.y0, w: RW, h: RH },
       saving: up && Date.now() < (sim.savingUntil || 0),
+      lawn: { recording: false, set: false, close_gap: 1.0 },
       geo: {
         boundary: up && sim.mapping ? SITE.lawn : null,
         route: up && sim.routeShown ? polyRange(R, sim.s, R.total) : null,
@@ -848,6 +868,7 @@ function demoSource() {
     ack(id) { const a = sim.alarms.find(x => x.id === id); if (a) a.acked = true; return { ok: true }; },
     ackAll() { sim.alarms.forEach(a => { a.acked = true; }); logEv('網頁 (' + LABEL + ')', '確認全部警報'); return { ok: true }; },
     takeAuth() { sim.authority = 'here'; logEv('網頁 (' + LABEL + ')', '操作權改到這台'); return { ok: true }; },
+    lawn() { return { ok: false, text: '展示版沒有記錄草地邊界' }; },
   };
   const ALLOWED_WITHOUT_AUTH = ['stop', 'ack', 'ackAll', 'takeAuth'];
   let push = null;
@@ -919,15 +940,17 @@ function demoSource() {
 // 畫面
 // ===================================================================
 let last = null, lastRx = 0, view = 'overview', almTab = 'active', pending = null, everRx = false;
-const cache = { alarms: [], events: [], route: null, boundary: null, trail: null, current: null };
+const cache = { alarms: [], events: [], route: null, boundary: null, trail: null, current: null, lawn: null, rec: null };
+const GEO_KEYS = ['route', 'boundary', 'trail', 'current', 'lawn', 'rec'];
 const trendBuf = []; for (let i = 0; i < 300; i++) trendBuf.push([0, 0]);
 
 // 大的欄位 (警報、紀錄、路線、軌跡) N150 只在有變的時候送；沒送就沿用上一次的
 function onFrame(f) {
   for (const k of ['alarms', 'events']) if (f[k] !== undefined) cache[k] = f[k];
-  if (f.geo) for (const k of ['route', 'boundary', 'trail', 'current']) if (f.geo[k] !== undefined) cache[k] = f.geo[k];
+  if (f.geo) for (const k of GEO_KEYS) if (f.geo[k] !== undefined) cache[k] = f.geo[k];
   f.alarms = cache.alarms; f.events = cache.events;
-  f.geo = Object.assign({}, f.geo || {}, { route: cache.route, boundary: cache.boundary, trail: cache.trail, current: cache.current });
+  f.geo = Object.assign({}, f.geo || {});
+  for (const k of GEO_KEYS) f.geo[k] = cache[k];
   trendBuf.push([f.vel ? f.vel.nav || 0 : 0, f.vel ? f.vel.out || 0 : 0]); if (trendBuf.length > 300) trendBuf.shift();
   last = f; lastRx = Date.now(); everRx = true;
   render(f);
@@ -951,7 +974,7 @@ function tileBlock(tile, st) {
   const busy = st.mode === 1 && (st.mission.state === 1 || st.mission.state === 2);
   if (tile.m === 1 && busy) return '正在割';
   if (tile.m === st.mode) return tile.m === 1 ? '這一趟結束了；要再割一次先切手動' : '已經是這個模式';
-  if (tile.m === 1 && st.saving) return '正在存地圖，存好（大約 10～30 秒）才能開始';
+  if ((tile.m === 1 || tile.m === 'preview') && st.lawn && st.lawn.recording) return '正在記錄草地邊界：先按「完成」或「取消這次」';
   if (tile.m === 1 && !st.joy.connected) return '手把沒連上：自動割草要手把連著';
   if (tile.m === 1 && !st.nav_ready) return '導航 (Nav2) 還沒準備好';
   if (tile.m === 'preview' && st.mode === 1) return '自動割草中不能預覽，先切手動';
@@ -959,7 +982,7 @@ function tileBlock(tile, st) {
 }
 function confirmText(tile) {
   switch (tile.m) {
-    case 1: return ['開始自動割草？', '車子會規劃路線後直接出發。確認旁邊有人顧馬達總開關、場地裡沒有人和寵物。'];
+    case 1: return ['開始自動割草？', (last && last.saving ? '正在存地圖，存好才會出發（大約 10～30 秒）。' : '車子會規劃路線後直接出發。') + '確認旁邊有人顧馬達總開關、場地裡沒有人和寵物。'];
     case 0: return ['開始建圖？', '從車子現在的位置開始建圖，之後一直建到關閉車上程式。'];
     case 2: return [last && last.mode === 4 ? '解除停止，切到手動？' : '切到手動？', last && last.mode === 1 ? '自動割草這一趟會取消，車子停下來。' : '之後用手把開車。'];
     case 'preview': return ['預覽割草路線？', '存地圖並算出路線，車子不會動。'];
@@ -972,6 +995,8 @@ function ask(kind, tile) {
   else if (kind === 'start') { title = '啟動車上程式？'; detail = '跟 car-start 一樣：光達開、速度上限 0.25（最快約 0.17 m/s），大約 20～40 秒。後輪要架高，或旁邊有人顧馬達總開關。'; run = () => Source.send('start'); }
   else if (kind === 'shutdown') { title = '關閉車上程式？'; detail = '會先切到停止，輪子停了才關（跟 car-stop 一樣）。地圖和禁區要重新建、重新畫。'; run = () => Source.send('shutdown'); }
   else if (kind === 'savemap') { title = '存地圖？'; detail = '大約 10～30 秒，車子不會停。'; run = () => Source.send('savemap'); }
+  else if (kind === 'lawnCancel') { title = '取消這次記錄？'; detail = '開過的這一段不要了。之前記好的草地邊界不會動。'; run = () => Source.send('lawn', 'cancel'); }
+  else if (kind === 'lawnClear') { title = '清除草地邊界？'; detail = '割草範圍改回只看地圖上的牆和障礙物。草地旁邊沒有牆的話會割到外面。'; run = () => Source.send('lawn', 'clear'); }
   pending = { kind, tile, detail, run, until: Date.now() + 10000 };
   $('#cfTitle').textContent = title;
   $('#cfGo').hidden = false; $('#cfCancel').textContent = '取消';
@@ -1007,6 +1032,12 @@ $('#btnStop').onclick = () => {
 $('#btnStart').onclick = () => ask('start');
 $('#btnShutdown').onclick = () => ask('shutdown');
 $('#btnSaveMap').onclick = () => ask('savemap');
+// 開始、完成只按一次：一手拿手把一手按手機，不讓人多按；取消、清除會丟掉資料，要確認
+$('#btnLawnStart').onclick = () => Source.send('lawn', 'start').then(report);
+$('#btnLawnStop').onclick = () => Source.send('lawn', 'stop').then(report);
+$('#btnLawnCancel').onclick = () => ask('lawnCancel');
+$('#btnLawnClear').onclick = () => ask('lawnClear');
+$('#btnWhyLawnStop').onclick = () => { if (linkOk()) Source.send('lawn', 'stop').then(report); };
 $('#btnTakeAuth').onclick = () => Source.send('takeAuth').then(report);
 $('#btnAckAll').onclick = () => Source.send('ackAll');
 $('#almSum').onclick = () => show('alarms');
@@ -1058,10 +1089,14 @@ function renderOverview(st) {
   else if (!st.manager) html = almIcon(1) + '<div><strong>模式程式沒有回應</strong><p>mower_manager 沒有在發狀態。看「診斷」，或到 N150 看 car-status。</p></div>';
   else if (st.mode === 4) html = almIcon(1) + '<div><strong>停止中</strong><p>輪子一直收到零速度。到「操作」按「手動」或手把 LB + X 解除。</p></div>';
   else if (b) html = almIcon(b.p) + '<div><strong>車子暫停：' + esc(b.text) + '</strong><p>' + esc(b.hint || '') + '</p></div>';
+  else if (st.lawn && st.lawn.recording) html = lawnBanner(st);
   else if (st.mode === 1 && ms.state === 2) html = '<span class="dot-run on"></span><div><strong>自動割草中</strong><p>放開 LB 不會停。要停：停止鍵、RB、LB + X。</p></div>';
   else if (st.mode === 1 && ms.state === 1) html = '<span class="dot-run on"></span><div><strong>規劃路線中</strong><p>算好就出發。</p></div>';
   else html = '<span class="dot-run"></span><div><strong>' + esc(MODE_NAME[st.mode]) + '</strong><p>' + (st.mode === 0 ? '建圖中，用手把開。' : st.mode === 1 ? '自動割草，' + esc(MSTATE[ms.state]) + '。' : '車子只聽手把。') + '</p></div>';
   setHTML(why, html);
+  const recNow = st.program.running && st.manager && st.mode !== 4 && !b && st.lawn && st.lawn.recording;
+  $('#whyAct').hidden = !(recNow && isHolder(st));
+  $('#btnWhyLawnStop').classList.toggle('go', !!recNow && st.lawn.gap != null && st.lawn.gap <= st.lawn.close_gap);
 
   if (!st.program.running) {
     setHTML($('#interlocks'), ['手把', '光達', '前方停止區', '導航', '停止'].map(n => '<div class="name">' + n + '</div><div class="val ok">—</div>').join(''));
@@ -1089,6 +1124,25 @@ function renderOverview(st) {
   $('#cPose').textContent = st.pose ? 'x ' + fx(st.pose.x, 2) + '　y ' + fx(st.pose.y, 2) + '　' + fx(((st.pose.yaw / DEG) % 360 + 360) % 360, 0) + '°' + (st.pose.frame === 'odom' ? '（odom）' : '') : '—';
 }
 
+function lawnGapText(L) {
+  if (L.gap == null) return '';
+  return L.gap <= L.close_gap ? '離起點 ' + fx(L.gap, 1) + ' m，可以按完成' : '離起點 ' + fx(L.gap, 1) + ' m';
+}
+function lawnBanner(st) {
+  const L = st.lawn;
+  return '<span class="dot-run on"></span><div><strong>記錄草地邊界中</strong><p>' +
+    (L.length != null ? '已開 ' + fx(L.length, 1) + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。' : '') +
+    '沿著草地邊緣開一圈，開回起點（地圖上的虛線圓）按完成。</p></div>';
+}
+function lawnBlock(st) {
+  if (!isHolder(st)) return '操作權在另一台';
+  if (!st.program.running) return '車上程式沒在跑';
+  if (!st.manager) return '模式程式 (mower_manager) 沒有回應';
+  if (st.mode === 1) return '自動割草中不能記錄，先切手動';
+  if (!st.map.ready) return '還沒開始建圖：先按「開始建圖」，邊界要記在地圖上';
+  return null;
+}
+
 function renderOps(st) {
   const here = isHolder(st);
   setHTML($('#opsAuth'), here ? '操作權：這台' : '<span class="muted">只能看</span>');
@@ -1110,6 +1164,20 @@ function renderOps(st) {
   $('#btnShutdown').disabled = !p.running || !!p.busy || !here;
   $('#btnSaveMap').disabled = !st.map.ready || !here || !!st.saving || st.mode === 1;
   $('#mapName').textContent = st.saving ? '存地圖中…（大約 10～30 秒）' : st.map.name || (st.map.ready ? '還沒存過' : '還沒有（先開始建圖）');
+
+  const L = st.lawn || {}, lw = lawnBlock(st);
+  setHTML($('#lawnState'), L.recording ? '<span class="tag sel">記錄中</span>' : L.set ? '已設定' : '<span class="muted">沒有</span>');
+  let kv;
+  if (L.recording) kv = '<dt>已開</dt><dd class="num">' + (L.length != null ? fx(L.length, 1) + ' m' : '—') + '</dd><dt>離起點</dt><dd class="num">' + (L.gap != null ? fx(L.gap, 1) + ' m' + (L.gap <= L.close_gap ? '（可以按完成）' : '（' + fx(L.close_gap, 0) + ' m 內才能完成）') : '—') + '</dd>';
+  else if (L.set) kv = '<dt>面積</dt><dd class="num">' + fx(L.area, 1) + ' m²</dd><dt>周長</dt><dd class="num">' + fx(L.perimeter, 1) + ' m</dd>';
+  else kv = '<dt>狀態</dt><dd>沒有：割草範圍只看地圖上的牆和障礙物</dd>';
+  setHTML($('#lawnKv'), kv);
+  $('#btnLawnStart').disabled = !!lw || !!L.recording;
+  $('#btnLawnStop').disabled = !!lw || !L.recording;
+  $('#btnLawnStop').classList.toggle('go', !!L.recording && L.gap != null && L.gap <= L.close_gap);
+  $('#btnLawnCancel').disabled = !here || !st.program.running || !L.recording;
+  $('#btnLawnClear').disabled = !here || !st.program.running || !L.set || !!L.recording;
+  const lwn = $('#lawnWhy'); lwn.hidden = !lw || !st.program.running; lwn.textContent = lw ? '不能記錄：' + lw : '';
 }
 
 function renderAlarms(st) {
@@ -1187,7 +1255,9 @@ function computeView(st) {
   }
   let B;
   const g = st.geo;
-  if (g.boundary && g.boundary.length > 2) B = bbox(g.boundary, 1.6);
+  if (g.rec && g.rec.length > 1) B = bbox(g.rec.concat(st.pose ? [[st.pose.x, st.pose.y]] : []), 2.0);
+  else if (g.lawn && g.lawn.length > 2) B = bbox(g.lawn.concat(g.boundary || []), 1.6);
+  else if (g.boundary && g.boundary.length > 2) B = bbox(g.boundary, 1.6);
   else if (st.map.ready && st.map.w) B = { x0: st.map.x0, y0: st.map.y0, x1: st.map.x0 + st.map.w * st.map.res, y1: st.map.y0 + st.map.h * st.map.res };
   else if (st.pose) B = { x0: st.pose.x - 5, x1: st.pose.x + 5, y0: st.pose.y - 5, y1: st.pose.y + 5 };
   else B = { x0: -5, x1: 5, y0: -5, y1: 5 };
@@ -1208,6 +1278,7 @@ function drawMap() {
   const hasMap = st.map.ready;
   ensureRaster(st.map);
   $('#mapEmpty').hidden = hasMap && !!st.pose;
+  $('#lgLawn').hidden = !(hasMap && st.geo.lawn); $('#lgRec').hidden = !(hasMap && st.geo.rec);
   $('#mapEmptyTxt').textContent = !st.program.running ? '車上程式沒在跑' : !st.pose ? '還不知道車子在哪（等 TF）' : '還沒有地圖。到「操作」按「開始建圖」，或手把 LB + A。';
   if (hasMap && rasterImg && rasterData) {
     const m = rasterData.meta;
@@ -1219,6 +1290,14 @@ function drawMap() {
   cx.lineCap = 'round'; cx.lineJoin = 'round';
   const g = st.geo;
   if (hasMap && g.boundary && g.boundary.length > 2) { line(g.boundary, true); cx.strokeStyle = tok('--fg'); cx.lineWidth = px(2); cx.stroke(); }
+  if (hasMap && g.lawn && g.lawn.length > 2) { line(g.lawn, true); cx.strokeStyle = tok('--fg-2'); cx.lineWidth = px(2); cx.setLineDash([px(1), px(4)]); cx.stroke(); cx.setLineDash([]); }
+  if (hasMap && g.rec && g.rec.length > 0) {
+    const [sx, sy] = g.rec[0], rr = (st.lawn && st.lawn.close_gap) || 1.0;
+    cx.strokeStyle = tok('--sel'); cx.lineWidth = px(1.5); cx.setLineDash([px(4), px(3)]);
+    cx.beginPath(); cx.arc(sx, sy, rr, 0, 2 * Math.PI); cx.stroke(); cx.setLineDash([]);
+    if (g.rec.length > 1) { cx.lineWidth = px(2.6); line(g.rec); cx.stroke(); }
+    cx.fillStyle = tok('--sel'); cx.beginPath(); cx.arc(sx, sy, px(4), 0, 2 * Math.PI); cx.fill();
+  }
   if (hasMap && g.trail) { cx.strokeStyle = tok('--mown'); cx.lineWidth = V.bladeR * 2; g.trail.forEach(p => { if (p.length > 1) { line(p); cx.stroke(); } }); }
   if (hasMap && g.route && g.route.length > 1) { cx.strokeStyle = tok('--route'); cx.lineWidth = px(1.1); cx.setLineDash([px(4), px(3)]); line(g.route); cx.stroke(); cx.setLineDash([]); }
   if (hasMap && g.current && g.current.length > 1) { cx.strokeStyle = tok('--sel'); cx.lineWidth = px(2.6); line(g.current); cx.stroke(); }

@@ -85,6 +85,55 @@ def test_figure_eight_is_rejected():
         lb.close_and_simplify(track, min_area=0.0)
 
 
+def rect_loop_with_overshoot(overshoot, noise=0.02, seed=1):
+    """5 x 4 m 的長方形繞一圈，回到起點後沿著第一條邊再往前開 overshoot 公尺 (加上手開的雜訊)。"""
+    rng = np.random.default_rng(seed)
+    corners = [(0.0, 0.0), (5.0, 0.0), (5.0, 4.0), (0.0, 4.0), (0.0, 0.0), (overshoot, 0.0)]
+    pts = []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        n = int(math.hypot(bx - ax, by - ay) / 0.1)
+        for i in range(n):
+            t = i / n
+            pts.append((ax + (bx - ax) * t + rng.normal(0, noise), ay + (by - ay) * t + rng.normal(0, noise)))
+    pts.append(corners[-1])
+    track = []
+    for x, y in pts:
+        lb.append_if_moved(track, x, y)
+    return track
+
+
+@pytest.mark.parametrize('overshoot', [0.3, 0.6, 0.9])
+def test_overshoot_past_start_is_trimmed(overshoot):
+    # 開回起點時開過頭：以前收出來自己交叉、按完成會失敗 (10-20 實算 0.3 / 0.6 / 0.9 m 都失敗)，
+    # 現在剪掉過頭的那段
+    track = rect_loop_with_overshoot(overshoot)
+    with pytest.raises(lb.SelfIntersectError):     # 不剪的話確實會交叉 (確認這個測試有測到剪的那條路)
+        lb._close_once(track, lb.MAX_CLOSE_GAP_M, lb.SIMPLIFY_EPS_M, lb.MIN_AREA_M2)
+    res = lb.close_and_simplify(track)
+    assert res['area'] == pytest.approx(20.0, rel=0.05)
+    assert res['gap'] < 0.15
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_trim_overshoot_keeps_track_that_stops_short():
+    track = square_track(0.0, 0.0, 5.0)[:-6]          # 停在起點前 0.6 m
+    assert lb.trim_overshoot(track) == track
+
+
+def test_trim_overshoot_ignores_earlier_pass_near_start():
+    # 中途經過起點附近 (0.8 m) 之後又開走，最後才開回來：終點只能在最後一段裡找
+    track = [(0.1 * k, 0.0) for k in range(30)]                       # 往右 3 m
+    track += [(3.0, 0.1 * k) for k in range(1, 30)]                   # 往上 3 m
+    track += [(3.0 - 0.1 * k, 2.9) for k in range(1, 31)]             # 往左到 x = 0
+    track += [(0.0, 2.9 - 0.1 * k) for k in range(1, 22)]             # 往下到 y = 0.8 (離起點 0.8 m)
+    track += [(-0.1 * k, 0.8) for k in range(1, 16)]                  # 往左離開 1.5 m
+    track += [(-1.5, 0.8 - 0.1 * k) for k in range(1, 9)]             # 往下
+    track += [(-1.5 + 0.1 * k, 0.0) for k in range(1, 18)]            # 往右開過起點 0.2 m
+    out = lb.trim_overshoot(track)
+    assert len(out) > len(track) - 20                    # 只剪掉最後過頭的幾點
+    assert math.hypot(*out[-1]) < 0.06
+
+
 def test_self_intersects_control_cases():
     assert not lb.self_intersects([(0, 0), (1, 0), (1, 1), (0, 1)])
     assert lb.self_intersects([(0, 0), (1, 1), (1, 0), (0, 1)])

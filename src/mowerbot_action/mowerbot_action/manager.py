@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 from rcl_interfaces.msg import ParameterDescriptor
 from mowerbot_action import swath_angle
@@ -31,6 +32,17 @@ DEFAULT_OVERLAP_RATIO = 0.4
 DEFAULT_MIN_BOUNDARY_AREA = 4.0
 # 航點間距：割草線、周邊環繞 (f2c_server 由 launch 傳入)、approach、跑道共用
 WAYPOINT_SPACING = 0.1
+# 存地圖最多多久 (map_autosave 的 timeout 120 s 再加餘裕)：/map_autosave/busy 一直是 true 超過這個時間，
+# 當成 map_autosave 存到一半掛掉，不再等它
+MAP_SAVE_MAX = 150.0
+# F2C 規劃多久沒回來就算失敗 (正常 1 秒內)
+F2C_TIMEOUT = 20.0
+# 「任務中止」訊息裡每一種失敗的白話說明 (原始的 status 名稱留在 log)
+FAIL_TEXT = {
+    'ALIGN_TIMEOUT': '原地轉 15 秒沒轉完',
+    'ABORTED': '導航判失敗 (卡住或被擋)',
+    'CANCELED': '被取消',
+}
 
 
 def perimeter_corner_cuts(xy, window, angle):
@@ -227,6 +239,11 @@ class MowerManager(Node):
         self._angle_executor = None
         self._angle_job = None
         self.create_timer(0.05, self.poll_angle_job)
+        # 送給 F2C 的請求 (編號, 送出時間)：F2C_TIMEOUT 內沒回來就中止，晚到的結果不用
+        self._f2c_seq = 0
+        self._f2c_pending = None
+        # 給人看的短提示 (文字, 到期時間)：附在任務訊息後面，例如「已經在割了」
+        self._note = None
         if self.swath_angle_fixed is None:
             self.get_logger().info('🧭 割草線方向：自動 (掉頭最少)')
         else:
@@ -326,6 +343,14 @@ class MowerManager(Node):
         # 不用按住 LB (auto_requires_deadman 關) 時通常一規劃好就成立，等的是手把沒連上之類的情況。
         self._wait_deadman_start = False
         self.create_timer(0.1, self.maybe_start_waiting)
+        # 存地圖中不出發 (2026-10-20 will)：存圖時 slam_toolbox 序列化地圖，map -> odom 會斷一下。
+        # 這時候送出第一段，對正與路線會連續被判失敗、整趟中止 (10-20 sandbox 整套 bringup_real 實測：
+        # 按 Y 之後馬上 LB + B)。map_autosave 存圖期間 /map_autosave/busy = true；
+        # 只擋「第一段送出之前」(start_wait_reason)：自動割草中 teleop 與網頁都不存圖。
+        self._map_saving_since = None
+        busy_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                              reliability=QoSReliabilityPolicy.RELIABLE)
+        self.create_subscription(Bool, '/map_autosave/busy', self.map_busy_cb, busy_qos)
         self.joy_status_sub = self.create_subscription(
             JoyStatus, '/joy_status', self.joy_status_cb, 10)
         if self.auto_requires_scan:
@@ -467,6 +492,29 @@ class MowerManager(Node):
                 return '光達 /scan 中斷 %.1f s' % self._age(self._scan_time)
         return None
 
+    def map_busy_cb(self, msg):
+        if msg.data:
+            if self._map_saving_since is None:
+                self._map_saving_since = self.get_clock().now()
+        else:
+            self._map_saving_since = None
+            self.maybe_start_waiting()
+
+    def map_saving(self):
+        return (self._map_saving_since is not None
+                and self._age(self._map_saving_since) < MAP_SAVE_MAX)
+
+    def start_wait_reason(self):
+        """第一段送出之前要等的原因：放行條件 (auto_block_reason) 加上「正在存地圖」。可以出發時回傳 None。"""
+        reason = self.auto_block_reason()
+        if reason is None and self.map_saving():
+            reason = '正在存地圖，存好就出發 (約 10 ~ 30 秒)'
+        return reason
+
+    def set_note(self, text, seconds=10.0):
+        """附在任務訊息後面的短提示，seconds 秒後自己消失 (car-status 與網頁看得到)。"""
+        self._note = (text, self.get_clock().now() + Duration(seconds=seconds))
+
     def publish_and_update(self,msg):
         self.real_vel_pub.publish(msg)
         self.last_cmd_time = self.get_clock().now()
@@ -607,8 +655,8 @@ class MowerManager(Node):
         # 與階段 21 那些針對「規劃出來的段落」的檢查互補 —— 見 start_pose_blocked()。
         blocked = self.start_pose_blocked()
         if blocked is not None:
-            text = ('無法開始：%s，不足以原地掉頭。'
-                    '請先用手動模式(模式 0)把車輛移到開闊處，再切回自動割草。'
+            text = ('車子現在的位置沒辦法開始：%s，不足以原地掉頭。'
+                    '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m 以上的開闊處，再按一次。'
                     % blocked)
             self.get_logger().error('🚫 ' + text)
             self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
@@ -616,7 +664,8 @@ class MowerManager(Node):
 
         if not self.f2c_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error('⚠️ F2C 伺服器未上線，請確認 f2c_server 已經啟動！')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED,
+                                   message='算路線的程式 (f2c_server) 沒有開：car-stop 再 car-start')
             return
 
         # 建立請求
@@ -653,6 +702,7 @@ class MowerManager(Node):
 
     def poll_angle_job(self):
         """auto 割草線方向算好了就接著送給 F2C (定時器，在 mower_manager 自己的執行緒上)。"""
+        self.check_f2c_timeout()
         if self._angle_job is None or not self._angle_job[0].done():
             return
         job, req, preview, epoch = self._angle_job
@@ -672,6 +722,17 @@ class MowerManager(Node):
             angle, info = 0.0, None
         self.send_f2c_request(req, angle, info, preview, epoch)
 
+    def check_f2c_timeout(self):
+        """F2C 超過 F2C_TIMEOUT 沒回來：中止，晚到的結果不用 (以前任務會永遠停在「規劃中」，之後按 Y 都被拒絕)。"""
+        if self._f2c_pending is None or self._age(self._f2c_pending[1]) < F2C_TIMEOUT:
+            return
+        self._f2c_pending = None
+        if self._mission_state != MissionStatus.STATE_PLANNING:
+            return
+        text = '算路線的程式 (f2c_server) %.0f 秒沒有回應，可能當掉了：car-stop 再 car-start' % F2C_TIMEOUT
+        self.get_logger().error('⏱️ ' + text)
+        self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+
     def send_f2c_request(self, req, angle, info, preview, epoch):
         """邊界與障礙物轉 -angle 之後送給 F2C (它沿 x 軸擺割草線)，路線回來在 f2c_response_callback 轉回 +angle。"""
         if angle != 0.0:
@@ -683,9 +744,12 @@ class MowerManager(Node):
                 % (info['deg'], info['segments'], info['lines'], info['segments_at_0']))
         else:
             self.get_logger().info('🧭 割草線方向 %.1f°' % math.degrees(angle))
+        self._f2c_seq += 1
+        seq = self._f2c_seq
+        self._f2c_pending = (seq, self.get_clock().now())
         future = self.f2c_client.call_async(req)
         future.add_done_callback(
-            lambda f: self.f2c_response_callback(f, preview, epoch, angle))
+            lambda f: self.f2c_response_callback(f, preview, epoch, angle, seq))
 
     @staticmethod
     def rotated_polygon(poly, angle):
@@ -740,6 +804,18 @@ class MowerManager(Node):
 
     def change_mode_callback(self,request,response):
         if request.mode in self.mode_map:
+            # 自動割草中 (規劃中 / 執行中) 再按一次 LB + B 不理它 (2026-10-20 will)。
+            # 以前會重新規劃：舊的 Nav2 goal 沒取消、佇列沒清，舊 goal 的結果被算到新任務頭上，
+            # 新任務連鎖誤判「對正超時」而中止，最後送出的 goal 還可能在轉。要重來先 LB + X。
+            # 放在 epoch 與手把斷線鎖之前：被擋下的這一按不能解掉斷線鎖。
+            if (request.mode == 1 and self.current_mode == 1
+                    and self._mission_state in (MissionStatus.STATE_PLANNING,
+                                                MissionStatus.STATE_EXECUTING)):
+                text = '已經在割了，再按 LB + B 不會重來；要重來先 LB + X 回手動，車停了再 LB + B'
+                self.get_logger().warn('🚫 ' + text)
+                self.set_note(text)
+                response.success = False
+                return response
             self._mode_epoch += 1
             # 手把斷線的鎖只管這一次自動模式 (見 auto_block_reason)
             self._joy_lost_latched = False
@@ -758,7 +834,7 @@ class MowerManager(Node):
                 # 混在一起的話，任務跑完之後按急停會把那份完成紀錄蓋掉
                 # (而 total_segments 不歸零正是為了保住那份紀錄)，
                 # 待命中按急停也會顯示「任務已中止」，但使用者根本沒啟動過任務。
-                self.abort_mission_if_running()
+                self.abort_mission_if_running('按了停止 (RB 或網頁的停止鍵)，這一趟取消了')
                 # 取消 Nav2 正在執行的 FollowPath，避免解除急停後車子被拉回原路徑
                 self.cancel_current_goal()
                 # 【安全關鍵】急停不能只取消「當前這一條」割草線。
@@ -777,7 +853,7 @@ class MowerManager(Node):
                     self.clear_swath_queue()
                     # 同上：只有跑到一半被切走才算中止。
                     # 任務已經跑完 (DONE) 之後離開自動模式，那份結果要留著。
-                    self.abort_mission_if_running()
+                    self.abort_mission_if_running('切到%s，這一趟取消了' % mode_name)
 
                 # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖 (實車上先存圖，見 start_f2c)
                 if self.current_mode == 1:
@@ -863,11 +939,12 @@ class MowerManager(Node):
         ms.current_label = self._current_label
         labels = []
         for label, start, reason in self._skipped:
+            # 原因直接寫在後面：網頁和 car-status 不用再去翻 car-log
+            why = FAIL_TEXT.get(reason, reason)
             if start is not None:
-                labels.append('%s (%.2f, %.2f)' % (label, start[0], start[1]))
+                labels.append('%s (%.2f, %.2f)：%s' % (label, start[0], start[1], why))
             else:
-                labels.append('%s (起點未知)' % label)
-            _ = reason
+                labels.append('%s (起點未知)：%s' % (label, why))
         ms.skipped_labels = labels
         ms.message = self._mission_message
         if self.current_mode in (1, 3):
@@ -875,9 +952,14 @@ class MowerManager(Node):
             if reason is not None:
                 pause = '暫停：%s。' % reason
                 ms.message = pause + ('\n' + ms.message if ms.message else '')
+        if self._note is not None:
+            if self.get_clock().now() < self._note[1]:
+                ms.message = (ms.message + '\n' if ms.message else '') + self._note[0]
+            else:
+                self._note = None
         self.mission_status_pub.publish(ms)
 
-    def abort_mission_if_running(self):
+    def abort_mission_if_running(self, message=''):
         """只有 PLANNING / EXECUTING 才轉成 ABORTED；IDLE 與 DONE 維持原狀。
 
         呼叫時機是「外力把任務打斷」(急停、離開自動模式)。
@@ -885,7 +967,7 @@ class MowerManager(Node):
         """
         if self._mission_state in (MissionStatus.STATE_PLANNING,
                                    MissionStatus.STATE_EXECUTING):
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=message)
 
     def set_mission_state(self, state, label=None, message=''):
         """集中改任務狀態，順便把「目前段落」與說明訊息一起更新。
@@ -1634,10 +1716,10 @@ class MowerManager(Node):
 
     def begin_execution(self):
         """規劃好了，開始送第一段。實車放行條件不成立時先等，見 _wait_deadman_start。"""
-        reason = self.auto_block_reason()
+        reason = self.start_wait_reason()
         if reason is not None:
             self._wait_deadman_start = True
-            if self.auto_requires_deadman:
+            if self.auto_requires_deadman and not self.map_saving():
                 text = '路線規劃好了，按住 LB 才開始走（還沒按之前不會出發，可以慢慢看路線）。'
             else:
                 text = '路線規劃好了，還不能出發：%s。' % reason
@@ -1653,7 +1735,7 @@ class MowerManager(Node):
         if self.current_mode not in (1, 3) or not self._swath_queue:
             self._wait_deadman_start = False
             return
-        if self.auto_block_reason() is not None:
+        if self.start_wait_reason() is not None:
             return
         self._wait_deadman_start = False
         self._mission_message = ''
@@ -1803,7 +1885,12 @@ class MowerManager(Node):
             self.get_logger().error(
                 f'❌ [{label}] 失敗 (status={status_name})，'
                 f'停止整個覆蓋任務，不自動重試')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            message = '[%s] 被取消了 (%s)，這一趟停止' % (label, status_name)
+            if self._mission_state == MissionStatus.STATE_ABORTED and self._mission_message:
+                # 急停、切模式的時候已經寫好原因 (abort_mission_if_running)，取消的結果晚一點才回來，
+                # 不要把它蓋成「[(未知任務)] 被取消了」(佇列那時已經清掉，查不到是哪一段)
+                message = self._mission_message
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=message)
             self.clear_swath_queue()
             self.stop_robot()
             return
@@ -1856,7 +1943,13 @@ class MowerManager(Node):
                     f'   {label}：起點 ({start[0]:.2f}, {start[1]:.2f})，'
                     f'status={reason}，起點 {self.describe_cost(cost)}')
             self.log_mission_summary(ended_early=True)
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            failed = self._skipped[-self._consecutive_failures:]
+            last = failed[-1][1] if failed else None
+            text = ('連續 %d 段沒走完，這一趟停止：%s。%s細節看 car-log 的 🛑 那幾行。' % (
+                self._consecutive_failures,
+                '、'.join('%s %s' % (lb, FAIL_TEXT.get(rs, rs)) for lb, _st, rs in failed),
+                '最後一段的起點 (%.2f, %.2f)。' % last if last else ''))
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             self.clear_swath_queue()
             self.stop_robot()
             return
@@ -1906,6 +1999,8 @@ class MowerManager(Node):
         """
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error('⚠️ 找不到 Nav2 的 follow_path 伺服器，請確認 Nav2 是否正常啟動！')
+            # 以前只印 log 就 return：任務永遠停在「執行中」，佇列也留著 (2026-10-20 will 同意改)
+            self.nav2_unavailable('找不到 Nav2 (follow_path 沒有開)')
             return
 
         self.get_logger().info('🚀 啟接割草任務！正在將路徑交給 Nav2 控制器...')
@@ -1922,16 +2017,23 @@ class MowerManager(Node):
         self._send_goal_future = self.nav_client.send_goal_async(goal_msg)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
+    def nav2_unavailable(self, what):
+        """Nav2 沒開或不收任務：這一趟沒辦法繼續，比照失敗處理並寫原因。"""
+        text = '%s，這一趟停止：car-stop 再 car-start；還是一樣就看 car-status 的導航那幾行' % what
+        self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+        self.clear_swath_queue()
+        self.stop_robot()
+
     def goal_response_callback(self, future):
         """
         確認 Nav2 是否成功接受了我們的循跡任務
         """
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error('❌ Nav2 拒絕了割草路徑！(可能是路徑起點距離車體太遠)')
-            # 被拒絕代表這條割草線送不出去，整個任務沒辦法繼續，比照失敗處理
-            self.clear_swath_queue()
-            self.stop_robot()
+            # 拒絕是 action server 層的事 (controller_server 沒進 active 之類)，跟路徑起點遠不遠無關：
+            # 起點太遠是接受之後才回 ABORTED。以前這裡沒有改任務狀態，畫面一直寫「執行中」。
+            self.get_logger().error('❌ Nav2 拒絕了 [%s]' % self._current_label)
+            self.nav2_unavailable('Nav2 拒絕了 [%s] (controller_server 沒有進 active？)' % self._current_label)
             return
         # 保存 handle，讓急停時可以取消這個任務
         self._goal_handle = goal_handle
@@ -1940,10 +2042,15 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0):
+    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None):
         """
         接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
+        if seq is not None:
+            if self._f2c_pending is None or self._f2c_pending[0] != seq:
+                self.get_logger().warn('🗺️ F2C 的結果超過 %.0f 秒才回來 (已經判失敗了)，不用。' % F2C_TIMEOUT)
+                return
+            self._f2c_pending = None
         try:
             response = future.result()
             if preview and self.current_mode in (1, 3):
@@ -1974,7 +2081,7 @@ class MowerManager(Node):
                 swaths = self.split_path_into_swaths(rest)
                 if not swaths:
                     self.get_logger().error('⚠️ 這條覆蓋路徑切不出任何割草線，任務中止。')
-                    self.set_mission_state(MissionStatus.STATE_ABORTED)
+                    self.set_mission_state(MissionStatus.STATE_ABORTED, message=self.too_narrow_text())
                     self.clear_swath_queue()
                     return
 
@@ -1983,7 +2090,9 @@ class MowerManager(Node):
                 robot_xy = self.get_robot_pose_in_map()
                 if robot_xy is None:
                     self.get_logger().error('⚠️ 不知道車子在哪裡，不啟動覆蓋任務。')
-                    self.set_mission_state(MissionStatus.STATE_ABORTED)
+                    self.set_mission_state(
+                        MissionStatus.STATE_ABORTED,
+                        message='查不到車子在地圖上的位置 (建圖開了嗎？光達有資料嗎？)，沒有出發')
                     self.clear_swath_queue()
                     return
 
@@ -2057,10 +2166,21 @@ class MowerManager(Node):
                 self.begin_execution()
             else:
                 self.get_logger().error('⚠️ F2C 伺服器回報路徑規劃失敗！')
-                self.set_mission_state(MissionStatus.STATE_ABORTED)
+                # srv 沒有原因欄位；最常見的是地頭吃光了作業區，其他原因只在 f2c_server 的 log
+                self.set_mission_state(
+                    MissionStatus.STATE_ABORTED,
+                    message=self.too_narrow_text() + '其他原因看 car-log 裡 f2c_server 的那幾行。')
         except Exception as e:
             self.get_logger().error(f'呼叫 F2C 服務時發生錯誤: {str(e)}')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED,
+                                   message='算路線時程式出錯 (%s: %s)，看 car-log' % (type(e).__name__, e))
+
+    def too_narrow_text(self):
+        """區域太窄切不出割草線時給人看的話。寬度由地頭與線距推算 (邊界另外內縮約 0.10 m，見 map_to_boundary)。"""
+        edge = 2.0 * (self.headland_width + 0.10)
+        return ('算不出割草線：區域四周各要留 %.1f m 的地頭，最窄的地方要大於約 %.1f m '
+                '(3 條線約 %.1f m)。把範圍圍大一點再試。'
+                % (self.headland_width, edge + 0.5 * self.swath_spacing, edge + 2.5 * self.swath_spacing))
 
 
 def main(args=None):

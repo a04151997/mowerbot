@@ -107,13 +107,53 @@ def self_intersects(poly):
     return False
 
 
+class SelfIntersectError(ValueError):
+    """軌跡自己交叉。"""
+
+
+def trim_overshoot(track, max_gap=MAX_CLOSE_GAP_M):
+    """開回起點時多開過頭的那一段剪掉 (2026-10-20)。
+
+    用手把開回起點，很難剛好停在起點上，多半會開過頭 0.3～0.5 m。過頭的那一段跟一開始
+    的軌跡疊在一起，收成多邊形就變成自己交叉，按「完成」會失敗；又因為是繼續記錄，
+    再往前開只會更糟，只能整圈重來。
+    做法：只看最後一次開進起點 max_gap 範圍內的那一段 (從終點往回數、離起點都在
+    max_gap 內的點)，取其中離起點最近的那一點當終點。中途經過起點附近的點不會被當成
+    終點，所以剪掉的只會是最後那一小段。
+    """
+    if len(track) < 3:
+        return list(track)
+    x0, y0 = track[0]
+    d = [math.hypot(x - x0, y - y0) for x, y in track]
+    i = len(track) - 1
+    if d[i] > max_gap:
+        return list(track)
+    while i > 0 and d[i - 1] <= max_gap:
+        i -= 1
+    if i == 0:              # 整條軌跡都沒離開起點附近，不是一圈，交給後面的檢查
+        return list(track)
+    end = min(range(i, len(track)), key=d.__getitem__)
+    return list(track[:end + 1])
+
+
 def close_and_simplify(track, max_gap=MAX_CLOSE_GAP_M, eps=SIMPLIFY_EPS_M,
                        min_area=MIN_AREA_M2):
     """把一圈軌跡收成閉合多邊形。
 
     回傳 dict(polygon=[(x, y), ...], gap=終點到起點距離, area=面積, perimeter=周長)。
     不合格時丟 ValueError，訊息直接給使用者看 (繁體中文、說明要怎麼做)。
+    收出來自己交叉、而且是因為開過頭的話，剪掉過頭的那段再收一次 (見 trim_overshoot)。
     """
+    try:
+        return _close_once(track, max_gap, eps, min_area)
+    except SelfIntersectError:
+        trimmed = trim_overshoot(track, max_gap)
+        if len(trimmed) == len(track):
+            raise
+        return _close_once(trimmed, max_gap, eps, min_area)
+
+
+def _close_once(track, max_gap, eps, min_area):
     if len(track) < 3:
         raise ValueError('只記到 %d 個點，還不是一圈。請沿著草地邊緣開完一整圈再停止。'
                          % len(track))
@@ -132,8 +172,8 @@ def close_and_simplify(track, max_gap=MAX_CLOSE_GAP_M, eps=SIMPLIFY_EPS_M,
     if area < min_area:
         raise ValueError('圍出來的面積只有 %.2f m² (下限 %.2f m²)。' % (area, min_area))
     if self_intersects(poly):
-        raise ValueError('軌跡自己交叉 (例如繞成 8 字形)，圍出來的範圍不明確。'
-                         '請清除後重新繞一圈。')
+        raise SelfIntersectError('軌跡自己交叉 (例如繞成 8 字形)，圍出來的範圍不明確。'
+                                 '請取消後重新繞一圈。')
     return {'polygon': poly, 'gap': gap, 'area': area,
             'perimeter': polygon_perimeter(poly)}
 

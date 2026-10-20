@@ -10,6 +10,7 @@
     ros2 service call /boundary_recorder/cancel std_srvs/srv/Trigger   # 放棄這次記錄
     ros2 service call /boundary_recorder/clear  std_srvs/srv/Trigger   # 清除，回到「只看牆」
 RViz 可以加 /boundary_recorder/track (Path) 看正在記錄的軌跡、/lawn_boundary (Polygon) 看結果。
+/boundary_recorder/recording (std_msgs/Bool，transient local)：true = 正在記錄。網頁人機介面和 car-boundary 讀它。
 
 記的是 map 座標系裡 base_footprint (後輪軸中心) 的位置。邊界就是這條軌跡本身，
 不往外推半個車寬：使用者不一定剛好把輪子壓在草地邊上，往外推可能推到草地外面。
@@ -23,8 +24,11 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rclpy.time import Time
 from geometry_msgs.msg import PolygonStamped, Point32, PoseStamped
 from nav_msgs.msg import Path
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 import tf2_ros
+
+from mowerbot_interfaces.msg import MowerStatus
 
 from mowerbot_action import lawn_boundary
 
@@ -52,11 +56,13 @@ class BoundaryRecorder(Node):
                              reliability=ReliabilityPolicy.RELIABLE)
         self.boundary_pub = self.create_publisher(PolygonStamped, '/lawn_boundary', latched)
         self.track_pub = self.create_publisher(Path, '~/track', 10)
+        self.recording_pub = self.create_publisher(Bool, '~/recording', latched)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.recording = False
+        self.recording_pub.publish(Bool(data=False))
         self.track = []
         self._tf_fail_since = None
         self._last_track_pub = 0.0
@@ -66,6 +72,9 @@ class BoundaryRecorder(Node):
         self.create_service(Trigger, '~/cancel', self.cancel_cb)
         self.create_service(Trigger, '~/clear', self.clear_cb)
         self.create_timer(0.1, self.sample)
+        # 記錄中切到自動割草 (手把 LB + B)：取消這次記錄。不然自動割草的路線也會被記進邊界裡，
+        # 而且那一趟用的還是舊的邊界 (網頁在記錄中會擋住自動割草，手把擋不住)
+        self.create_subscription(MowerStatus, '/mower_status', self.mower_status_cb, 10)
 
         if self.get_parameter('load_on_start').value and os.path.exists(self.boundary_file):
             try:
@@ -127,31 +136,43 @@ class BoundaryRecorder(Node):
             msg.polygon.points.append(Point32(x=float(x), y=float(y), z=0.15))
         self.boundary_pub.publish(msg)
 
+    def mower_status_cb(self, msg):
+        if self.recording and msg.mode == 1:
+            self.set_recording(False)
+            self.track = []
+            self.publish_track()
+            self.get_logger().warn('⚠️ 切到自動割草了，這次草地邊界的記錄取消。要記的話先完成 (car-boundary stop) 再割。')
+
+    def set_recording(self, on):
+        self.recording = on
+        self.recording_pub.publish(Bool(data=on))
+
     # ---- 服務 ---------------------------------------------------------------
     def start_cb(self, _req, resp):
         self.track = []
-        self.recording = True
+        self.set_recording(True)
         self._tf_fail_since = None
         self.publish_track()
         resp.success = True
-        resp.message = '開始記錄。請沿著草地邊緣開一整圈，開回起點附近再呼叫 stop。'
+        resp.message = ('開始記錄。用手把沿著草地邊緣開一整圈，開回起點 %.1f m 內再按完成 (car-boundary stop)。'
+                        % lawn_boundary.MAX_CLOSE_GAP_M)
         self.get_logger().info('▶️ ' + resp.message)
         return resp
 
     def stop_cb(self, _req, resp):
         if not self.recording:
             resp.success = False
-            resp.message = '目前沒有在記錄 (先呼叫 start)。'
+            resp.message = '目前沒有在記錄 (先開始記錄)。'
             return resp
         try:
             result = lawn_boundary.close_and_simplify(self.track)
         except ValueError as exc:
             # 繼續記錄：使用者可以再往起點開一點再按一次 stop，不必整圈重來
             resp.success = False
-            resp.message = f'{exc} (仍在記錄中；要放棄請呼叫 cancel)'
+            resp.message = f'{exc} (還在記錄中，可以繼續開；要放棄就取消 = car-boundary cancel)'
             self.get_logger().warn('⚠️ ' + resp.message)
             return resp
-        self.recording = False
+        self.set_recording(False)
         poly = result['polygon']
         self.publish_polygon(poly, self.global_frame)
         saved = ''
@@ -171,7 +192,7 @@ class BoundaryRecorder(Node):
 
     def cancel_cb(self, _req, resp):
         was = self.recording
-        self.recording = False
+        self.set_recording(False)
         self.track = []
         self.publish_track()
         resp.success = True
@@ -180,7 +201,7 @@ class BoundaryRecorder(Node):
         return resp
 
     def clear_cb(self, _req, resp):
-        self.recording = False
+        self.set_recording(False)
         self.track = []
         self.publish_track()
         # 空的多邊形 = 「沒有草地邊界」，map_to_boundary 回到只看牆與障礙物

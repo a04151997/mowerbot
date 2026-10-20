@@ -11,6 +11,8 @@ free_thresh 改 0.10、記下這次開機的 session 與畫禁區用的圖，全
              還沒開始建圖 (/slam_scan_gate/active 是 false) 時直接拒絕。
 話題：
     ~/last   (std_msgs/String，latched) 最後一次存圖的結果，car-status 顯示這一行
+    ~/busy   (std_msgs/Bool，latched) 存圖中 = true。mower_manager 在存圖中不送出第一段：
+             存圖時 slam_toolbox 序列化地圖，map -> odom 會斷一下，路線會被判失敗 (2026-10-20)
 參數：
     map_dir  存到哪裡；留空 = save_map.sh 自己決定 (原始碼的 maps/，與 car-savemap 相同)
     prefix   檔名開頭，預設 map
@@ -47,6 +49,8 @@ class MapAutosave(Node):
         self.create_subscription(Bool, '/slam_scan_gate/active',
                                  lambda m: setattr(self, 'mapping', bool(m.data)), latched)
         self.last_pub = self.create_publisher(String, '~/last', latched)
+        self.busy_pub = self.create_publisher(Bool, '~/busy', latched)
+        self.busy_pub.publish(Bool(data=False))
         self.create_service(Trigger, '~/save', self.save_cb)
         self.get_logger().info('💾 存圖就緒：手把按 Y 存一份地圖。')
 
@@ -61,7 +65,11 @@ class MapAutosave(Node):
             ok, message = False, '還沒開始建圖 (按住 LB + A)，沒有地圖可以存'
         else:
             name = '%s_%s' % (self.get_parameter('prefix').value, time.strftime('%m%d_%H%M%S'))
-            ok, message = self.save(name)
+            self.busy_pub.publish(Bool(data=True))
+            try:
+                ok, message = self.save(name)
+            finally:
+                self.busy_pub.publish(Bool(data=False))
         resp.success = ok
         resp.message = message
         if ok:

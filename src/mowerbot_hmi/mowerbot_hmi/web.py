@@ -95,6 +95,9 @@ RUN_BRINGUP_RE = re.compile(r'run_bringup\.sh\s+(\S+)\s+(\S+)(?:\s+(\S+))?')
 
 # 存一次地圖最多等多久 (map_autosave 的 timeout 是 120 s)；超過就當作存完了，免得一直擋住自動割草
 SAVE_MAX = 130.0
+# 草地邊界：開回起點多近才能「完成」(跟 lawn_boundary.MAX_CLOSE_GAP_M 一樣)
+LAWN_CLOSE_GAP = 1.0
+LAWN_WHAT = {'start': '開始記錄草地邊界', 'stop': '草地邊界完成', 'cancel': '放棄記錄草地邊界', 'clear': '清除草地邊界'}
 
 # 「診斷」頁看的程式，跟它在做什麼
 NODES = [
@@ -102,6 +105,7 @@ NODES = [
     ('/joy_node', '手把接收'), ('/lidar', '光達'), ('/slam_toolbox', '建圖與定位'),
     ('/controller_server', '導航'), ('/collision_monitor', '停止區'), ('/f2c_server', '割草路線'),
     ('/map_to_boundary', '割草範圍'), ('/keepout_server', '禁區'), ('/map_autosave', '存地圖'),
+    ('/boundary_recorder', '草地邊界'),
 ]
 # 「診斷」頁的資料更新率 (話題, 下限 Hz)
 TOPICS = [('/scan', 8.0), ('/odom', 10.0), ('/joy', 10.0), ('/joy_status', 3.0),
@@ -149,6 +153,14 @@ def mission_text(message):
     if message.startswith('暫停：'):
         return message.split('\n', 1)[1] if '\n' in message else ''
     return message
+
+
+def poly_area_perimeter(pts):
+    area, perim = 0.0, 0.0
+    for (x0, y0), (x1, y1) in zip(pts, pts[1:] + pts[:1]):
+        area += x0 * y1 - x1 * y0
+        perim += math.hypot(x1 - x0, y1 - y0)
+    return abs(area) / 2.0, perim
 
 
 def decimate(points, step):
@@ -264,11 +276,18 @@ class HmiWeb(Node):
         self.boundary_pts = None                        # /f2c_boundary 最新的 (跟著建圖一直更新)
         self.route_boundary = None                      # 路線送來那一刻的割草範圍
         self._shown_boundary = None
+        # 草地邊界 (boundary_recorder)：沿草地邊緣開一圈記下來的範圍，割草範圍只取它裡面
+        self.lawn_pts = None                            # /lawn_boundary
+        self.lawn_ver = 0
+        self.rec_on = False                             # /boundary_recorder/recording
+        self.rec_pts = None                             # 正在記錄的軌跡
+        self.rec_len = 0.0
+        self.rec_ver = 0
 
         # ---- 送給網頁的 ----
         self.frame = {}
         self.heavy = {'alarms': ([], 0), 'events': ([], 0), 'route': (None, 0),
-                      'boundary': (None, 0), 'trail': (None, 0)}
+                      'boundary': (None, 0), 'trail': (None, 0), 'lawn': (None, 0), 'rec': (None, 0)}
         self.map_png = None
         self.map_meta = {'ready': False, 'ver': 0}
         self.map_ver = 0
@@ -311,6 +330,7 @@ class HmiWeb(Node):
         self.mode_cli = self.create_client(SetDriveMode, 'change_mower_mode')
         self.preview_cli = self.create_client(Trigger, '/mower_manager/preview')
         self.save_cli = self.create_client(Trigger, '/map_autosave/save')
+        self.lawn_cli = {k: self.create_client(Trigger, '/boundary_recorder/' + k) for k in LAWN_WHAT}
         self.nav_ac = ActionClient(self, FollowPath, 'follow_path')
         self._save_future = None
         # 存地圖中 (單調時間，沒在存是 None)。網頁按的、手把 Y 按的都算。
@@ -336,6 +356,10 @@ class HmiWeb(Node):
         sub(PolygonStamped, '/f2c_boundary', self._on_boundary, 10)
         sub(Bool, '/slam_scan_gate/active', self._on_mapping, LATCHED)
         sub(String, '/map_autosave/last', self._on_save, LATCHED)
+        sub(Bool, '/map_autosave/busy', self._on_save_busy, LATCHED)
+        sub(PolygonStamped, '/lawn_boundary', self._on_lawn, LATCHED)
+        sub(Bool, '/boundary_recorder/recording', self._on_rec, LATCHED)
+        sub(Path, '/boundary_recorder/track', self._on_track, 10)
         sub(PolygonStamped, '/polygon_stop', self._on_zone, qos_profile_sensor_data)
 
         self.vehicle = self._vehicle()
@@ -442,6 +466,33 @@ class HmiWeb(Node):
         self.last_save = msg.data
         with self._lock:
             self.saving_since = None
+
+    def _on_save_busy(self, msg):
+        # map_autosave 自己說在不在存 (手把 Y、網頁、預覽都算)；舊版沒有這個話題就只靠網頁自己記的
+        with self._lock:
+            if msg.data:
+                if self.saving_since is None:
+                    self.saving_since = self._mono()
+            else:
+                self.saving_since = None
+
+    def _on_lawn(self, msg):
+        pts = [[round(p.x, 3), round(p.y, 3)] for p in msg.polygon.points]
+        with self._lock:
+            self.lawn_pts = pts if len(pts) >= 3 else None
+            self.lawn_ver += 1
+
+    def _on_rec(self, msg):
+        with self._lock:
+            self.rec_on = bool(msg.data)
+            self.rec_ver += 1
+
+    def _on_track(self, msg):
+        pts = [[round(p.pose.position.x, 3), round(p.pose.position.y, 3)] for p in msg.poses]
+        with self._lock:
+            self.rec_pts = pts or None
+            self.rec_len = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts, pts[1:]))
+            self.rec_ver += 1
 
     def _on_zone(self, msg):
         if msg.header.frame_id in ('base_footprint', 'base_link') and len(msg.polygon.points) >= 3:
@@ -571,6 +622,16 @@ class HmiWeb(Node):
                 nav_ready = False
 
         with self._lock:
+            lawn = {'recording': self.rec_on, 'set': bool(self.lawn_pts), 'length': None, 'gap': None,
+                    'area': None, 'perimeter': None, 'close_gap': LAWN_CLOSE_GAP}
+            if self.rec_on and self.rec_pts:
+                lawn['length'] = round(self.rec_len, 1)
+                if pose and frame == 'map':
+                    x0, y0 = self.rec_pts[0]
+                    lawn['gap'] = round(math.hypot(pose['x'] - x0, pose['y'] - y0), 2)
+            if self.lawn_pts:
+                area, perim = poly_area_perimeter(self.lawn_pts)
+                lawn['area'], lawn['perimeter'] = round(area, 1), round(perim, 1)
             mission = {
                 'state': state, 'total': int(ms.total_segments) if ms else 0,
                 'completed': int(ms.completed_segments) if ms else 0, 'skipped': int(ms.skipped_segments) if ms else 0,
@@ -596,6 +657,7 @@ class HmiWeb(Node):
                 'vel': {'v': round(vx, 3), 'w': round(wz, 3), 'nav': round(nav, 3), 'out': round(out, 3)},
                 'map': dict(self.map_meta, ready=bool(running and self.mapping and self.map_meta.get('ver')), name=save_name),
                 'saving': self.saving_since is not None,
+                'lawn': lawn,
                 'geo': {'scan': scan_flat},
                 'vehicle': self.vehicle,
                 'diag': {
@@ -610,6 +672,8 @@ class HmiWeb(Node):
                 'route': (self.path_pts, self.route_ver),
                 'boundary': (self.shown_boundary(mode), self.boundary_ver),
                 'trail': ([s for s in self.trail if len(s) > 1] or None, self.trail_ver),
+                'lawn': (self.lawn_pts, self.lawn_ver),
+                'rec': (self.rec_pts if self.rec_on else None, self.rec_ver),
             }
             self.release_stale_holder()
 
@@ -694,8 +758,8 @@ class HmiWeb(Node):
         if self.mission is not None and manager_ok:
             skipped = int(self.mission.skipped_segments)
             if skipped > self._prev_skipped and self.mission.skipped_labels:
-                # 跳過的原因 (被擋住、對正超時、Nav2 回失敗…) 只在 manager 的 log 裡
-                A.pulse('skip%d' % skipped, 3, '%s 沒有跑完，跳過了（原因看 car-log）' % self.mission.skipped_labels[-1])
+                # 2026-10-20 起 manager 把原因 (對正超時、導航判失敗…) 寫在 skipped_labels 後面
+                A.pulse('skip%d' % skipped, 3, '跳過 %s' % self.mission.skipped_labels[-1])
             self._prev_skipped = skipped
             if state == MissionStatus.STATE_ABORTED and self._abort_logged not in (None, state):
                 # 進到「已中止」的那一刻報一次。message 開頭的「暫停：…」是 manager 另外加的 (自動模式中擋住的原因)，不是中止的原因
@@ -805,6 +869,11 @@ class HmiWeb(Node):
                 self.route_ver += 1
                 self.boundary_pts = None
                 self.route_boundary = None
+                self.lawn_pts = None
+                self.lawn_ver += 1
+                self.rec_on = False
+                self.rec_pts = None
+                self.rec_ver += 1
                 self.map_msg = None
                 self.keepout_msg = None
                 self.map_meta = {'ready': False, 'ver': 0}
@@ -985,25 +1054,46 @@ class HmiWeb(Node):
                 return False, '停止中只能先切手動（跟手把 LB + X 一樣）'
             if m == 1 and not frame.get('map', {}).get('ready'):
                 return False, '還沒有地圖：先開始建圖，把範圍開一圈'
-            if m == 1 and self.saving_since is not None:
-                return False, '正在存地圖，存好（大約 10～30 秒）再開始：存圖的時候車子在地圖上的位置會斷一下，路線會被判失敗'
             if m == 1 and not frame.get('joy', {}).get('connected'):
                 return False, '手把沒連上：自動割草要手把連著（打開手把再按）'
+            if m == 1 and self.rec_on:
+                return False, '正在記錄草地邊界：先按「完成」或「取消這次」'
             if m == 1 and not frame.get('nav_ready'):
                 return False, '導航 (Nav2) 還沒準備好：car-start planonly 開的，或 Nav2 沒起來（關閉再啟動一次）'
             ok, err = self.set_mode(m, who)
             if not ok:
                 self.log(who, '切到%s（沒成功：%s）' % (MODE_NAME[m], err))
+            elif m == 1 and self.saving_since is not None:
+                # 存圖的時候車子在地圖上的位置會斷一下，manager 會等存好才出發 (2026-10-20)
+                return ok, '正在存地圖，存好就出發（大約 10～30 秒）'
             return ok, err
         if cmd == 'preview':
             if mode in (1, 3):
                 return False, '自動割草中不能預覽，先切手動'
+            if self.rec_on:
+                return False, '正在記錄草地邊界：先按「完成」，預覽才會用新的邊界'
             res, err = self.call(self.preview_cli, Trigger.Request())
             if res is None or not res.success:
                 return False, err or res.message
             self.log(who, '預覽路線')
             err = self.save_async(who)
             return True, '算路線中，大約 1 秒後畫在總覽的地圖上；' + ('同時存地圖' if not err else '地圖沒存：' + err)
+        if cmd == 'lawn':
+            if arg not in LAWN_WHAT:
+                return False, '不認得的指令'
+            if mode in (1, 3) and arg in ('start', 'stop'):
+                return False, '自動割草中不能記錄草地邊界，先切手動'
+            if arg == 'start' and not self.mapping:
+                return False, '還沒開始建圖：先「開始建圖」（手把 LB + A），邊界要記在地圖上'
+            if arg == 'start' and self.rec_on:
+                return False, '已經在記錄了'
+            if arg == 'stop' and not self.rec_on:
+                return False, '目前沒有在記錄'
+            res, err = self.call(self.lawn_cli[arg], Trigger.Request())
+            if res is None:
+                return False, '草地邊界記錄器 (boundary_recorder) ' + err
+            self.log(who, LAWN_WHAT[arg] + ('' if res.success else '（沒成功：%s）' % res.message))
+            return bool(res.success), res.message
         if cmd == 'savemap':
             if mode in (1, 3):
                 return False, '自動割草中不存地圖（存圖的時候路線會被判失敗）；先切手動'
@@ -1052,12 +1142,18 @@ class HmiWeb(Node):
             except Exception as exc:
                 text, rc = '跑不起來：%s' % exc, -1
             lines = text.splitlines()
+            fail = [ln for ln in lines if '❌' in ln or '⚠' in ln]
             with self._lock:
                 self.prog['busy'] = None
-                # 成功就不用給人看整段輸出；失敗留最後幾行 (car-start 的 ❌ 原因在這裡)
-                self.prog['output'] = '' if rc == 0 else '\n'.join(lines[-12:])
-            fail = [ln for ln in lines if '❌' in ln or '⚠' in ln]
-            self.log('系統', '%s：%s' % (what, '完成' if rc == 0 else '失敗（%s）' % (fail[-1].strip() if fail else '回傳 %d' % rc)))
+                # 失敗留最後幾行 (car-start 的 ❌ 原因在這裡)；成功但有 ❌ / ⚠ 的行 (例如光達停止區沒起來) 只留那幾行
+                self.prog['output'] = '\n'.join(lines[-12:]) if rc != 0 else '\n'.join(ln.strip() for ln in fail)
+            if rc != 0:
+                result = '失敗（%s）' % (fail[-1].strip() if fail else '回傳 %d' % rc)
+            elif fail:
+                result = '完成，但是：' + '；'.join(ln.strip() for ln in fail)
+            else:
+                result = '完成'
+            self.log('系統', '%s：%s' % (what, result))
             self._prog_check_t = 0.0
         threading.Thread(target=work, daemon=True).start()
 
