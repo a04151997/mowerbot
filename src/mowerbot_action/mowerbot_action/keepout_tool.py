@@ -94,7 +94,7 @@ def cmd_apply(args):
             session_id = fh.read().strip()
     except OSError:
         print('❌ 找不到 %s：這張地圖存的時候沒有記下是哪一次開機，不能拿來畫禁區。'
-              '請這次開機重新存圖再畫。' % session_path, file=sys.stderr)
+              '請重新存圖再畫。' % session_path, file=sys.stderr)
         return 1
 
     record = keepout.write_mask(prefix + '_keepout', red, meta['resolution'],

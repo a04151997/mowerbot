@@ -1,9 +1,12 @@
+import math
 import os
+import tempfile
 
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument, LogInfo, OpaqueFunction
+from launch.actions import (IncludeLaunchDescription, DeclareLaunchArgument, LogInfo, OpaqueFunction,
+                            SetLaunchConfiguration)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
@@ -12,7 +15,7 @@ from launch_ros.actions import Node, SetParameter
 from launch_ros.parameter_descriptions import ParameterValue
 
 from mowerbot_action.manager import DEFAULT_OVERLAP_RATIO, WAYPOINT_SPACING
-from mowerbot_action import swath_angle
+from mowerbot_action import map_session, swath_angle
 from mowerbot_description import vehicle_geometry
 
 def check_headland(context, geom, nav2_params_path):
@@ -102,6 +105,69 @@ def resolve_mode_options(context):
     return opts
 
 
+# 用存好的地圖開機 (2026-10-21 will：不要每次重開都重新建圖)，說明見 mowerbot_action/map_session.py。
+#   saved_map       存好的地圖 (save_map.sh 存的，絕對路徑、不含副檔名)。空 = 建新地圖 (跟以前一樣)
+#   map_start_pose  車子在那張地圖上的哪裡 "x,y,朝向(度)"。空 = 上次關機前記下的位置 (同一張圖才用)，
+#                   再沒有就當作在建圖的起點。開機後 map_session 會用光達在附近 ±1.5 m、±30° 找準。
+# 這一次的 session (禁區、外框跟著它存) 與起點在 launch 開始時算一次，存成下面三個 launch 設定給各節點用。
+SESSION_KEYS = ('mowerbot_session_id', 'mowerbot_saved_map', 'mowerbot_start_pose', 'mowerbot_start_source')
+
+
+def resolve_map_session(context):
+    saved = os.path.expanduser(LaunchConfiguration('saved_map').perform(context).strip())
+    start_text = LaunchConfiguration('map_start_pose').perform(context).strip()
+    if not saved:
+        if start_text:
+            raise RuntimeError('map_start_pose 只在用存好的地圖 (saved_map) 時有用；建新地圖時車子的位置就是原點')
+        sid = map_session.new_session_id()
+        values = (sid, '', '', '')
+        msg = '[mower_control] 地圖：建新地圖 (session %s)' % sid
+    else:
+        for ext in ('.posegraph', '.data', '.yaml', '.pgm'):
+            if saved.endswith(ext):
+                saved = saved[:-len(ext)]
+        if not os.path.isabs(saved):
+            raise RuntimeError('saved_map 要寫完整路徑 (不含副檔名)，收到 %r' % saved)
+        missing = map_session.check_saved_map(saved)
+        if missing:
+            raise RuntimeError('存好的地圖 %s 缺 %s，用不了' % (saved, '、'.join('.' + e for e in missing)))
+        sid = map_session.session_of(saved)
+        try:
+            x, y, yaw, src = map_session.start_pose(sid, start_text)
+        except ValueError as e:
+            raise RuntimeError(str(e))
+        values = (sid, saved, '%.4f,%.4f,%.6f' % (x, y, yaw), src)
+        msg = ('[mower_control] 地圖：用存好的地圖 %s (session %s)，起點 (%.2f, %.2f, %.0f°) = %s'
+               % (saved, sid, x, y, math.degrees(yaw), src))
+    return [SetLaunchConfiguration(k, v) for k, v in zip(SESSION_KEYS, values)] + [LogInfo(msg=msg)]
+
+
+def session_param(key):
+    """launch 設定 -> 字串參數。一定要指定 str：session 可能全是數字，不指定會被當成整數，節點宣告的是字串會起不來。"""
+    return ParameterValue(LaunchConfiguration(key), value_type=str)
+
+
+def localization_slam(context, bringup_dir, use_sim_time):
+    """slam_toolbox 定位模式：讀存好的 .posegraph，不再建圖。參數用建圖的那一份 (mapper_params.yaml，
+    解析度、光達範圍要跟存圖時一樣)，再蓋上模式、地圖、起點。
+    蓋的那幾個要寫成指名 slam_toolbox 的 yaml：launch 的 dict 參數是 /** 萬用字元，比不過
+    mapper_params.yaml 裡指名的 (mapping.launch.py 的 scan_topic 實測過)。"""
+    saved = LaunchConfiguration('mowerbot_saved_map').perform(context)
+    x, y, yaw = (float(v) for v in LaunchConfiguration('mowerbot_start_pose').perform(context).split(','))
+    f = tempfile.NamedTemporaryFile(mode='w', prefix='mowerbot_slam_localization_', suffix='.yaml', delete=False)
+    # map_start_pose 一定要給：不給的話 slam_toolbox 依版本不同，可能根本不載入地圖
+    yaml.safe_dump({'slam_toolbox': {'ros__parameters': {
+        'mode': 'localization', 'map_file_name': saved, 'map_start_pose': [x, y, yaw]}}}, f)
+    f.close()
+    return Node(
+        package='slam_toolbox',
+        executable='localization_slam_toolbox_node',
+        name='slam_toolbox',
+        output='screen',
+        parameters=[os.path.join(bringup_dir, 'config', 'mapper_params.yaml'), f.name,
+                    {'use_sim_time': use_sim_time}])
+
+
 def generate_launch_description():
     # 1. 取得各個套件的路徑
     bringup_dir = get_package_share_directory('mowerbot_bringup')
@@ -147,6 +213,17 @@ def generate_launch_description():
     def slam_action(context):
         opts = resolve_mode_options(context)
         on = opts['mapping_on_button']
+        saved = LaunchConfiguration('mowerbot_saved_map').perform(context)
+        if saved:
+            # 用存好的地圖：slam_toolbox 定位模式直接讀 /scan (沒有「按 LB + A 才開始」，一開就要定位)；
+            # map_autosave 還是開著，手把 Y 回答「沿用存好的地圖」，Y 的路線預覽照常
+            return [
+                LogInfo(msg='[mower_control] 定位：用存好的地圖，slam_toolbox 定位模式 (不會改地圖)'),
+                localization_slam(context, bringup_dir, use_sim_time),
+                Node(package='mowerbot_action', executable='map_autosave', name='map_autosave',
+                     output='screen',
+                     parameters=[{'use_sim_time': use_sim_time, 'saved_map': session_param('mowerbot_saved_map')}]),
+            ]
         actions = [
             LogInfo(msg='[mower_control] 建圖：%s' % (
                 '按 LB + A (建圖模式) 才開始，在那之前沒有地圖' if on
@@ -205,7 +282,8 @@ def generate_launch_description():
         executable='boundary_recorder',
         name='boundary_recorder',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        # session (2026-10-21)：圈好的外框跟著地圖存，用同一張存好的地圖開機時載回來
+        parameters=[{'use_sim_time': use_sim_time, 'session_id': session_param('mowerbot_session_id')}]
     )
 
     # 禁區 (2026-10-18)：使用者在存好的地圖上用紅色畫的區域，發布成 /keepout_mask，
@@ -216,7 +294,21 @@ def generate_launch_description():
         executable='keepout_server',
         name='keepout_server',
         output='screen',
-        parameters=[{'use_sim_time': use_sim_time}]
+        # session (2026-10-21)：建新地圖 = 新的 (沒有禁區)；用存好的地圖 = 那張圖的 (那一次畫的禁區載回來)
+        parameters=[{'use_sim_time': use_sim_time, 'session_id': session_param('mowerbot_session_id')}]
+    )
+
+    # 這一次用哪張地圖、車子在地圖上的哪裡 (2026-10-21)：記下車子的位置給下次開機用；
+    # 用存好的地圖時拿光達比對地圖、找準位置。說明見 mowerbot_action/map_session.py
+    map_session_node = Node(
+        package='mowerbot_action',
+        executable='map_session',
+        name='map_session',
+        output='screen',
+        parameters=[{'use_sim_time': use_sim_time,
+                     'session_id': session_param('mowerbot_session_id'),
+                     'saved_map': session_param('mowerbot_saved_map'),
+                     'start_source': session_param('mowerbot_start_source')}]
     )
 
     # 手把控制邏輯
@@ -286,6 +378,13 @@ def generate_launch_description():
                 'perimeter_corner_window': geom.perimeter_corner_window,
                 'perimeter_corner_angle': geom.perimeter_corner_angle,
                 'goal_xy_tolerance': goal_xy_tolerance,
+                # 沿邊多繞幾圈 (2026-10-21)：離邊界幾公尺各繞一圈，空 = 不繞 (模擬預設)；
+                # 轉角圓弧與車身檢查用 footprint 的前後伸出量
+                'edge_loops': LaunchConfiguration('edge_loops', default='').perform(context),
+                'front_extent': geom.front_extent,
+                'rear_extent': geom.rear_extent,
+                # 用存好的地圖 (2026-10-21)：定位對上 (map_session) 才讓自動割草出發
+                'saved_map': LaunchConfiguration('mowerbot_saved_map').perform(context),
             }]
         )
         return [log, manager_node]
@@ -299,6 +398,21 @@ def generate_launch_description():
             default_value='1.0',
             description='手把速度比例 (0.05 ~ 1.0)，乘在 joystick.yaml 的 scale_linear / scale_angular 上。'
                         '實車由 car-start 的速度上限傳進來；Nav2 那邊是 navigation.launch.py 的 speed_scale。'),
+        DeclareLaunchArgument(
+            'saved_map',
+            default_value='',
+            description='用存好的地圖開機 (2026-10-21)：save_map.sh 存的地圖，完整路徑、不含副檔名。'
+                        '空 = 建新地圖 (跟以前一樣)。這張地圖畫過的禁區、圈過的外框會自動載回來。'),
+        DeclareLaunchArgument(
+            'map_start_pose',
+            default_value='',
+            description='用存好的地圖時車子在地圖上的哪裡："x,y,朝向(度)"。'
+                        '空 = 上次關機前記下的位置，沒有就當作在建圖的起點。開機後會用光達在附近找準。'),
+        DeclareLaunchArgument(
+            'edge_loops',
+            default_value='',
+            description='沿邊多繞幾圈 (2026-10-21)：離邊界幾公尺各繞一圈，逗號分開 (實車 "1.10,0.75")。'
+                        '空 = 不繞 (模擬預設，跟以前一樣)。轉角邊走邊轉，只在進出圈的匝道兩頭原地轉身。'),
         # 模擬時預設不啟動 robot_state_publisher (由 gazebo.launch.py 負責)
         DeclareLaunchArgument(
             'start_rsp',
@@ -376,6 +490,9 @@ def generate_launch_description():
         # 【核心修正】全域設定模擬時間參數
         SetParameter(name='use_sim_time', value=use_sim_time),
 
+        # 這一次的地圖與 session：要在 SLAM 與各節點之前算好 (它們讀 SESSION_KEYS)
+        OpaqueFunction(function=resolve_map_session),
+
         robot_description_launch,
         joint_state_publisher,
         slam_launch,
@@ -386,4 +503,5 @@ def generate_launch_description():
         boundary_node,
         boundary_recorder_node,
         keepout_node,
+        map_session_node,
     ])

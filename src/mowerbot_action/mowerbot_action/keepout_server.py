@@ -11,14 +11,18 @@
     ~/clear     清除禁區
 一般不直接呼叫，用 keepout_tool (ros2 run mowerbot_action keepout_tool -h)。
 
-【開機永遠沒有禁區】session_id 每次啟動都重新產生，開機不載入任何舊檔。
-上一次開機畫的禁區放進這次的 map 座標系，只要車子起點差一點、朝向差幾度，整片禁區就會
-平移、旋轉到別的地方 —— 而且畫面上看起來一切正常。所以只接受這次開機存的地圖畫出來的禁區。
+【只載同一張地圖畫的禁區】上一次建圖畫的禁區放進這一次新建的 map 座標系，只要車子起點差一點、
+朝向差幾度，整片禁區就會平移、旋轉到別的地方 —— 而且畫面上看起來一切正常。
+所以只接受同一個 session (同一次建圖) 畫出來的禁區。
+  * 建新地圖：session 是這次開機新產生的，開機沒有禁區
+  * 用存好的地圖開機 (2026-10-21，map_session.py)：session 是那張地圖的，那一次畫的禁區自動載回來
+套用成功的禁區另外存一份在 <keepout_dir>/sessions/<session>.yaml，清除時刪掉；
+restore 開著的話開機載回同一個 session 的那一份。
 """
+import glob
 import os
-import time
-import uuid
 
+import numpy as np
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -26,7 +30,7 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from nav_msgs.msg import OccupancyGrid
 from std_srvs.srv import Trigger
 
-from mowerbot_action import keepout
+from mowerbot_action import keepout, map_session
 
 
 class KeepoutServer(Node):
@@ -37,12 +41,16 @@ class KeepoutServer(Node):
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('mask_topic', '/keepout_mask')
         self.declare_parameter('empty_frame', 'odom')
+        # 2026-10-21：mower_control 傳進來 (建新地圖 = 新的、用存好的地圖 = 那張圖的)。空 = 自己產生
+        self.declare_parameter('session_id', '')
+        self.declare_parameter('restore', True)
         self.keepout_dir = self.get_parameter('keepout_dir').value
         self.global_frame = self.get_parameter('global_frame').value
         self.empty_frame = self.get_parameter('empty_frame').value
         mask_topic = self.get_parameter('mask_topic').value
 
-        self.session_id = time.strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex[:6]
+        self.session_id = self.get_parameter('session_id').value or map_session.new_session_id()
+        self.saved_dir = os.path.join(self.keepout_dir, 'sessions')
 
         latched = QoSProfile(depth=1,
                              durability=DurabilityPolicy.TRANSIENT_LOCAL,
@@ -54,9 +62,44 @@ class KeepoutServer(Node):
         self.create_service(Trigger, '~/session', self.session_cb)
         self.create_service(Trigger, '~/load', self.load_cb)
         self.create_service(Trigger, '~/clear', self.clear_cb)
+        restored = self.restore() if self.get_parameter('restore').value else ''
         self.get_logger().info(
-            f'✅ 禁區節點就緒 (session {self.session_id})。開機不載入舊的禁區：'
-            f'要用這次開機存的地圖畫，再用 keepout_tool apply 套用。')
+            f'✅ 禁區節點就緒 (session {self.session_id})。{restored or "沒有這張地圖的禁區。"}')
+
+    def saved_prefix(self):
+        return os.path.join(self.saved_dir, self.session_id)
+
+    def restore(self):
+        """開機載回同一個 session 存的禁區。回傳要印的一句話 (沒有就空字串)。"""
+        path = self.saved_prefix() + '.yaml'
+        if not os.path.isfile(path):
+            return ''
+        try:
+            m = keepout.load_mask(path)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self.get_logger().error(f'⚠️ 讀不到存著的禁區 {path}：{exc}')
+            return ''
+        if m['session_id'] != self.session_id or m['zones'] == 0:
+            return ''
+        self.publish_mask(m)
+        return f'載回這張地圖的禁區：{m["zones"]} 塊、共 {m["area"]:.2f} m²。'
+
+    def save_copy(self, m, source):
+        try:
+            os.makedirs(self.saved_dir, exist_ok=True)
+            keepout.write_mask(self.saved_prefix(), np.flipud(m['grid']), m['resolution'],
+                               m['origin_x'], m['origin_y'], self.session_id, source=source)
+            return ''
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(f'⚠️ 禁區存不起來 (下次開機不會自動載回)：{exc}')
+            return '，但存不起來 (下次開機不會自動載回)'
+
+    def delete_copy(self):
+        for f in glob.glob(glob.escape(self.saved_prefix()) + '.*'):
+            try:
+                os.remove(f)
+            except OSError as exc:
+                self.get_logger().error(f'⚠️ 刪不掉存著的禁區 {f}：{exc}')
 
     def publish_empty(self):
         # 空遮罩放在 odom，不放在 map (2026-10-18)：實車要按 LB + A 才開始建圖，在那之前
@@ -103,9 +146,9 @@ class KeepoutServer(Node):
         if m['session_id'] != self.session_id:
             resp.success = False
             resp.message = (
-                f'這張禁區是用另一次開機存的地圖畫的 (session {m["session_id"]})，'
-                f'現在是 {self.session_id}。每次開機地圖的原點都不一樣，舊的禁區會對不上，'
-                f'所以不載入。請這次開機重新存圖、重新畫。')
+                f'這張禁區是畫在另一張地圖上的 (session {m["session_id"]})，'
+                f'現在是 {self.session_id}。不同地圖的原點不一樣，禁區會對不上，所以不載入。'
+                f'要用那張圖的禁區：用那張存好的地圖啟動 (car-start map 名稱)；不然就在這張圖上重畫。')
             self.get_logger().error('🚫 ' + resp.message)
             return resp
         if m['zones'] == 0:
@@ -114,14 +157,16 @@ class KeepoutServer(Node):
             self.get_logger().warn('⚠️ ' + resp.message)
             return resp
         self.publish_mask(m)
+        kept = self.save_copy(m, 'active.yaml')
         resp.success = True
         resp.message = (f'已套用禁區：{m["zones"]} 塊、共 {m["area"]:.2f} m²。'
-                        f'割草範圍與 Nav2 都會避開。')
+                        f'割草範圍與 Nav2 都會避開{kept}。')
         self.get_logger().info('⛔ ' + resp.message)
         return resp
 
     def clear_cb(self, _req, resp):
         self.publish_empty()
+        self.delete_copy()
         resp.success = True
         resp.message = '已清除禁區，割草範圍回到只由地圖 (與草地邊界) 決定。'
         self.get_logger().info(resp.message)

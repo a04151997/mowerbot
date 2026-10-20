@@ -6,6 +6,7 @@ from mowerbot_interfaces.srv import SetDriveMode        # 自定義的模式切�
 from mowerbot_interfaces.msg import JoyStatus           # 手把連線狀態 (給 HMI 看)
 from mowerbot_interfaces.msg import MowerStatus         # 目前模式 (Y 存圖要看)
 from std_srvs.srv import Trigger                        # Y 存圖 (map_autosave)
+from rcl_interfaces.msg import SetParametersResult      # 網頁改速度 (speed_scale)
                                                         
 class MowerTeleop(Node):
     def __init__(self):
@@ -32,10 +33,11 @@ class MowerTeleop(Node):
         speed_scale = float(self.get_parameter('speed_scale').value)
         if not 0.05 <= speed_scale <= 1.0:
             raise ValueError('speed_scale 要在 0.05 ~ 1.0 之間，收到 %r' % speed_scale)
-        self.p['scale_linear'] *= speed_scale
-        self.p['scale_angular'] *= speed_scale
-        self.get_logger().info('手把推到底：%.3f m/s、%.3f rad/s (speed_scale %.2f)'
-                               % (self.p['scale_linear'], self.p['scale_angular'], speed_scale))
+        self._full = (self.p['scale_linear'], self.p['scale_angular'])
+        self._apply_speed_scale(speed_scale)
+        # 網頁改速度 (2026-10-21)：執行中改 speed_scale 參數就換手把的上限，不用重開。
+        # Nav2 那邊網頁另外改 controller_server 的參數 (見 mowerbot_hmi/web.py 的 set_speed)。
+        self.add_on_set_parameters_callback(self._on_params)
 
         # 訂閱 joy 話題，讀取手把硬體狀態
         self.joy_sub = self.create_subscription(Joy,'joy',self.joy_callback,10)
@@ -72,6 +74,25 @@ class MowerTeleop(Node):
                                'Y = 存圖 + 預覽割草路線 (不用按 LB)')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
+
+    def _apply_speed_scale(self, speed_scale):
+        self.p['scale_linear'] = self._full[0] * speed_scale
+        self.p['scale_angular'] = self._full[1] * speed_scale
+        self.get_logger().info('手把推到底：%.3f m/s、%.3f rad/s (speed_scale %.2f)'
+                               % (self.p['scale_linear'], self.p['scale_angular'], speed_scale))
+
+    def _on_params(self, params):
+        for prm in params:
+            if prm.name != 'speed_scale':
+                continue
+            try:
+                v = float(prm.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(successful=False, reason='speed_scale 要是數字')
+            if not 0.05 <= v <= 1.0:
+                return SetParametersResult(successful=False, reason='speed_scale 要在 0.05 ~ 1.0 之間')
+            self._apply_speed_scale(v)
+        return SetParametersResult(successful=True)
 
     @staticmethod
     def _button(buttons, index):

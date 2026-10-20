@@ -9,9 +9,10 @@
 map_to_boundary 把遮罩裡的格子當成不能割 (會變成 F2C 的內環，或切掉外圈)，
 local costmap 的 keepout_layer 把它當成牆，Nav2 也不往裡面開 (approach 是直線，可能穿過禁區)。
 
-【只在同一次開機有效】每次 bringup 都重新建圖，map 座標系的原點是這次開機時車子停的位置
-(與 boundary_recorder 的 load_on_start 是同一個理由)。所以存圖時記下這次開機的 session_id，
-keepout_server 只接受同一個 session_id 畫出來的禁區。
+【只在同一張地圖有效】每次建新地圖，map 座標系的原點就是那次開機時車子停的位置
+(與 boundary_recorder 的 load_on_start 是同一個理由)。所以存圖時記下這張圖的 session_id，
+keepout_server 只接受同一個 session_id 畫出來的禁區。用存好的地圖開機 (map_session.py) 時
+session 沿用那張圖的，禁區也從 ~/.ros/mowerbot_keepout/sessions/ 自動載回。
 
 座標：圖片與 slam_toolbox 存的 .pgm 同尺寸、同方向 (第 0 列 = 地圖最上方 = y 最大)。
 yaml 的 origin 是左下角那一格的世界座標 (與 map_server 相同)；OccupancyGrid 的 data 是

@@ -55,16 +55,30 @@ echo ""
 # 其中「單獨呼叫 save_map」5 次就失敗了 2 次。
 # 服務回傳失敗時不會產生 .pgm/.yaml，所以這裡重試最多 3 次，
 # 每次都把結果印出來，讓這個不穩定性留在 log 裡看得見，而不是被默默吞掉。
+#
+# 2026-10-20：slam_toolbox 的 save_map 其實只是在裡面跑
+#   ros2 run nav2_map_server map_saver_cli -f <名稱> --ros-args -p map_subscribe_transient_local:=true
+# map_saver_cli 預設只等 /map 2 秒 (save_map_timeout)，等不到就失敗、回 255。
+# CPU 忙的時候 (模擬：建圖 + F2C 一起跑) 3 次全失敗。所以前兩次照舊走 slam_toolbox，
+# 第 3 次直接跑 map_saver_cli、等 10 秒；三種方式存出來的檔一樣 (同一支程式、同樣的預設門檻)。
 echo "[2/2] save_map -> ${NAME}.pgm + ${NAME}.yaml"
 saved=0
 for attempt in 1 2 3; do
     echo "  第 ${attempt} 次嘗試..."
-    out="$(ros2 service call /slam_toolbox/save_map \
-            slam_toolbox/srv/SaveMap \
-            "{name: {data: '${TARGET}'}}" 2>&1)"
-    echo "${out}"
-    if echo "${out}" | grep -q "result=0"; then
-        saved=1
+    if [ "${attempt}" -lt 3 ]; then
+        out="$(ros2 service call /slam_toolbox/save_map \
+                slam_toolbox/srv/SaveMap \
+                "{name: {data: '${TARGET}'}}" 2>&1)"
+        echo "${out}"
+        echo "${out}" | grep -q "result=0" && saved=1
+    else
+        echo "  (直接跑 map_saver_cli，等 /map 最多 10 秒)"
+        if timeout 30 ros2 run nav2_map_server map_saver_cli -f "${TARGET}" --ros-args \
+                -p map_subscribe_transient_local:=true -p save_map_timeout:=10.0 2>&1; then
+            saved=1
+        fi
+    fi
+    if [ "${saved}" -eq 1 ]; then
         if [ "${attempt}" -gt 1 ]; then
             echo "  (注意：save_map 第 ${attempt} 次才成功，這個服務本身不穩定)"
         fi
@@ -97,13 +111,14 @@ if [ -f "${TARGET}.yaml" ]; then
 fi
 echo ""
 
-# 禁區 (2026-10-18)：記下這次開機的 session_id，再產生一張給人畫禁區的圖 <名稱>_draw.png
+# 禁區 (2026-10-18)：記下這張圖的 session_id (建圖那次開機產生的；用存好的地圖開機時沿用那張圖的)，
+# 再產生一張給人畫禁區的圖 <名稱>_draw.png
 # (用法見 mowerbot_action/keepout.py)。keepout_server 沒開時 (只跑 SLAM、舊版程式) 跳過，
 # 不影響存圖本身，也不改 rc。
 if [ -f "${TARGET}.yaml" ]; then
     if session="$(ros2 run mowerbot_action keepout_tool session 2>/dev/null)" && [ -n "${session}" ]; then
         echo "${session}" > "${TARGET}.session"
-        echo "  這次開機的 session：${session}（只有這次開機能用這張圖畫禁區）"
+        echo "  地圖的 session：${session}（禁區、外框跟著它存；下次用這張圖啟動會載回來）"
         ros2 run mowerbot_action keepout_tool template "${TARGET}" \
             || echo "  !! 畫禁區用的圖沒有產生" >&2
     else

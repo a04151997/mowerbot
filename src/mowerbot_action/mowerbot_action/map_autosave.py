@@ -17,6 +17,8 @@ free_thresh 改 0.10、記下這次開機的 session 與畫禁區用的圖，全
     map_dir  存到哪裡；留空 = save_map.sh 自己決定 (原始碼的 maps/，與 car-savemap 相同)
     prefix   檔名開頭，預設 map
     timeout  save_map.sh 最多跑幾秒 (N150 上一次約 10 ~ 30 秒)
+    saved_map  用存好的地圖開機時 (2026-10-21，map_session.py) 的那張地圖：定位模式不會改地圖，
+             不用再存，~/save 直接回答成功 (message = 那張地圖)，手把 Y 的路線預覽照常
 save_map.sh 的完整輸出存在 ~/.ros/mowerbot_autosave/<名稱>.log。
 """
 import os
@@ -42,6 +44,8 @@ class MapAutosave(Node):
         self.declare_parameter('prefix', 'map')
         self.declare_parameter('timeout', 120.0)
         self.declare_parameter('log_dir', os.path.expanduser('~/.ros/mowerbot_autosave'))
+        self.declare_parameter('saved_map', '')
+        self.saved_map = self.get_parameter('saved_map').value
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
                              reliability=ReliabilityPolicy.RELIABLE)
         # 建圖開始了沒：slam_scan_gate 的 latched 話題。沒有這個話題 (模擬，一開機就在建圖) = 不擋
@@ -61,6 +65,13 @@ class MapAutosave(Node):
                             'lib', 'mowerbot_bringup', 'save_map.sh')
 
     def save_cb(self, _req, resp):
+        if self.saved_map:
+            resp.success = True
+            resp.message = self.saved_map
+            self.get_logger().info('💾 用的是存好的地圖 %s，不用再存' % self.saved_map)
+            self.last_pub.publish(String(data='%s ✅ 沿用存好的地圖 %s (不用再存)' % (
+                time.strftime('%H:%M:%S'), os.path.basename(self.saved_map))))
+            return resp
         if self.mapping is False:
             ok, message = False, '還沒開始建圖 (按住 LB + A)，沒有地圖可以存'
         else:

@@ -44,6 +44,9 @@ def generate_launch_description():
     serial_port = LaunchConfiguration('serial_port')
     max_vel_scale = LaunchConfiguration('max_vel_scale')
     speed_scale = LaunchConfiguration('speed_scale', default='1.0')
+    edge_loops = LaunchConfiguration('edge_loops', default='1.10,0.75')
+    saved_map = LaunchConfiguration('saved_map', default='')
+    map_start_pose = LaunchConfiguration('map_start_pose', default='')
     allow_provisional = LaunchConfiguration('allow_provisional')
     override_reason = LaunchConfiguration('provisional_override_reason')
     use_lidar = LaunchConfiguration('use_lidar')
@@ -169,6 +172,11 @@ def generate_launch_description():
                 'mapping_on_button': 'true',
                 'save_map_before_f2c': 'false',
                 'speed_scale': speed_scale,
+                # 沿邊多繞兩圈 (2026-10-21 will 同意)：離邊界 1.10 m、0.75 m，地頭裡以前不割的那一圈
+                'edge_loops': edge_loops,
+                # 用存好的地圖開機 (2026-10-21 will)：car-start map 傳進來，空 = 建新地圖
+                'saved_map': saved_map,
+                'map_start_pose': map_start_pose,
             }.items()
         )
     ])
@@ -225,6 +233,19 @@ def generate_launch_description():
             description='速度上限比例 (0.05 ~ 1.0，2026-10-20 D1)：手把 (joystick.yaml 的 scale) 和 '
                         'Nav2 (FollowPath 的 max_vel_x / max_speed_xy / max_vel_theta) 各自乘上它，'
                         'bridge 不縮放。car-start 的速度上限就是這個。'),
+        DeclareLaunchArgument(
+            'saved_map',
+            default_value='',
+            description='用存好的地圖開機 (2026-10-21)：save_map.sh 存的地圖，完整路徑、不含副檔名。'
+                        '空 = 建新地圖。car-start map 會挑最新的一張傳進來。'),
+        DeclareLaunchArgument(
+            'map_start_pose',
+            default_value='',
+            description='用存好的地圖時車子在地圖上的哪裡 "x,y,朝向(度)"。空 = 上次關機前記下的位置。'),
+        DeclareLaunchArgument(
+            'edge_loops',
+            default_value='1.10,0.75',
+            description='沿邊多繞幾圈 (2026-10-21 will 同意)：離邊界幾公尺各繞一圈，逗號分開；空 = 不繞。'),
 
         LogInfo(msg=['[bringup_real] 啟動實車節點 (driver_type=', driver_type,
                      ', encoder_ticks_per_rev=', ticks_per_rev,

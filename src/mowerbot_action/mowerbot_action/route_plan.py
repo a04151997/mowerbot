@@ -327,7 +327,7 @@ class TransitPlanner:
         for hole in rings[1:]:
             if len(hole) >= 3:
                 cv2.fillPoly(mask, [px(hole)], 0, lineType=cv2.LINE_8, shift=4)
-        self.dist = cv2.distanceTransform(mask, cv2.DIST_L2, cv2.DIST_MASK_PRECISE) * np.float32(res)
+        self.dist = _distance(mask, res)
         self.travel_clearance = float(travel_clearance)
         self.turn_clearance = float(turn_clearance)
         self.travel = self.dist >= self.travel_clearance
@@ -470,3 +470,496 @@ class TransitPlanner:
             chain.append((float(nodes[u][0]), float(nodes[u][1])))
             u = int(parent[u])
         return [a] + chain[::-1] + [b]
+
+
+# ---------------------------------------------------------------------------
+# 3. 沿邊多繞幾圈 (2026-10-21 will 同意)
+# ---------------------------------------------------------------------------
+#
+# 割草線兩頭、F2C 的環繞都要原地轉身：車頭在後輪軸前 0.975 m，原地轉一圈車頭角掃出 1.06 m，
+# 所以割草線和環繞都離邊界 1.2 m (地頭) 以上，這一圈從來沒割 (will 的 lab1 圖紅線內只割到約 56%)。
+# 這裡在地頭裡沿著邊界再繞幾圈 (離邊界 offsets，實車 1.10、0.75 m)：
+#   * 轉角改成邊走邊轉的圓弧，不原地轉。外凸的轉角 (前面是邊界) 圓弧要夠大，車頭角才不會
+#     伸出邊界 (corner_radius)；內凹的轉角 (繞著障礙物的角轉) 本來就離那個角 d。
+#     做法是開運算：離邊界 >= d + r 的區域往外長 r，外凸的角自然變成半徑 r 的圓弧。
+#   * 進圈、出圈各一條斜斜的「匝道」：從離邊界 safe_offset (地頭寬，原地轉身掃不到邊界) 的點
+#     斜著開進這一圈，繞完一圈再斜著開出去。原地轉身只會發生在匝道的兩頭。
+#   * 一圈切成幾段交給 Nav2，段與段之間方向連續，manager 不再原地對正 (見 manager 的 send_next_swath)。
+#   * 每一個位置都檢查整個車身在割草範圍裡 (離邊緣至少 EDGE_MARGIN)；有給 walls (地圖上真的牆) 時，
+#     光達停止區也不能掃到牆 (掃到車子就停，那一段 15 s 後判失敗)。檢查不過的地方那一圈就斷開，
+#     剩下的部分各自進圈出圈，太短就不割。
+# 用點陣算 (跟 TransitPlanner 同一套)，格子細一點。
+
+EDGE_RES = 0.025            # 格子大小 (m)；場地大時放寬，一邊不超過 EDGE_MAX_CELLS 格
+EDGE_MAX_CELLS = 2400
+EDGE_MARGIN = 0.05          # 車身離割草範圍邊緣至少這麼遠
+# 轉角圓弧至少這麼大：太小的弧 DWB 跟不好 (10-21 模擬實跑：半徑 0.5 m 的地方車頭方向落後路線 30° 以上，
+# 有一段 U 形彎卡在彎前面 15 s 判失敗)。1.0 m 在 speed_scale 0.5 時 (0.35 m/s、0.6 rad/s) 不用減速就轉得過去。
+EDGE_MIN_RADIUS = 1.0
+EDGE_STEP = 0.1             # 航點間距 (跟 F2C 一樣)
+EDGE_RAMPS = (2.0, 1.5, 1.0)    # 匝道長度，先試長的 (越長越平緩)
+EDGE_RAMP_MAX_TURN = 0.35   # 匝道旁邊那一段圈的方向最多偏這麼多 (rad)，太彎就換一個起點
+EDGE_SEG = 6.0              # 每一段大約這麼長 (m)
+# 每一段最多轉這麼多 (rad)：DWB 只看前面 2 m 左右的路線，U 形彎整個在同一段裡的話，
+# 它把彎後面那一截當目標，選「原地慢慢轉」不往前開 (10-21 模擬實跑卡住的那一段轉了 188°)
+EDGE_SEG_MAX_TURN = math.radians(120.0)
+EDGE_MIN_PIECE = 2.0        # 斷開之後剩不到這麼長的就不割
+EDGE_SMOOTH = 0.15          # 等高線的鋸齒用前後這麼長平均掉 (m)
+EDGE_MIN_LOOP = 4.0         # 比這個短的圈 (很小的一塊) 不繞
+
+
+def corner_radius(d, front, half_w, margin=EDGE_MARGIN):
+    """離邊界 d 的那一圈，外凸轉角的圓弧至少要多大，車頭角才不會伸出邊界 (a <= 0 回傳 None)。
+
+    車子沿半徑 r 的圓弧走 (圓心 O)，外側的車頭角離 O 是 hypot(r + half_w, front)；
+    開運算保證 O 離邊界至少 r + d。要 hypot(r + half_w, front) <= r + d - margin：
+        r >= (front² - a²) / (2a) - half_w，a = d - margin - half_w。
+    """
+    a = d - margin - half_w
+    if a <= 0:
+        return None
+    return max(0.0, (front * front - a * a) / (2.0 * a) - half_w)
+
+
+# 割草範圍離牆至少這麼遠 (map_to_boundary 把空地往內腐蝕 2 格 = 0.10 m)：沿邊那一圈離牆 = d + 這個值
+EDGE_WALL_GAP = 0.10
+# 地圖上的佔據格連成一塊、長或寬至少這麼大才當牆
+EDGE_WALL_MIN_SIZE = 0.30
+# 車頭方向會偏離路線多少 (rad)：光達停止區在這個範圍裡怎麼轉都不能掃到牆。
+# 10-21 模擬實跑 (speed_scale 0.5)：直的地方 6° 內，轉彎的地方 18°，急彎 (半徑 0.5 m) 35°；
+# 有一個牆角路線上停止區離牆 0.16 m，車頭落後 15° 就掃到牆，車子停住、不能倒車也不能原地轉，整趟停止。
+EDGE_YAW_TOL = math.radians(20.0)
+# 停止區 (轉過 ±EDGE_YAW_TOL 的範圍) 離牆至少這麼遠
+EDGE_ZONE_MARGIN = 0.05
+# 牆邊轉角要這麼大的圓弧才轉得過去的話，那一圈不在牆角轉彎：牆邊斷開，一截一截割 (離牆太近的那幾截不割)
+EDGE_WALL_MAX_RADIUS = 2.5
+
+
+def tolerant_box(front, half_w, tol):
+    """車頭方向往外偏 tol 時，長方形 (前緣 front、半寬 half_w) 外側前角的位置：回傳 (往前, 往外)。
+
+    給 corner_radius 用：偏 tol 的長方形外側前角，當成沒偏的長方形 (front', half_w') 的角。
+    """
+    c, s = math.cos(tol), math.sin(tol)
+    return max(front * c - half_w * s, 0.0), front * s + half_w * c
+
+
+def _swept_samples(x0, x1, half_w, tol, step=0.05):
+    """長方形 (x0..x1, ±half_w) 繞原點轉 -tol..tol 掃過的地方，取樣點落在 step 的格點上 (不重複)。"""
+    box = _box_samples(x0, x1, half_w, step / 2.0)
+    n = max(int(math.ceil(2.0 * tol / math.radians(1.0))), 1)
+    pts = []
+    for a in np.linspace(-tol, tol, n + 1):
+        c, s = math.cos(a), math.sin(a)
+        pts.append(np.column_stack([c * box[:, 0] - s * box[:, 1], s * box[:, 0] + c * box[:, 1]]))
+    q = np.unique(np.round(np.vstack(pts) / step).astype(np.int64), axis=0)
+    return q.astype(float) * step
+
+
+def _wrap(a):
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _resample_closed(pts, step):
+    """閉合折線照弧長重新取樣成等間距 (最後一點不重複第 0 點)。回傳 (點, 周長)。"""
+    p = np.vstack([pts, pts[:1]])
+    seg = np.hypot(*np.diff(p, axis=0).T)
+    s = np.concatenate([[0.0], np.cumsum(seg)])
+    length = float(s[-1])
+    n = max(int(round(length / step)), 3)
+    t = np.arange(n) * (length / n)
+    return np.column_stack([np.interp(t, s, p[:, 0]), np.interp(t, s, p[:, 1])]), length
+
+
+def _smooth_closed(pts, k):
+    """閉合折線的前後各 k 點平均 (把格子的鋸齒抹平)。"""
+    if k <= 0 or len(pts) <= 2 * k + 1:
+        return pts
+    c = np.concatenate([pts[-k:], pts, pts[:k]])
+    ker = np.ones(2 * k + 1) / (2 * k + 1)
+    return np.column_stack([np.convolve(c[:, 0], ker, 'valid'),
+                            np.convolve(c[:, 1], ker, 'valid')])
+
+
+def _headings(pts, closed):
+    """每一點的行進方向 (rad)。"""
+    if closed:
+        d = np.roll(pts, -1, axis=0) - np.roll(pts, 1, axis=0)
+    else:
+        d = np.gradient(pts, axis=0)
+    return np.arctan2(d[:, 1], d[:, 0])
+
+
+def _line(a, b, step):
+    """a 到 b 的直線，間距約 step，含兩端。"""
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    n = max(int(math.ceil(float(np.hypot(*(b - a))) / step)), 1)
+    t = np.linspace(0.0, 1.0, n + 1)[:, None]
+    return a + t * (b - a)
+
+
+def _distance(mask, res):
+    """每一格離最近的 mask 外格子多遠 (公尺)。"""
+    return cv2.distanceTransform(np.asarray(mask).astype(np.uint8), cv2.DIST_L2,
+                                 cv2.DIST_MASK_PRECISE) * np.float32(res)
+
+
+def _box_samples(x0, x1, half_w, step):
+    """長方形 (x0..x1, -half_w..half_w) 裡面的取樣點 (含邊)，間距不超過 step。"""
+    xs = np.linspace(x0, x1, max(int(math.ceil((x1 - x0) / step)), 1) + 1)
+    ys = np.linspace(-half_w, half_w, max(int(math.ceil(2 * half_w / step)), 1) + 1)
+    return np.array([(x, y) for x in xs for y in ys])
+
+
+def segment_route(pts, seg_len=EDGE_SEG, min_gap=1.0, max_turn=EDGE_SEG_MAX_TURN):
+    """把一條沿邊路線切成幾段交給 Nav2：回傳 [(i0, i1)] (含兩端，下一段從上一段的終點開始)。
+
+    每段約 seg_len (最長 1.25 倍)、方向最多轉 max_turn；切點挑附近最直的地方
+    (上一段結束時車頭方向跟下一段的起點差最少，接著走不用原地對正)。
+    每段的起點和終點至少相距 min_gap (起點 = 終點的段落 goal checker 一送出就判到達，
+    見 manager 的不變量 ②)；剩下不到半段的併進前一段。
+    """
+    pts = np.asarray(pts, dtype=float)
+    n = len(pts)
+    if n < 3:
+        return []
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+    yaw = np.unwrap(_headings(pts, False))
+    # 每一點前後 0.5 m 方向差多少：越小越直
+    h = max(int(round(0.5 / max(float(s[-1]) / (n - 1), 1e-6))), 1)
+    lo_i, hi_i = np.clip(np.arange(n) - h, 0, n - 1), np.clip(np.arange(n) + h, 0, n - 1)
+    bend = np.round(np.abs(yaw[hi_i] - yaw[lo_i]) / 0.05)     # 0.05 rad 一級：一樣直的挑最遠的
+
+    def gap(i, j):
+        return float(np.hypot(*(pts[j] - pts[i])))
+
+    out = []
+    i0 = 0
+    while i0 < n - 1:
+        # 這一段最遠可以到哪裡：長度 <= 1.25 seg_len、方向範圍 <= max_turn
+        j = i0 + 1
+        ymin, ymax = min(yaw[i0], yaw[j]), max(yaw[i0], yaw[j])
+        while j < n - 1 and s[j + 1] - s[i0] <= 1.25 * seg_len:
+            y = yaw[j + 1]
+            if max(ymax, y) - min(ymin, y) > max_turn:
+                break
+            ymin, ymax = min(ymin, y), max(ymax, y)
+            j += 1
+        if j >= n - 1:
+            i1 = n - 1
+        else:
+            # 在後半段 (起點往後至少 min_gap) 挑最直的地方切
+            want = s[i0] + max(min_gap, 0.5 * min(seg_len, s[j] - s[i0]))
+            cand = [c for c in range(int(np.searchsorted(s, want)), j + 1) if gap(i0, c) >= min_gap]
+            if cand:
+                cand = np.array(cand)
+                i1 = int(cand[np.lexsort((-cand, bend[cand]))][0])
+            else:
+                i1 = j
+            # 剩下不到半段：這一段直接走到底 (加起來轉太多或太長就不併，剩下的另成一段)
+            if s[-1] - s[i1] < 0.5 * seg_len and np.ptp(yaw[i0:]) <= max_turn \
+                    and s[-1] - s[i0] <= 1.5 * seg_len:
+                i1 = n - 1
+        if i1 - i0 < 2 or gap(i0, i1) < min_gap:
+            if out:                             # 太短或起點離終點太近：併進前一段
+                out[-1] = (out[-1][0], i1)
+                i0 = i1
+                continue
+            more = [k for k in range(i1 + 1, n) if k - i0 >= 2 and gap(i0, k) >= min_gap]
+            if not more:
+                return []                       # 整條都不到 min_gap
+            i1 = more[0]
+        out.append((i0, i1))
+        i0 = i1
+    return out
+
+
+class EdgeLoops:
+    """在割草範圍 (外圈 + 內環) 的地頭裡規劃沿邊繞圈的路線。
+
+    front / rear / half_w：車身 footprint (後輪軸中心往前、往後、往旁邊伸出多少)。
+    walls：(bool 網格, 解析度, origin_x, origin_y)，地圖上真的牆 (光達看得到)；None = 不檢查停止區。
+    stop_len / stop_side：光達停止區 (車頭前緣往前 stop_len、左右比車身各寬 stop_side)。
+    """
+
+    def __init__(self, rings, front, rear, half_w, walls=None, stop_len=0.40, stop_side=0.05):
+        outer = np.asarray(rings[0], dtype=float)
+        lo, hi = outer.min(axis=0), outer.max(axis=0)
+        span = float(max(hi - lo))
+        self.res = res = max(EDGE_RES, span / EDGE_MAX_CELLS)
+        # 四周多留停止區伸得到的距離：範圍外面的牆也要在格子裡
+        pad = float(front) + stop_len + float(half_w) + stop_side
+        self.origin = lo - pad
+        w = int(math.ceil((hi[0] - lo[0] + 2 * pad) / res)) + 1
+        h = int(math.ceil((hi[1] - lo[1] + 2 * pad) / res)) + 1
+
+        def px(ring):
+            p = (np.asarray(ring, dtype=float) - self.origin) / res - 0.5
+            return np.round(p * 16).astype(np.int32).reshape(-1, 1, 2)   # 4 bit 小數 (shift=4)
+
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(mask, [px(rings[0])], 1, lineType=cv2.LINE_8, shift=4)
+        for hole in rings[1:]:
+            if len(hole) >= 3:
+                cv2.fillPoly(mask, [px(hole)], 0, lineType=cv2.LINE_8, shift=4)
+        self.dist = _distance(mask, res)
+        self.front, self.rear, self.half_w = float(front), float(rear), float(half_w)
+        # 車身裡面的取樣點 (base_footprint 座標)：內部也取，比車身小的障礙物才不會漏掉
+        self._body = _box_samples(-self.rear, self.front, self.half_w, 0.1)
+        self.wall = None
+        self._zone = None
+        if walls is not None:
+            grid, wres, wox, woy = walls
+            cx = self.origin[0] + (np.arange(w) + 0.5) * res
+            cy = self.origin[1] + (np.arange(h) + 0.5) * res
+            cu = np.floor((cx - wox) / wres).astype(np.int64)
+            cv_ = np.floor((cy - woy) / wres).astype(np.int64)
+            ok_u = (cu >= 0) & (cu < grid.shape[1])
+            ok_v = (cv_ >= 0) & (cv_ < grid.shape[0])
+            wall = np.zeros((h, w), bool)
+            if ok_u.any() and ok_v.any():
+                wall[np.ix_(ok_v, ok_u)] = grid[np.ix_(cv_[ok_v], cu[ok_u])]
+            # 零星的小點 (雜訊、細桌腳) 不當牆：割草範圍本來也不理它們 (map_to_boundary 的 MIN_OBSTACLE_AREA)，
+            # 割草線一樣會從旁邊經過；拿它們當牆的話沿邊那一圈會被推得很遠。
+            n, lab, stats, _c = cv2.connectedComponentsWithStats(
+                wall.astype(np.uint8), connectivity=8)
+            size = np.maximum(stats[:, cv2.CC_STAT_WIDTH], stats[:, cv2.CC_STAT_HEIGHT]) * res
+            big = size >= EDGE_WALL_MIN_SIZE
+            big[0] = False                     # 第 0 塊是背景
+            wall = big[lab]
+            self.wall = wall
+            zw = self.half_w + stop_side
+            # 停止區在車頭方向偏 ±EDGE_YAW_TOL 的範圍裡掃過的地方 (DWB 跟路線會有方向誤差)
+            self._zone = _swept_samples(self.front, self.front + stop_len, zw, EDGE_YAW_TOL)
+            # 離牆多遠 (轉角的圓弧要讓停止區掃不到牆，見 loops)；停止區要離牆 EDGE_ZONE_MARGIN 以上
+            self.wall_dist = _distance(~wall, res)
+            self._wall_near = self.wall_dist <= EDGE_ZONE_MARGIN + 0.5 * res
+            self.zone_front, self.zone_half = self.front + stop_len, zw
+
+    # ---- 查格子 ----
+    def _cells(self, xy):
+        g = np.floor((np.asarray(xy, dtype=float) - self.origin) / self.res).astype(np.int64)
+        h, w = self.dist.shape
+        inside = (g[..., 0] >= 0) & (g[..., 0] < w) & (g[..., 1] >= 0) & (g[..., 1] < h)
+        return g, inside
+
+    def clearance_at(self, xy):
+        """每一點離割草範圍邊緣多遠 (範圍外 = 0)。xy: (..., 2)。"""
+        g, inside = self._cells(xy)
+        out = np.zeros(inside.shape, np.float32)
+        out[inside] = self.dist[g[inside][:, 1], g[inside][:, 0]]
+        return out
+
+    def _sample(self, pts, yaw, local):
+        c, s = np.cos(yaw)[:, None], np.sin(yaw)[:, None]
+        x = pts[:, 0:1] + c * local[None, :, 0] - s * local[None, :, 1]
+        y = pts[:, 1:2] + s * local[None, :, 0] + c * local[None, :, 1]
+        return np.stack([x, y], axis=-1)
+
+    def poses_ok(self, pts, yaw, margin=EDGE_MARGIN):
+        """每一個位姿 (pts[i], yaw[i]) 車身是不是都在範圍裡 (離邊緣 >= margin)，停止區有沒有掃到牆
+        (車頭方向偏 ±EDGE_YAW_TOL 都算，離牆 EDGE_ZONE_MARGIN 以內就算掃到)。"""
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        yaw = np.asarray(yaw, dtype=float).reshape(-1)
+        if len(pts) == 0:
+            return np.zeros(0, bool)
+        ok = self.clearance_at(self._sample(pts, yaw, self._body)).min(axis=1) >= margin
+        if self.wall is not None:
+            g, inside = self._cells(self._sample(pts, yaw, self._zone))
+            hit = np.zeros(inside.shape, bool)
+            hit[inside] = self._wall_near[g[inside][:, 1], g[inside][:, 0]]
+            ok &= ~hit.any(axis=1)
+        return ok
+
+    # ---- 一圈 ----
+    def loops(self, d):
+        """離邊界 d 的那幾圈 (每一塊、每一個內環各一圈)，每圈是等間距的閉合折線，割草範圍在行進方向的左邊。"""
+        r = corner_radius(d, self.front, self.half_w)
+        if r is None:
+            return []
+        region = self._opened(self.dist, d, max(r, EDGE_MIN_RADIUS))
+        if self.wall is not None:
+            # 地圖上真的牆：光達停止區 (車頭前 stop_len、左右各寬 stop_side) 在轉角也不能掃到牆，
+            # 牆邊的轉角圓弧要更大。離牆的距離是 d + EDGE_WALL_GAP (割草範圍本來就離牆這麼遠)。
+            # 車頭方向偏 EDGE_YAW_TOL (轉彎時落後) 也不能掃到：當成比較大的停止區算圓弧。
+            # 圓弧大到 EDGE_WALL_MAX_RADIUS 以上 (或怎麼轉都不行) 就不在牆角轉彎，
+            # 留給 routes 的檢查把這一圈在牆邊斷開 (離牆太近的那幾截不割)。
+            dw = d + EDGE_WALL_GAP
+            zf, zh = tolerant_box(self.zone_front, self.zone_half, EDGE_YAW_TOL)
+            rw = corner_radius(dw, zf, zh, margin=EDGE_ZONE_MARGIN)
+            if rw is not None and rw <= EDGE_WALL_MAX_RADIUS:
+                region &= self._opened(self.wall_dist, dw, max(rw, EDGE_MIN_RADIUS))
+                # 兩種邊界交會的地方會有尖角：再用最小的圓弧修圓
+                region = self._opened(_distance(region, self.res), 0.0, EDGE_MIN_RADIUS)
+        if not region.any():
+            return []
+        contours, hier = cv2.findContours(
+            region.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+        out = []
+        k = int(round(EDGE_SMOOTH / self.res))
+        for ci, c in enumerate(contours):
+            if len(c) < 8:
+                continue
+            pts = self.origin + (c.reshape(-1, 2).astype(float) + 0.5) * self.res
+            pts, _l = _resample_closed(pts, self.res)
+            pts = _smooth_closed(pts, k)
+            pts, length = _resample_closed(pts, EDGE_STEP)
+            if length < EDGE_MIN_LOOP:
+                continue
+            nx = np.roll(pts, -1, axis=0)
+            area = 0.5 * float(np.sum(pts[:, 0] * nx[:, 1] - nx[:, 0] * pts[:, 1]))
+            outer = hier is None or hier[0][ci][3] == -1
+            if (area > 0) != outer:          # 外圈逆時針、內環順時針：割草範圍都在左邊
+                pts = pts[::-1].copy()
+            out.append(pts)
+        return out
+
+    def _opened(self, dist, d, r):
+        """離邊界 >= d 的區域做半徑 r 的開運算 (外凸的角變成半徑 r 的圓弧，窄於 2r 的地方去掉)。"""
+        core = dist >= d + r
+        if not core.any():
+            return np.zeros(dist.shape, bool)
+        return _distance(~core, self.res) <= r
+
+    def _ramp(self, p, yaw, off, length, entry, rot_need):
+        """匝道：entry 時從 q 斜斜開到 p，否則從 p 斜斜開到 q。q 在 p 的後方 (或前方) length、往裡面 off。
+
+        q 要能原地轉身 (離邊緣 >= rot_need)，整條匝道車身都要在範圍裡。不行回傳 None。
+        回傳不含 p 的那些點 (entry：q ... p 之前；exit：p 之後 ... q)。
+        """
+        t = np.array([math.cos(yaw), math.sin(yaw)])
+        n_in = np.array([-t[1], t[0]])
+        q = p + (-length if entry else length) * t + off * n_in
+        if float(self.clearance_at(q)) < rot_need:
+            return None
+        line = _line(q, p, EDGE_STEP) if entry else _line(p, q, EDGE_STEP)
+        hd = math.atan2(*(line[-1] - line[0])[::-1])
+        if not self.poses_ok(line, np.full(len(line), hd)).all():
+            return None
+        return line[:-1] if entry else line[1:]
+
+    def _straightness(self, pts, yaw, closed, half):
+        """每一點前後 half 個點之內，方向最多偏離這一點多少 (rad)。開放折線兩端以外當成無限大。"""
+        n = len(pts)
+        dev = np.zeros(n)
+        idx = np.arange(n)
+        for k in range(-half, half + 1):
+            j = idx + k
+            if closed:
+                j %= n
+                dev = np.maximum(dev, np.abs(_wrap(yaw[j] - yaw)))
+            else:
+                valid = (j >= 0) & (j < n)
+                jj = np.clip(j, 0, n - 1)
+                dev = np.maximum(dev, np.where(valid, np.abs(_wrap(yaw[jj] - yaw)), np.inf))
+        return dev
+
+    def _full_loop(self, loop, yaw, off, rot_need):
+        """整圈都走得過去：挑直的地方當起點 (進出匝道都放得下)。回傳路線或 None。"""
+        for length in EDGE_RAMPS:
+            half = int(round(length / EDGE_STEP))
+            dev = self._straightness(loop, yaw, True, half)
+            for i in np.argsort(dev, kind='stable')[:60]:
+                if dev[i] > EDGE_RAMP_MAX_TURN:
+                    break
+                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need)
+                if rin is None:
+                    continue
+                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need)
+                if rout is None:
+                    continue
+                body = np.vstack([loop[i:], loop[:i], loop[i:i + 1]])
+                return np.vstack([rin, body, rout]), len(rin), len(rout)
+        return None
+
+    def _open_piece(self, pts, yaw, off, rot_need):
+        """斷開的一段 (開放折線)：從前面找得到進圈匝道的第一點、從後面找得到出圈匝道的最後一點。"""
+        n = len(pts)
+        need = int(round(EDGE_MIN_PIECE / EDGE_STEP))
+        for length in EDGE_RAMPS:
+            half = int(round(length / EDGE_STEP))
+            dev = self._straightness(pts, yaw, False, half)
+            start = None
+            for i in range(0, n - need):
+                if dev[i] <= EDGE_RAMP_MAX_TURN:
+                    rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need)
+                    if rin is not None:
+                        start = (i, rin)
+                        break
+            if start is None:
+                continue
+            for j in range(n - 1, start[0] + need - 1, -1):
+                if dev[j] <= EDGE_RAMP_MAX_TURN:
+                    rout = self._ramp(pts[j], yaw[j], off, length, False, rot_need)
+                    if rout is not None:
+                        i, rin = start
+                        return np.vstack([rin, pts[i:j + 1], rout]), len(rin), len(rout)
+        return None
+
+    def routes(self, offsets, safe_offset, rot_need):
+        """每一個離邊界距離 d 的每一圈的路線：[{'d', 'pts' (M, 2), 'ramp_in', 'ramp_out', 'full', 'length'}]。
+
+        safe_offset：匝道從離邊界這麼遠的地方開始 (地頭寬)；rot_need：匝道兩頭要能原地轉身的淨空。
+        """
+        out = []
+        for d in offsets:
+            off = max(0.0, float(safe_offset) - float(d))
+            for loop in self.loops(d):
+                yaw = _headings(loop, True)
+                ok = self.poses_ok(loop, yaw)
+                got = []
+                if ok.all():
+                    r = self._full_loop(loop, yaw, off, rot_need)
+                    if r is not None:
+                        got.append((r, True))
+                else:
+                    # 走不過去的地方斷開：一段一段 (環狀) 各自進出
+                    n = len(loop)
+                    if ok.any():
+                        first = int(np.argmin(ok))           # 從一個走不過去的點後面開始數
+                        order = (np.arange(n) + first) % n
+                        run = []
+                        for i in list(order) + [order[0]]:
+                            if ok[i]:
+                                run.append(i)
+                                continue
+                            if len(run) * EDGE_STEP >= EDGE_MIN_PIECE:
+                                piece = loop[run]
+                                r = self._open_piece(piece, _headings(piece, False), off, rot_need)
+                                if r is not None:
+                                    got.append((r, False))
+                            run = []
+                for (pts, nin, nout), full in got:
+                    length = float(np.sum(np.hypot(*np.diff(pts, axis=0).T)))
+                    out.append({'d': float(d), 'pts': pts, 'ramp_in': nin, 'ramp_out': nout,
+                                'full': full, 'length': length})
+        return out
+
+    def rotation_ok(self, xy, yaw0, yaw1, step=math.radians(5.0)):
+        """在 xy 原地從 yaw0 轉到 yaw1 (走比較短的那一邊)，整個過程車身都在範圍裡嗎。"""
+        dy = _wrap(yaw1 - yaw0)
+        n = max(int(math.ceil(abs(dy) / step)), 1)
+        yaws = yaw0 + dy * np.linspace(0.0, 1.0, n + 1)
+        pts = np.repeat(np.asarray(xy, float).reshape(1, 2), len(yaws), axis=0)
+        return bool(self.poses_ok(pts, yaws).all())
+
+    def escape(self, xy, yaw, rot_need, max_len=3.0):
+        """沿邊那一段失敗、車子停在離邊很近的地方時，往前斜斜開回能原地轉身的地方。
+
+        方向試 yaw 偏 0、±10、±20、±30 度 (先試偏得少的)：原地轉到那個方向的過程、
+        往前開的整條直線，車身都要在範圍裡；開到離邊緣 >= rot_need 就停 (最多 max_len)。
+        回傳 (直線的點, 方向)，找不到回傳 None。
+        """
+        p = np.asarray(xy, dtype=float)
+        for deg in (0, 10, -10, 20, -20, 30, -30):
+            hd = yaw + math.radians(deg)
+            line = _line(p, p + max_len * np.array([math.cos(hd), math.sin(hd)]), EDGE_STEP)
+            reach = np.flatnonzero(self.clearance_at(line) >= rot_need)
+            if len(reach) == 0:
+                continue
+            line = line[:max(int(reach[0]), 2) + 1]
+            if not self.rotation_ok(p, yaw, hd):
+                continue
+            if self.poses_ok(line[1:], np.full(len(line) - 1, hd)).all():
+                return line, hd
+        return None

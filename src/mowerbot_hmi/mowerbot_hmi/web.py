@@ -28,6 +28,7 @@ N150 開機就由 systemd 啟動 (mowerbot-hmi.service)。Mac 或手機連上 mo
 """
 
 import argparse
+import base64
 import collections
 import ipaddress
 import json
@@ -53,7 +54,9 @@ from rclpy.qos import (QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy,
 from rclpy.time import Time
 
 import tf2_ros
-from geometry_msgs.msg import PolygonStamped, Twist
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
+from geometry_msgs.msg import PolygonStamped, PoseWithCovarianceStamped, Twist
 from nav2_msgs.action import FollowPath
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from sensor_msgs.msg import Joy, LaserScan
@@ -95,9 +98,37 @@ RUN_BRINGUP_RE = re.compile(r'run_bringup\.sh\s+(\S+)\s+(\S+)(?:\s+(\S+))?')
 
 # 存一次地圖最多等多久 (map_autosave 的 timeout 是 120 s)；超過就當作存完了，免得一直擋住自動割草
 SAVE_MAX = 130.0
-# 草地邊界：開回起點多近才能「完成」(跟 lawn_boundary.MAX_CLOSE_GAP_M 一樣)
+# 外框 (草地邊界，boundary_recorder)：開回起點多近才能「結束」(跟 lawn_boundary.MAX_CLOSE_GAP_M 一樣)。
+# 2026-10-21 起網頁叫它「外框」(will 的說法)：建圖中按開始、沿邊開一圈、按結束，走過的線就是割草範圍的外框。
 LAWN_CLOSE_GAP = 1.0
-LAWN_WHAT = {'start': '開始記錄草地邊界', 'stop': '草地邊界完成', 'cancel': '放棄記錄草地邊界', 'clear': '清除草地邊界'}
+LAWN_WHAT = {'start': '開始圈外框', 'stop': '外框圈好了', 'cancel': '放棄這次圈外框', 'clear': '清除外框'}
+
+# 網頁改速度 (2026-10-21 will)。跟 car-start 的「速度上限」是同一個比例 (speed_scale)：手把和 Nav2 都乘它。
+# 執行中改，重開車上程式就回到 car-start 的值 (0.25)。0.5 要先量過煞車距離 (實車還沒量)。
+SPEED_CHOICES = (0.10, 0.15, 0.25, 0.35, 0.50)
+# Nav2 跟著 speed_scale 降的鍵 (navigation.launch.py 的 SPEED_SCALED_KEYS)。AlignController (原地對正)
+# 啟動時從 FollowPath 繼承縮放過的值，max_vel_x 固定 0 (只能原地轉)，所以它只改另外兩個。
+NAV_SPEED_KEYS = ('max_vel_x', 'max_speed_xy', 'max_vel_theta')
+NAV_SPEED_FULL = {'max_vel_x': 0.7, 'max_speed_xy': 0.7, 'max_vel_theta': 1.2}     # 讀不到 nav2_params.yaml 時用
+SPEED_READ_PERIOD = 2.0
+
+# 網頁畫禁區 (2026-10-21 will)：總覽地圖上點幾個角圍一塊，或下載地圖圖片用紅筆畫好再上傳。
+# 寫到 keepout_server 讀的 active.yaml (跟 keepout_tool apply 同一個檔)，再叫它載入。
+KEEPOUT_DIR = os.path.expanduser('~/.ros/mowerbot_keepout')
+KEEPOUT_MAX_POINTS = 200
+KEEPOUT_UPLOAD_MAX = 12 * 1024 * 1024           # base64 之後；圖片本身約 9 MB
+KEEPOUT_TEMPLATES = 5                           # 記住最近幾張下載的地圖圖片 (上傳時對尺寸、原點)
+# 跟 save_map.sh (map_saver) 存的 .pgm 一樣的灰階，keepout_tool template 給的圖也是這樣
+PGM_FREE, PGM_OCC, PGM_UNKNOWN = 254, 0, 205
+
+# 用存好的地圖開機 (2026-10-21 will：不要每次重開都重新建圖)，見 mowerbot_action/map_session.py。
+# 開始的時候選「建新地圖」或「用存好的地圖」(car-start map <名稱>)；網頁列出最近幾張存好的地圖。
+SAVED_MAPS_SHOWN = 8
+SAVED_MAPS_PERIOD = 5.0
+# /map_session/match 多久沒更新就當作不知道 (它每秒發一次)
+LOC_TIMEOUT = 3.0
+# 「設定車子位置」：車子要停著 (速度小於這些) 才能換位置
+LOCATE_MAX_V, LOCATE_MAX_W = 0.02, 0.03
 
 # 「診斷」頁看的程式，跟它在做什麼
 NODES = [
@@ -105,7 +136,7 @@ NODES = [
     ('/joy_node', '手把接收'), ('/lidar', '光達'), ('/slam_toolbox', '建圖與定位'),
     ('/controller_server', '導航'), ('/collision_monitor', '停止區'), ('/f2c_server', '割草路線'),
     ('/map_to_boundary', '割草範圍'), ('/keepout_server', '禁區'), ('/map_autosave', '存地圖'),
-    ('/boundary_recorder', '草地邊界'),
+    ('/boundary_recorder', '外框 (草地邊界)'), ('/map_session', '地圖與定位'),
 ]
 # 「診斷」頁的資料更新率 (話題, 下限 Hz)
 TOPICS = [('/scan', 8.0), ('/odom', 10.0), ('/joy', 10.0), ('/joy_status', 3.0),
@@ -283,11 +314,27 @@ class HmiWeb(Node):
         self.rec_pts = None                             # 正在記錄的軌跡
         self.rec_len = 0.0
         self.rec_ver = 0
+        # 沿邊多繞幾圈的路線 (/edge_path，2026-10-21)：manager 跟 /f2c_path 分開發
+        self.edge_pts = None
+        self.edge_ver = 0
+        # 速度上限：手把 (teleop 的 speed_scale) 與 Nav2 (FollowPath.max_vel_x / 滿速) 各讀一次，兩個應該一樣
+        self.speed = {'joy': None, 'nav': None}
+        self._speed_t = 0.0
+        # 禁區：統計 (塊數、面積) 跟著 /keepout_mask 算；undo = 上一次套用前的禁區
+        self.keepout_info = {'zones': 0, 'area': 0.0}
+        self._ko_undo = None
+        self._templates = collections.OrderedDict()
+        # 這次用哪張地圖 (/map_session/info) 與定位對上了沒 (/map_session/match)
+        self.map_info = None
+        self.loc = None
+        self.saved_maps = []
+        self._maps_t = -SAVED_MAPS_PERIOD
 
         # ---- 送給網頁的 ----
         self.frame = {}
         self.heavy = {'alarms': ([], 0), 'events': ([], 0), 'route': (None, 0),
-                      'boundary': (None, 0), 'trail': (None, 0), 'lawn': (None, 0), 'rec': (None, 0)}
+                      'boundary': (None, 0), 'trail': (None, 0), 'lawn': (None, 0), 'rec': (None, 0),
+                      'edge': (None, 0)}
         self.map_png = None
         self.map_meta = {'ready': False, 'ver': 0}
         self.map_ver = 0
@@ -332,6 +379,15 @@ class HmiWeb(Node):
         self.save_cli = self.create_client(Trigger, '/map_autosave/save')
         self.lawn_cli = {k: self.create_client(Trigger, '/boundary_recorder/' + k) for k in LAWN_WHAT}
         self.nav_ac = ActionClient(self, FollowPath, 'follow_path')
+        self.nav_full = self._nav_full()
+        self.par_cli = {
+            'joy_get': self.create_client(GetParameters, '/mower_teleop/get_parameters'),
+            'joy_set': self.create_client(SetParameters, '/mower_teleop/set_parameters'),
+            'nav_get': self.create_client(GetParameters, '/controller_server/get_parameters'),
+            'nav_set': self.create_client(SetParameters, '/controller_server/set_parameters'),
+        }
+        self.ko_cli = {k: self.create_client(Trigger, '/keepout_server/' + k) for k in ('session', 'load', 'clear')}
+        self.locate_pub = self.create_publisher(PoseWithCovarianceStamped, '/map_session/locate_request', 10)
         self._save_future = None
         # 存地圖中 (單調時間，沒在存是 None)。網頁按的、手把 Y 按的都算。
         # 存圖的時候 slam_toolbox 很忙，map -> odom 會斷一下；這時候 Nav2 在跑的話會把這一段判失敗
@@ -353,6 +409,7 @@ class HmiWeb(Node):
         sub(OccupancyGrid, '/map', self._on_map, LATCHED)
         sub(OccupancyGrid, '/keepout_mask', self._on_keepout, LATCHED)
         sub(Path, '/f2c_path', self._on_path, QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
+        sub(Path, '/edge_path', self._on_edge, QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
         sub(PolygonStamped, '/f2c_boundary', self._on_boundary, 10)
         sub(Bool, '/slam_scan_gate/active', self._on_mapping, LATCHED)
         sub(String, '/map_autosave/last', self._on_save, LATCHED)
@@ -361,6 +418,8 @@ class HmiWeb(Node):
         sub(Bool, '/boundary_recorder/recording', self._on_rec, LATCHED)
         sub(Path, '/boundary_recorder/track', self._on_track, 10)
         sub(PolygonStamped, '/polygon_stop', self._on_zone, qos_profile_sensor_data)
+        sub(String, '/map_session/info', self._on_map_info, LATCHED)
+        sub(String, '/map_session/match', self._on_loc, LATCHED)
 
         self.vehicle = self._vehicle()
         self.alarms.on_raise = lambda p, text: self.log('系統', ('警報 %d：' % p) + text)
@@ -442,8 +501,16 @@ class HmiWeb(Node):
         self.t['/map'] = self._mono()
 
     def _on_keepout(self, msg):
+        keep = msg if msg.header.frame_id == 'map' and msg.info.width > 1 else None
+        info = {'zones': 0, 'area': 0.0}
+        if keep is not None:
+            g = (np.asarray(keep.data, dtype=np.int8).reshape(keep.info.height, keep.info.width) > OCC_THRESHOLD)
+            if g.any():
+                n, _lab = cv2.connectedComponents(g.astype(np.uint8), connectivity=8)
+                info = {'zones': n - 1, 'area': round(float(g.sum()) * keep.info.resolution ** 2, 1)}
         with self._lock:
-            self.keepout_msg = msg if msg.header.frame_id == 'map' else None
+            self.keepout_msg = keep
+            self.keepout_info = info
             self.map_dirty = True
 
     def _on_path(self, msg):
@@ -453,6 +520,12 @@ class HmiWeb(Node):
             self.route_boundary = self.boundary_pts if pts else None
             self.route_ver += 1
 
+    def _on_edge(self, msg):
+        pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        with self._lock:
+            self.edge_pts = decimate(pts, 0.05) if pts else None
+            self.edge_ver += 1
+
     def _on_boundary(self, msg):
         pts = [[round(p.x, 3), round(p.y, 3)] for p in msg.polygon.points]
         with self._lock:
@@ -461,6 +534,48 @@ class HmiWeb(Node):
 
     def _on_mapping(self, msg):
         self.mapping = bool(msg.data)
+
+    def _on_map_info(self, msg):
+        try:
+            self.map_info = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _on_loc(self, msg):
+        try:
+            self.loc = json.loads(msg.data)
+        except ValueError:
+            return
+        self._tick_rate('/map_session/match')
+
+    def localization(self):
+        """用存好的地圖開的 (slam_toolbox 定位模式)。"""
+        return bool(self.map_info and self.map_info.get('mode') == 'localization')
+
+    def map_active(self):
+        """有地圖可以用：建圖開始了，或是用存好的地圖。"""
+        return self.mapping or self.localization()
+
+    def loc_state(self):
+        """定位的狀態給網頁：建新地圖或還沒開 = None。"""
+        if not self.localization():
+            return None
+        d = self.loc if (self.loc is not None and self.fresh('/map_session/match', LOC_TIMEOUT)) else None
+        if d is None:
+            return {'state': 'waiting', 'ok': False, 'score': None, 'text': '等定位的回報 (map_session)'}
+        return {'state': d.get('state'), 'ok': bool(d.get('ok')), 'score': d.get('score'), 'text': d.get('text', '')}
+
+    def read_saved_maps(self):
+        from mowerbot_action import map_session
+        try:
+            maps = map_session.list_saved_maps(map_session.default_maps_dir(), SAVED_MAPS_SHOWN)
+        except Exception as exc:
+            self.get_logger().warn('讀不到存好的地圖：%r' % exc, throttle_duration_sec=60.0)
+            maps = []
+        out = [{'name': m['name'], 'when': time.strftime('%m-%d %H:%M', time.localtime(m['mtime'])),
+                'keepout': m['keepout'], 'lawn': m['lawn']} for m in maps]
+        with self._lock:
+            self.saved_maps = out
 
     def _on_save(self, msg):
         self.last_save = msg.data
@@ -497,6 +612,19 @@ class HmiWeb(Node):
     def _on_zone(self, msg):
         if msg.header.frame_id in ('base_footprint', 'base_link') and len(msg.polygon.points) >= 3:
             self.zone_poly = [(p.x, p.y) for p in msg.polygon.points]
+
+    def _nav_full(self):
+        """FollowPath 滿速 (speed_scale = 1) 的上限：讀 navigation.launch.py 用的同一份 nav2_params.yaml。"""
+        try:
+            import yaml
+            from ament_index_python.packages import get_package_share_directory
+            path = os.path.join(get_package_share_directory('mowerbot_bringup'), 'config', 'nav2_params.yaml')
+            with open(path, encoding='utf-8') as f:
+                fp = yaml.safe_load(f)['controller_server']['ros__parameters']['FollowPath']
+            return {k: float(fp[k]) for k in NAV_SPEED_KEYS}
+        except Exception as exc:
+            self.get_logger().warn('讀不到 nav2_params.yaml 的 FollowPath 速度，用預設值：%s' % exc)
+            return dict(NAV_SPEED_FULL)
 
     def _vehicle(self):
         v = {'front': 0.975, 'rear': 0.155, 'half': 0.42, 'bladeX': 0.375, 'bladeR': 0.25, 'lidarX': 0.30,
@@ -551,6 +679,12 @@ class HmiWeb(Node):
         if mono - self._nodes_t >= 2.0:
             self._nodes_t = mono
             self.read_nodes()
+        if mono - self._speed_t >= SPEED_READ_PERIOD:
+            self._speed_t = mono
+            self.read_speed()
+        if mono - self._maps_t >= SAVED_MAPS_PERIOD:
+            self._maps_t = mono
+            self.read_saved_maps()
 
         running = self.prog['running']
         manager_ok = running and self.mower is not None and self.fresh('/mower_status', MOWER_STATUS_TIMEOUT)
@@ -600,7 +734,8 @@ class HmiWeb(Node):
                 self.trail_ver += 1
 
         block = self.block_reason(mode, state, message, joy_ok, latched, zone_blocked)
-        self.update_alarms(running, manager_ok, mode, state, message, joy_ok, latched, scan_ok, zone_blocked, executing)
+        loc = self.loc_state() if running else None
+        self.update_alarms(running, manager_ok, mode, state, message, joy_ok, latched, scan_ok, zone_blocked, executing, loc)
         self.update_events(mode, state, ms)
         if self.map_dirty:
             self.render_map()
@@ -613,6 +748,9 @@ class HmiWeb(Node):
         mm = re.search(r'已存 (\S+)', self.last_save or '')
         if mm:
             save_name = os.path.basename(mm.group(1))
+        info = self.map_info if running else None
+        if info and info.get('mode') == 'localization':
+            save_name = info.get('name') or save_name
 
         nav_ready = False
         if running:
@@ -655,9 +793,15 @@ class HmiWeb(Node):
                 'zone': {'n': zone_n, 'blocked': zone_blocked},
                 'pose': pose,
                 'vel': {'v': round(vx, 3), 'w': round(wz, 3), 'nav': round(nav, 3), 'out': round(out, 3)},
-                'map': dict(self.map_meta, ready=bool(running and self.mapping and self.map_meta.get('ver')), name=save_name),
+                'map': dict(self.map_meta, name=save_name,
+                            ready=bool(running and self.map_active() and self.map_meta.get('ver'))),
+                'mapsrc': {'mode': info.get('mode') if info else None, 'name': info.get('name', '') if info else '',
+                           'start': info.get('start', '') if info else '', 'loc': loc},
+                'maps': self.saved_maps,
                 'saving': self.saving_since is not None,
                 'lawn': lawn,
+                'speed': dict(self.speed, choices=list(SPEED_CHOICES)),
+                'keepout': dict(self.keepout_info, undo=self._ko_undo is not None),
                 'geo': {'scan': scan_flat},
                 'vehicle': self.vehicle,
                 'diag': {
@@ -674,6 +818,7 @@ class HmiWeb(Node):
                 'trail': ([s for s in self.trail if len(s) > 1] or None, self.trail_ver),
                 'lawn': (self.lawn_pts, self.lawn_ver),
                 'rec': (self.rec_pts if self.rec_on else None, self.rec_ver),
+                'edge': (self.edge_pts, self.edge_ver),
             }
             self.release_stale_holder()
 
@@ -739,7 +884,8 @@ class HmiWeb(Node):
                     'hint': '東西拿走就會接著走。停超過 15 秒這一段會跳過。'}
         return None
 
-    def update_alarms(self, running, manager_ok, mode, state, message, joy_ok, latched, scan_ok, zone_blocked, executing):
+    def update_alarms(self, running, manager_ok, mode, state, message, joy_ok, latched, scan_ok, zone_blocked, executing,
+                      loc=None):
         A = self.alarms
         mono = self._mono()
         grace = self.prog_seen_up is not None and mono - self.prog_seen_up < STARTUP_GRACE
@@ -752,6 +898,11 @@ class HmiWeb(Node):
               '光達沒有資料' + ('，車子停在原地' if auto else '：停止區沒有作用，自動割草也不會出發'))
         A.set('zone', executing and zone_blocked, 2, '前方停止區有東西，車子暫停')
         A.set('manager', running and not grace and not manager_ok, 1, 'mower_manager 沒有回應')
+        # 用存好的地圖：對不上 = 自動割草不會出發；割草中變差 = 車子照走 (不停車)，要人看著
+        A.set('loclost', running and not grace and loc is not None and loc['state'] == 'lost', 2,
+              '定位對不上存好的地圖：在總覽的地圖上按「設定車子位置」點出車子在哪')
+        A.set('locweak', executing and loc is not None and loc['state'] == 'ok' and not loc['ok'], 2,
+              '割草中定位變差（%s）：看車子有沒有走偏，偏了就按停止' % (loc or {}).get('text', ''))
         temp = self._sys.get('temp')
         A.set('temp', temp is not None and temp >= 85.0, 2, 'N150 溫度 %.0f °C' % (temp or 0))
         A.set('disk', 0 < self._sys.get('disk', 99) < 3.0, 2, 'SSD 只剩 %.1f GB' % self._sys.get('disk', 0))
@@ -867,6 +1018,12 @@ class HmiWeb(Node):
                 self.trail_ver += 1
                 self.path_pts = None
                 self.route_ver += 1
+                self.edge_pts = None
+                self.edge_ver += 1
+                self.speed = {'joy': None, 'nav': None}
+                self._ko_undo = None
+                self._templates.clear()
+                self.keepout_info = {'zones': 0, 'area': 0.0}
                 self.boundary_pts = None
                 self.route_boundary = None
                 self.lawn_pts = None
@@ -877,6 +1034,8 @@ class HmiWeb(Node):
                 self.map_msg = None
                 self.keepout_msg = None
                 self.map_meta = {'ready': False, 'ver': 0}
+                self.map_info = None
+                self.loc = None
                 self.mission = None
                 self.mower = None
                 if self.expect_down:
@@ -938,6 +1097,251 @@ class HmiWeb(Node):
             names = set()
         up = self.prog['running']
         self._nodes = [{'name': n, 'what': what, 'ok': up and n in names} for n, what in NODES]
+
+    # ------------------------------------------------------------------
+    # 速度上限 (網頁可以改)
+    # ------------------------------------------------------------------
+    def read_speed(self):
+        """非同步讀手把與 Nav2 現在的速度上限 (別的地方改的也看得到，例如 ros2 param set)。"""
+        if not self.prog['running']:
+            return
+        cli = self.par_cli['joy_get']
+        if cli.service_is_ready():
+            cli.call_async(GetParameters.Request(names=['speed_scale'])).add_done_callback(
+                lambda f: self._on_speed('joy', f, 1.0))
+        cli = self.par_cli['nav_get']
+        if cli.service_is_ready():
+            cli.call_async(GetParameters.Request(names=['FollowPath.max_vel_x'])).add_done_callback(
+                lambda f: self._on_speed('nav', f, self.nav_full['max_vel_x']))
+
+    def _on_speed(self, key, fut, full):
+        try:
+            v = fut.result().values[0]
+        except Exception:
+            return
+        if v.type == ParameterType.PARAMETER_DOUBLE:
+            val = v.double_value
+        elif v.type == ParameterType.PARAMETER_INTEGER:
+            val = float(v.integer_value)
+        else:
+            val = None
+        with self._lock:
+            self.speed[key] = round(val / full, 3) if val is not None else None
+
+    @staticmethod
+    def _double(name, value):
+        return Parameter(name=name, value=ParameterValue(type=ParameterType.PARAMETER_DOUBLE, double_value=float(value)))
+
+    def set_speed(self, scale, who):
+        """手把 (teleop 的 speed_scale) 和 Nav2 (FollowPath / AlignController 的上限) 一起改。
+
+        Nav2 沒在跑 (car-start planonly) 就只改手把。兩邊都要成功才算成功，失敗的那邊寫在回覆裡。
+        """
+        errs = []
+        nav = None
+        if self.par_cli['nav_set'].wait_for_service(timeout_sec=1.0):
+            params = [self._double('FollowPath.' + k, round(self.nav_full[k] * scale, 4)) for k in NAV_SPEED_KEYS]
+            params += [self._double('AlignController.' + k, round(self.nav_full[k] * scale, 4))
+                       for k in NAV_SPEED_KEYS if k != 'max_vel_x']
+            res, err = self.call(self.par_cli['nav_set'], SetParameters.Request(parameters=params))
+            if res is None:
+                errs.append('導航：' + err)
+            else:
+                bad = [r.reason for r in res.results if not r.successful]
+                if bad:
+                    errs.append('導航不接受：' + '；'.join(bad))
+                else:
+                    nav = scale
+        res, err = self.call(self.par_cli['joy_set'],
+                             SetParameters.Request(parameters=[self._double('speed_scale', scale)]))
+        if res is None:
+            errs.append('手把：' + err)
+        elif not res.results[0].successful:
+            errs.append('手把不接受：' + res.results[0].reason)
+        else:
+            with self._lock:
+                self.speed['joy'] = scale
+        with self._lock:
+            if nav is not None:
+                self.speed['nav'] = nav
+        self._speed_t = 0.0
+        text = '速度上限 %.2f（最快約 %.2f m/s）' % (scale, self.nav_full['max_vel_x'] * scale)
+        self.log(who, '改' + text + ('' if not errs else '（%s）' % '；'.join(errs)))
+        if errs:
+            return False, '；'.join(errs)
+        return True, '改好了：' + text + ('' if nav is not None else '。導航沒在跑，只改了手把')
+
+    # ------------------------------------------------------------------
+    # 禁區 (網頁畫、上傳)
+    # ------------------------------------------------------------------
+    def _map_grid(self):
+        """現在的 /map 網格資訊 (w, h, res, ox, oy)，還沒有地圖回傳 None。"""
+        with self._lock:
+            m = self.map_msg
+        if m is None or m.info.width == 0:
+            return None
+        return (m.info.width, m.info.height, m.info.resolution,
+                m.info.origin.position.x, m.info.origin.position.y)
+
+    def _current_keepout(self, grid):
+        """現在的禁區換到 grid 的格子上 (bool，row 0 在 origin 那側)。"""
+        from mowerbot_action import keepout
+        w, h, res, ox, oy = grid
+        with self._lock:
+            k = self.keepout_msg
+        if k is None:
+            return np.zeros((h, w), dtype=bool)
+        src = np.asarray(k.data, dtype=np.int8).reshape(k.info.height, k.info.width) > OCC_THRESHOLD
+        return keepout.resample(src, k.info.resolution, k.info.origin.position.x, k.info.origin.position.y,
+                                w, h, res, ox, oy)
+
+    def _apply_keepout(self, mask, res, ox, oy, source, undo):
+        """mask (bool，row 0 在 origin 那側) 交給 keepout_server。undo = 這次之前的禁區 (給「復原」用)。"""
+        from mowerbot_action import keepout
+        if not mask.any():
+            res_c, err = self.call(self.ko_cli['clear'], Trigger.Request())
+            if res_c is None:
+                return False, '禁區程式 (keepout_server) ' + err
+            with self._lock:
+                self._ko_undo = undo
+            return True, '禁區都清掉了'
+        res_s, err = self.call(self.ko_cli['session'], Trigger.Request())
+        if res_s is None or not res_s.success:
+            return False, '禁區程式 (keepout_server) ' + (err or res_s.message)
+        try:
+            os.makedirs(KEEPOUT_DIR, exist_ok=True)
+            keepout.write_mask(os.path.join(KEEPOUT_DIR, 'active'), np.ascontiguousarray(np.flipud(mask)),
+                               res, ox, oy, res_s.message, source=source)
+        except Exception as exc:
+            return False, '存不了禁區檔：%s' % exc
+        res_l, err = self.call(self.ko_cli['load'], Trigger.Request())
+        if res_l is None:
+            return False, '禁區程式 (keepout_server) ' + err
+        if not res_l.success:
+            return False, res_l.message
+        with self._lock:
+            self._ko_undo = undo
+        return True, res_l.message
+
+    def keepout_edit(self, arg, who):
+        if not isinstance(arg, dict):
+            return False, '看不懂的禁區'
+        op = arg.get('op')
+        grid = self._map_grid()
+        if grid is None:
+            return False, '還沒有地圖：先開始建圖'
+        w, h, res, ox, oy = grid
+        before = self._current_keepout(grid)
+        prev = (before, res, ox, oy)
+        if op == 'clear':
+            ok, text = self._apply_keepout(np.zeros_like(before), res, ox, oy, '網頁清除', prev)
+            self.log(who, '清除全部禁區' + ('' if ok else '（沒成功：%s）' % text))
+            return ok, text
+        if op == 'undo':
+            with self._lock:
+                u = self._ko_undo
+            if u is None:
+                return False, '沒有可以復原的'
+            from mowerbot_action import keepout
+            mask = keepout.resample(u[0], u[1], u[2], u[3], w, h, res, ox, oy)
+            ok, text = self._apply_keepout(mask, res, ox, oy, '網頁復原', None)
+            self.log(who, '禁區復原上一步' + ('' if ok else '（沒成功：%s）' % text))
+            return ok, ('復原了：' + text) if ok else text
+        if op not in ('add', 'erase'):
+            return False, '看不懂的禁區指令'
+        pts = arg.get('poly')
+        try:
+            pts = [(float(x), float(y)) for x, y in pts]
+        except Exception:
+            return False, '看不懂的禁區形狀'
+        if not 3 <= len(pts) <= KEEPOUT_MAX_POINTS or not all(math.isfinite(v) for p in pts for v in p):
+            return False, '一塊禁區要 3 ~ %d 個角' % KEEPOUT_MAX_POINTS
+        area, _perim = poly_area_perimeter([list(p) for p in pts])
+        if area < 0.01:
+            return False, '這塊太小了 (%.3f m²)：角點開一點' % area
+        cells = np.round(np.array([((x - ox) / res - 0.5, (y - oy) / res - 0.5) for x, y in pts])).astype(np.int32)
+        draw = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(draw, [cells], 1)
+        draw = draw.astype(bool)
+        if not draw.any():
+            return False, '這塊在地圖外面'
+        mask = (before | draw) if op == 'add' else (before & ~draw)
+        what = '畫禁區 %.1f m²' % area if op == 'add' else '擦掉禁區 %.1f m²' % area
+        if (mask == before).all():
+            return False, '禁區沒有變 (這塊本來就%s)' % ('是禁區' if op == 'add' else '不是禁區')
+        ok, text = self._apply_keepout(mask, res, ox, oy, '網頁' + ('畫' if op == 'add' else '擦'), prev)
+        self.log(who, what + ('' if ok else '（沒成功：%s）' % text))
+        return ok, text
+
+    def keepout_template(self):
+        """給人用紅筆畫的地圖圖片 (跟存圖的 .pgm 同樣的灰階，現在的禁區塗紅)。回傳 (png, 檔名) 或 (None, 原因)。"""
+        with self._lock:
+            m = self.map_msg
+        if m is None or m.info.width == 0:
+            return None, '還沒有地圖：先開始建圖'
+        res_s, err = self.call(self.ko_cli['session'], Trigger.Request())
+        if res_s is None or not res_s.success:
+            return None, '禁區程式 (keepout_server) ' + (err or res_s.message)
+        w, h, res = m.info.width, m.info.height, m.info.resolution
+        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+        g = np.asarray(m.data, dtype=np.int8).reshape(h, w)
+        gray = np.full((h, w), PGM_UNKNOWN, dtype=np.uint8)
+        gray[(g >= 0) & (g < OCC_THRESHOLD)] = PGM_FREE
+        gray[g >= OCC_THRESHOLD] = PGM_OCC
+        bgr = cv2.cvtColor(np.flipud(gray), cv2.COLOR_GRAY2BGR)
+        cur = self._current_keepout((w, h, res, ox, oy))
+        bgr[np.flipud(cur)] = (0, 0, 255)
+        ok, png = cv2.imencode('.png', bgr)
+        if not ok:
+            return None, '地圖轉不成圖片'
+        tid = time.strftime('%m%d_%H%M%S')
+        with self._lock:
+            self._templates[tid] = {'w': w, 'h': h, 'res': res, 'ox': ox, 'oy': oy, 'session': res_s.message}
+            while len(self._templates) > KEEPOUT_TEMPLATES:
+                self._templates.popitem(last=False)
+        return png.tobytes(), 'keepout_%s.png' % tid
+
+    def keepout_image(self, arg, who):
+        """上傳畫好的圖：紅色 = 禁區 (整張的禁區換成圖上的紅色，跟 keepout_tool apply 一樣)。"""
+        from mowerbot_action import keepout
+        if not isinstance(arg, dict) or not isinstance(arg.get('data'), str):
+            return False, '沒有收到圖片'
+        name = str(arg.get('name', ''))
+        data = arg['data'].split(',', 1)[-1]
+        try:
+            raw = np.frombuffer(base64.b64decode(data, validate=False), dtype=np.uint8)
+            bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+        except Exception:
+            bgr = None
+        if bgr is None:
+            return False, '讀不出圖片 (要 PNG 或 JPG)'
+        ih, iw = bgr.shape[:2]
+        with self._lock:
+            temps = dict(self._templates)
+        mt = re.search(r'keepout_(\d{4}_\d{6})', name)
+        meta = temps.get(mt.group(1)) if mt else None
+        if meta is None:
+            same = [t for t in reversed(list(temps.values())) if (t['w'], t['h']) == (iw, ih)]
+            meta = same[0] if same else None
+        if meta is None:
+            return False, ('找不到這張圖的地圖 (%d x %d)：要用這次開機在網頁按「下載地圖圖片」的那張畫，'
+                           '不要裁切或縮放' % (iw, ih))
+        if (meta['w'], meta['h']) != (iw, ih):
+            return False, '圖片尺寸 %d x %d 跟下載的地圖 %d x %d 不一樣：不要裁切或縮放' % (iw, ih, meta['w'], meta['h'])
+        res_s, err = self.call(self.ko_cli['session'], Trigger.Request())
+        if res_s is None or not res_s.success:
+            return False, '禁區程式 (keepout_server) ' + (err or res_s.message)
+        if res_s.message != meta['session']:
+            return False, '這張圖是上一次開機的地圖，現在的地圖原點不一樣，對不上。請重新下載再畫'
+        red = keepout.red_mask(bgr)
+        grid = self._map_grid()
+        prev = None
+        if grid is not None:
+            prev = (self._current_keepout(grid),) + grid[2:]
+        ok, text = self._apply_keepout(np.flipud(red), meta['res'], meta['ox'], meta['oy'],
+                                       '網頁上傳 ' + name[:60], prev)
+        self.log(who, '上傳禁區圖 %s' % name[:60] + ('' if ok else '（沒成功：%s）' % text))
+        return ok, text
 
     # ------------------------------------------------------------------
     # 操作權
@@ -1028,8 +1432,16 @@ class HmiWeb(Node):
         if cmd == 'start':
             if running or self.prog['busy']:
                 return False, '車上程式已經在跑了'
-            self.run_script('starting', [self.car_start], who, '啟動車上程式')
-            return True, '啟動中（N150 上大約 20～40 秒）'
+            # arg：空或 'new' = 建新地圖；其他 = 存好的地圖的名稱 (只收清單裡有的)
+            name = arg if isinstance(arg, str) else ''
+            if name in ('', 'new'):
+                self.run_script('starting', [self.car_start], who, '啟動車上程式（建新地圖）')
+                return True, '啟動中（N150 上大約 20～40 秒）。開始建圖：手把 LB + A'
+            self.read_saved_maps()
+            if name not in [m['name'] for m in self.saved_maps]:
+                return False, '找不到存好的地圖「%s」' % name
+            self.run_script('starting', [self.car_start, 'map', name], who, '啟動車上程式（用存好的地圖 %s）' % name)
+            return True, '啟動中（N150 上大約 20～40 秒）。用存好的地圖 %s，禁區和外框會一起載回來' % name
         if cmd == 'shutdown':
             if not running or self.prog['busy']:
                 return False, '車上程式沒在跑'
@@ -1052,12 +1464,18 @@ class HmiWeb(Node):
                 return False, '已經是%s了' % MODE_NAME[m]
             if mode == 4 and m != 2:
                 return False, '停止中只能先切手動（跟手把 LB + X 一樣）'
+            if m == 0 and self.localization():
+                return False, '用的是存好的地圖，不用建圖（要建新地圖：關閉車上程式，重新啟動時選「建新地圖」）'
             if m == 1 and not frame.get('map', {}).get('ready'):
                 return False, '還沒有地圖：先開始建圖，把範圍開一圈'
+            if m == 1 and self.localization():
+                loc = self.loc_state()
+                if not loc['ok']:
+                    return False, '定位還沒對上存好的地圖（%s）。按「設定車子位置」點出車子在哪' % loc['text']
             if m == 1 and not frame.get('joy', {}).get('connected'):
                 return False, '手把沒連上：自動割草要手把連著（打開手把再按）'
             if m == 1 and self.rec_on:
-                return False, '正在記錄草地邊界：先按「完成」或「取消這次」'
+                return False, '正在圈外框：先按「結束」或「取消這次」'
             if m == 1 and not frame.get('nav_ready'):
                 return False, '導航 (Nav2) 還沒準備好：car-start planonly 開的，或 Nav2 沒起來（關閉再啟動一次）'
             ok, err = self.set_mode(m, who)
@@ -1071,7 +1489,7 @@ class HmiWeb(Node):
             if mode in (1, 3):
                 return False, '自動割草中不能預覽，先切手動'
             if self.rec_on:
-                return False, '正在記錄草地邊界：先按「完成」，預覽才會用新的邊界'
+                return False, '正在圈外框：先按「結束」，預覽才會用新的外框'
             res, err = self.call(self.preview_cli, Trigger.Request())
             if res is None or not res.success:
                 return False, err or res.message
@@ -1082,28 +1500,75 @@ class HmiWeb(Node):
             if arg not in LAWN_WHAT:
                 return False, '不認得的指令'
             if mode in (1, 3) and arg in ('start', 'stop'):
-                return False, '自動割草中不能記錄草地邊界，先切手動'
-            if arg == 'start' and not self.mapping:
-                return False, '還沒開始建圖：先「開始建圖」（手把 LB + A），邊界要記在地圖上'
+                return False, '自動割草中不能圈外框，先切手動'
+            if arg == 'start' and not self.map_active():
+                return False, '還沒開始建圖：先「開始建圖」（手把 LB + A），外框要記在地圖上'
+            if arg == 'start' and self.localization() and not (self.loc_state() or {}).get('ok'):
+                return False, '定位還沒對上存好的地圖：先「設定車子位置」，外框才會記在對的地方'
             if arg == 'start' and self.rec_on:
                 return False, '已經在記錄了'
             if arg == 'stop' and not self.rec_on:
                 return False, '目前沒有在記錄'
             res, err = self.call(self.lawn_cli[arg], Trigger.Request())
             if res is None:
-                return False, '草地邊界記錄器 (boundary_recorder) ' + err
+                return False, '外框記錄器 (boundary_recorder) ' + err
             self.log(who, LAWN_WHAT[arg] + ('' if res.success else '（沒成功：%s）' % res.message))
             return bool(res.success), res.message
+        if cmd == 'speed':
+            try:
+                v = float(arg)
+            except (TypeError, ValueError):
+                return False, '速度不對'
+            if not any(abs(v - c) < 1e-6 for c in SPEED_CHOICES):
+                return False, '速度只能選 %s' % '、'.join('%.2f' % c for c in SPEED_CHOICES)
+            return self.set_speed(v, who)
+        if cmd in ('keepout', 'keepoutImage'):
+            ms = frame.get('mission', {})
+            if mode in (1, 3) and ms.get('state') in (MissionStatus.STATE_PLANNING, MissionStatus.STATE_EXECUTING):
+                return False, '自動割草中不能改禁區（車子正照舊的路線走），先切手動'
+            if not self.map_active():
+                return False, '還沒開始建圖：先「開始建圖」（手把 LB + A），禁區要畫在地圖上'
+            if cmd == 'keepout':
+                return self.keepout_edit(arg, who)
+            return self.keepout_image(arg, who)
         if cmd == 'savemap':
             if mode in (1, 3):
                 return False, '自動割草中不存地圖（存圖的時候路線會被判失敗）；先切手動'
+            if self.localization():
+                return False, '用的是存好的地圖（%s），不用再存' % (self.map_info.get('name') or '')
             if not self.mapping:
                 return False, '還沒開始建圖，沒有地圖可以存'
             err = self.save_async(who)
             if err:
                 return False, err
             return True, '存地圖中（大約 10～30 秒），存好會寫在「紀錄」'
+        if cmd == 'locate':
+            return self.locate(arg, who, mode)
         return False, '不認得的指令'
+
+    def locate(self, arg, who, mode):
+        """「設定車子位置」：使用者在地圖上點車子在哪、朝哪，map_session 在附近用光達找準。"""
+        if not self.localization():
+            return False, '建新地圖的時候車子的位置就是地圖的起點，不用設定'
+        if mode in (1, 3):
+            return False, '自動割草中不能換位置，先切手動'
+        try:
+            x, y, yaw = float(arg['x']), float(arg['y']), float(arg['yaw'])
+        except (TypeError, ValueError, KeyError):
+            return False, '位置不對'
+        if not all(math.isfinite(v) for v in (x, y, yaw)):
+            return False, '位置不對'
+        o = self.odom if (self.odom is not None and self.fresh('/odom', 1.0)) else None
+        if o is None or abs(o.twist.twist.linear.x) > LOCATE_MAX_V or abs(o.twist.twist.angular.z) > LOCATE_MAX_W:
+            return False, '車子要停著才能設定位置'
+        m = PoseWithCovarianceStamped()
+        m.header.frame_id = 'map'
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.pose.pose.position.x, m.pose.pose.position.y = x, y
+        m.pose.pose.orientation.z, m.pose.pose.orientation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+        self.locate_pub.publish(m)
+        self.log(who, '設定車子位置 (%.1f, %.1f, 朝 %.0f°)' % (x, y, math.degrees(yaw)))
+        return True, '在你點的位置附近找（光達對地圖），幾秒後看「定位」'
 
     def save_async(self, who):
         """存地圖 (跟手把 Y 一樣叫 map_autosave)。存一次 10～30 秒，結果由 /map_autosave/last 寫進紀錄。"""
@@ -1206,6 +1671,12 @@ def make_handler(node, page, allow):
                 if png is None:
                     return self.send_bytes(404, b'no map', 'text/plain')
                 return self.send_bytes(200, png, 'image/png')
+            if u.path == '/api/keepout_template.png':
+                png, name = node.keepout_template()
+                if png is None:
+                    return self.send_bytes(409, name.encode('utf-8'), 'text/plain; charset=utf-8')
+                return self.send_bytes(200, png, 'image/png',
+                                       {'Content-Disposition': 'attachment; filename="%s"' % name})
             if u.path == '/api/state':
                 with node._lock:
                     f = dict(node.frame)
@@ -1220,7 +1691,8 @@ def make_handler(node, page, allow):
         def do_POST(self):
             if not self.allowed():
                 return self.send_bytes(403, b'forbidden', 'text/plain')
-            if urlparse(self.path).path != '/api/cmd':
+            path = urlparse(self.path).path
+            if path not in ('/api/cmd', '/api/upload'):
                 return self.send_bytes(404, b'not found', 'text/plain')
             # 只收這個網頁自己送的指令：別的網站 (手機同時開著行動網路) 想偷送的話，
             # 瀏覽器會帶別的 Origin；而 application/json 會先問 OPTIONS，這裡不回，瀏覽器就不送。
@@ -1229,11 +1701,19 @@ def make_handler(node, page, allow):
                 return self.send_json({'ok': False, 'text': '只接受從車子網頁送出的指令'}, 403)
             if not self.headers.get('Content-Type', '').startswith('application/json'):
                 return self.send_json({'ok': False, 'text': '看不懂的請求'}, 415)
+            # /api/upload 只收「上傳畫好的禁區圖」，可以比較大
+            limit = KEEPOUT_UPLOAD_MAX if path == '/api/upload' else 65536
             try:
                 n = int(self.headers.get('Content-Length', '0'))
-                body = json.loads(self.rfile.read(min(n, 65536)).decode('utf-8') or '{}')
+                if n > limit:
+                    self.close_connection = True
+                    return self.send_json({'ok': False, 'text': '太大了 (最多 %d MB)' % (limit // 1048576 or 1)}, 413)
+                body = json.loads(self.rfile.read(n).decode('utf-8') or '{}')
             except Exception:
                 return self.send_json({'ok': False, 'text': '看不懂的請求'}, 400)
+            if path == '/api/upload':
+                body['cmd'] = 'keepoutImage'
+                body['arg'] = {'name': body.get('name', ''), 'data': body.get('data', '')}
             cid = str(body.get('client', ''))[:40]
             if not cid:
                 return self.send_json({'ok': False, 'text': '看不懂的請求（沒有裝置代號）'}, 400)

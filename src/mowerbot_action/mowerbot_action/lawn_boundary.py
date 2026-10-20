@@ -195,11 +195,12 @@ def rasterize(poly, origin_x, origin_y, resolution, width, height):
     return mask
 
 
-def save_yaml(path, poly, frame_id, stamp_sec=None):
-    """存檔只是留紀錄 (與除錯用)，見 boundary_recorder 裡 load_on_start 的說明。"""
+def save_yaml(path, poly, frame_id, stamp_sec=None, session_id=None):
+    """存成 yaml。session_id (2026-10-21)：哪一次建圖的座標系，boundary_recorder 開機時只載回同一個 session 的。"""
     data = {
         'frame_id': frame_id,
         'stamp_sec': stamp_sec,
+        'session_id': session_id,
         'area_m2': round(polygon_area(poly), 3),
         'perimeter_m': round(polygon_perimeter(poly), 3),
         'polygon': [[round(x, 4), round(y, 4)] for x, y in poly],
@@ -208,9 +209,11 @@ def save_yaml(path, poly, frame_id, stamp_sec=None):
         yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False)
 
 
-def load_yaml(path):
-    """回傳 (polygon, frame_id)。"""
+def load_yaml(path, with_session=False):
+    """回傳 (polygon, frame_id)；with_session 時回傳 (polygon, frame_id, session_id)。"""
     with open(path, encoding='utf-8') as fh:
         data = yaml.safe_load(fh)
     poly = [(float(p[0]), float(p[1])) for p in data['polygon']]
+    if with_session:
+        return poly, data.get('frame_id', 'map'), data.get('session_id')
     return poly, data.get('frame_id', 'map')

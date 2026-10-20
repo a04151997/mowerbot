@@ -14,6 +14,10 @@ RViz 可以加 /boundary_recorder/track (Path) 看正在記錄的軌跡、/lawn_
 
 記的是 map 座標系裡 base_footprint (後輪軸中心) 的位置。邊界就是這條軌跡本身，
 不往外推半個車寬：使用者不一定剛好把輪子壓在草地邊上，往外推可能推到草地外面。
+
+【跟著地圖存起來】(2026-10-21) 圈好的外框另外存一份在 ~/.ros/mowerbot_lawn/<session>.yaml (清除時刪掉)。
+session = 哪一次建圖 (map_session.py)：用存好的地圖開機時 session 跟那一次一樣，外框自動載回來；
+建新地圖時 session 是新的，不會載到別次建圖的外框 (座標系不一樣)。
 """
 import os
 import time
@@ -30,7 +34,7 @@ import tf2_ros
 
 from mowerbot_interfaces.msg import MowerStatus
 
-from mowerbot_action import lawn_boundary
+from mowerbot_action import lawn_boundary, map_session
 
 
 class BoundaryRecorder(Node):
@@ -44,8 +48,12 @@ class BoundaryRecorder(Node):
         # 【預設不載入舊檔】每次啟動 bringup，slam_toolbox 都從頭建一張新圖，
         # map 座標系的原點就是這次開機時車子停的位置。上一次存的多邊形放進這次的 map，
         # 只要車子起點差一點、朝向差幾度，整個割草範圍就會平移、旋轉到草地外面。
-        # 所以每次都要重新繞一圈；檔案只留紀錄。改成載入同一張存檔地圖 (定位模式) 之前不要打開。
+        # 所以 boundary_file 只留紀錄，不要打開 load_on_start；要載回請用下面的 session (同一張地圖才載)。
         self.declare_parameter('load_on_start', False)
+        # 2026-10-21：mower_control 傳進來 (map_session.py)。restore = 開機載回同一個 session 存的外框
+        self.declare_parameter('session_id', '')
+        self.declare_parameter('restore', True)
+        self.session_id = self.get_parameter('session_id').value
 
         self.boundary_file = self.get_parameter('boundary_file').value
         self.global_frame = self.get_parameter('global_frame').value
@@ -85,8 +93,28 @@ class BoundaryRecorder(Node):
                     f'只有在使用同一張存檔地圖時才可信。')
             except Exception as exc:     # 檔案壞掉不該讓節點起不來
                 self.get_logger().error(f'載入 {self.boundary_file} 失敗：{exc}')
+        if self.session_id and self.get_parameter('restore').value:
+            self.restore()
         self.get_logger().info(
             '✅ 草地邊界記錄器就緒。沿草地邊緣開一圈前呼叫 ~/start，開回起點附近呼叫 ~/stop。')
+
+    def session_file(self):
+        return map_session.lawn_file(self.session_id) if self.session_id else None
+
+    def restore(self):
+        path = self.session_file()
+        if not os.path.isfile(path):
+            return
+        try:
+            poly, frame, sid = lawn_boundary.load_yaml(path, with_session=True)
+        except Exception as exc:     # 檔案壞掉不該讓節點起不來
+            self.get_logger().error(f'讀不到存著的外框 {path}：{exc}')
+            return
+        if sid != self.session_id or len(poly) < 3:
+            return
+        self.publish_polygon(poly, frame)
+        self.get_logger().info(
+            f'🌱 載回這張地圖的外框：{len(poly)} 個頂點、面積 {lawn_boundary.polygon_area(poly):.1f} m²')
 
     # ---- 取樣 ---------------------------------------------------------------
     def sample(self):
@@ -177,10 +205,12 @@ class BoundaryRecorder(Node):
         self.publish_polygon(poly, self.global_frame)
         saved = ''
         try:
-            os.makedirs(os.path.dirname(self.boundary_file) or '.', exist_ok=True)
-            lawn_boundary.save_yaml(self.boundary_file, poly, self.global_frame,
-                                    stamp_sec=time.time())
-            saved = f'，紀錄存到 {self.boundary_file}'
+            for path in filter(None, (self.boundary_file, self.session_file())):
+                os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+                lawn_boundary.save_yaml(path, poly, self.global_frame,
+                                        stamp_sec=time.time(), session_id=self.session_id or None)
+            saved = ('，跟著這張地圖存好了 (下次用這張圖開機自動載回)' if self.session_id
+                     else f'，紀錄存到 {self.boundary_file}')
         except OSError as exc:
             saved = f'，但存檔失敗：{exc}'
         resp.success = True
@@ -206,6 +236,12 @@ class BoundaryRecorder(Node):
         self.publish_track()
         # 空的多邊形 = 「沒有草地邊界」，map_to_boundary 回到只看牆與障礙物
         self.publish_polygon([], self.global_frame)
+        path = self.session_file()
+        if path and os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError as exc:
+                self.get_logger().error(f'刪不掉存著的外框 {path}：{exc}')
         resp.success = True
         resp.message = '已清除草地邊界，割草範圍回到只由地圖 (牆、障礙物) 決定。'
         self.get_logger().info(resp.message)
