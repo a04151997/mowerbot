@@ -185,25 +185,35 @@ private:
             // 這裡的 field 已經是扣掉地頭的 mainland，所以這一圈落在
             // 作業區邊緣往內 tool_width/2 的位置，與最外側那條割草線重疊，
             // 剛好補掉掉頭外凸弧留下的那一塊。
-            std::vector<std::pair<double, double>> perimeter_pts;
+            // 2026-10-21：作業區被障礙物或凹口切成好幾塊、或中間有內環時，每一塊的外圈與內環都繞一圈。
+            // 以前只取 rings[0].getCell(0) 的外圈：10-20 will 的 lab1 圖 (中間方形禁區 + 樓梯凹口)
+            // 內縮 tool_width/2 之後分成兩塊，環繞只繞了左下那一塊 (32.8 m)，右上那一大塊完全沒有。
+            // 每一圈各自「最後一點 = 第 0 點」，mower_manager 從路徑前面一圈一圈切下來。
+            std::vector<std::vector<std::pair<double, double>>> perimeter_loops;
             const bool perimeter_pass =
                 this->get_parameter("perimeter_pass").as_bool();
             if (perimeter_pass && request->tool_width > 0.0) {
                 f2c::hg::ConstHL hl_ring;
                 auto rings = hl_ring.generateHeadlandSwaths(
                     mainland, request->tool_width, 1, true);
-                if (!rings.empty() && rings[0].size() > 0) {
-                    const auto ring = rings[0].getCell(0).getExteriorRing();
-                    for (size_t i = 0; i < ring.size(); ++i) {
-                        perimeter_pts.emplace_back(ring.getX(i), ring.getY(i));
+                if (!rings.empty()) {
+                    for (size_t c = 0; c < rings[0].size(); ++c) {
+                        const auto ring_cell = rings[0].getCell(c);
+                        for (size_t r = 0; r < ring_cell.size(); ++r) {
+                            const auto ring = ring_cell.getGeometry(r);
+                            std::vector<std::pair<double, double>> pts;
+                            for (size_t i = 0; i < ring.size(); ++i) {
+                                pts.emplace_back(ring.getX(i), ring.getY(i));
+                            }
+                            if (pts.size() >= 4) {
+                                perimeter_loops.push_back(pts);
+                            }
+                        }
                     }
                 }
-                if (perimeter_pts.size() < 4) {
+                if (perimeter_loops.empty()) {
                     RCLCPP_WARN(this->get_logger(),
-                        "⚠️ 周邊環繞產生不出可用的環 (只有 %zu 個頂點)，"
-                        "這次只送弓字形割草線。作業區可能太小。",
-                        perimeter_pts.size());
-                    perimeter_pts.clear();
+                        "⚠️ 周邊環繞產生不出可用的環，這次只送弓字形割草線。作業區可能太小。");
                 }
             }
 
@@ -229,7 +239,10 @@ private:
             // 航點間距：mower_control.launch.py 從 mowerbot_action.manager.WAYPOINT_SPACING 傳入 (階段 38 單一來源)
             const double kPerimeterSpacing = this->get_parameter("waypoint_spacing").as_double();
             size_t n_perimeter_clipped = 0;
-            for (size_t i = 0; i + 1 < perimeter_pts.size(); ++i) {
+            size_t n_loops = 0;
+            for (const auto& perimeter_pts : perimeter_loops) {
+              const size_t loop_begin = ros_path.poses.size();
+              for (size_t i = 0; i + 1 < perimeter_pts.size(); ++i) {
                 const double x1 = perimeter_pts[i].first;
                 const double y1 = perimeter_pts[i].second;
                 const double x2 = perimeter_pts[i + 1].first;
@@ -272,13 +285,18 @@ private:
                     pose.pose.orientation.w = q.w();
                     ros_path.poses.push_back(pose);
                 }
-            }
-            if (!ros_path.poses.empty()) {
-                // 收尾航點：座標取第 0 個航點 (完全相同的 double)，
+              }
+              if (ros_path.poses.size() - loop_begin >= 3) {
+                // 收尾航點：座標取這一圈第 0 個航點 (完全相同的 double)，
                 // 朝向沿用最後一段的方向。
                 geometry_msgs::msg::PoseStamped closing = ros_path.poses.back();
-                closing.pose.position = ros_path.poses.front().pose.position;
+                closing.pose.position = ros_path.poses[loop_begin].pose.position;
                 ros_path.poses.push_back(closing);
+                ++n_loops;
+              } else {
+                // 整圈幾乎都被擋掉：剩下的零星航點不成一圈，丟掉 (否則 manager 會把它們當成割草線)
+                ros_path.poses.resize(loop_begin);
+              }
             }
             const size_t n_perimeter_poses = ros_path.poses.size();
             if (n_perimeter_clipped > 0) {
@@ -347,14 +365,17 @@ private:
             if (n_perimeter_poses > 0) {
                 double perimeter_len = 0.0;
                 for (size_t i = 0; i + 1 < n_perimeter_poses; ++i) {
-                    perimeter_len += std::hypot(
+                    const double step = std::hypot(
                         ros_path.poses[i + 1].pose.position.x - ros_path.poses[i].pose.position.x,
                         ros_path.poses[i + 1].pose.position.y - ros_path.poses[i].pose.position.y);
+                    if (step <= 3.0 * kPerimeterSpacing) {      // 圈與圈之間、被障礙物挖開的缺口不算
+                        perimeter_len += step;
+                    }
                 }
                 RCLCPP_INFO(this->get_logger(),
-                    "🔄 周邊環繞：%zu 個航點，全長 %.2f m，"
+                    "🔄 周邊環繞：%zu 圈、%zu 個航點，全長 %.2f m，"
                     "走在作業區邊緣往內 %.2f m 處 (距真實邊界 %.2f m)。",
-                    n_perimeter_poses, perimeter_len, request->tool_width / 2.0,
+                    n_loops, n_perimeter_poses, perimeter_len, request->tool_width / 2.0,
                     headland_width + request->tool_width / 2.0);
             } else {
                 RCLCPP_INFO(this->get_logger(), "🔄 周邊環繞：未產生 (功能關閉或作業區太小)。");

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import math
 from concurrent.futures import ThreadPoolExecutor
 import tf2_ros
@@ -22,6 +23,7 @@ from mowerbot_interfaces.srv import SetDriveMode
 from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 from rcl_interfaces.msg import ParameterDescriptor
+from mowerbot_action import route_plan
 from mowerbot_action import swath_angle
 
 # ---- 跨檔共用的預設值：單一來源 (階段 38 修正 3 原則 7) ----
@@ -241,6 +243,8 @@ class MowerManager(Node):
         self.create_timer(0.05, self.poll_angle_job)
         # 送給 F2C 的請求 (編號, 送出時間)：F2C_TIMEOUT 內沒回來就中止，晚到的結果不用
         self._f2c_seq = 0
+        # 這一趟任務的轉場路線規劃器 (2026-10-21，route_plan)：approach 直線會穿過障礙物時改成繞過去
+        self._transit = None
         self._f2c_pending = None
         # 給人看的短提示 (文字, 到期時間)：附在任務訊息後面，例如「已經在割了」
         self._note = None
@@ -735,6 +739,9 @@ class MowerManager(Node):
 
     def send_f2c_request(self, req, angle, info, preview, epoch):
         """邊界與障礙物轉 -angle 之後送給 F2C (它沿 x 軸擺割草線)，路線回來在 f2c_response_callback 轉回 +angle。"""
+        # 轉之前的割草範圍 (map 座標)：路線回來時排割草順序、規劃繞過障礙物的轉場用
+        rings = [[(p.x, p.y) for p in req.boundary.points]]
+        rings += [[(p.x, p.y) for p in o.points] for o in req.obstacles if len(o.points) >= 3]
         if angle != 0.0:
             req.boundary = self.rotated_polygon(req.boundary, -angle)
             req.obstacles = [self.rotated_polygon(o, -angle) for o in req.obstacles]
@@ -749,7 +756,7 @@ class MowerManager(Node):
         self._f2c_pending = (seq, self.get_clock().now())
         future = self.f2c_client.call_async(req)
         future.add_done_callback(
-            lambda f: self.f2c_response_callback(f, preview, epoch, angle, seq))
+            lambda f: self.f2c_response_callback(f, preview, epoch, angle, seq, rings))
 
     @staticmethod
     def rotated_polygon(poly, angle):
@@ -1062,6 +1069,10 @@ class MowerManager(Node):
         (c) log 與報告數據分得開，才知道失敗是卡在移動還是卡在割草。
 
         距離小於 APPROACH_SKIP_DISTANCE 時回傳 None，代表不需要 approach。
+
+        2026-10-21 起回傳一個 list (一段或好幾段)：直線會穿過障礙物或禁區時 (這一趟的
+        self._transit 判斷)，改成繞過去的折線，每個轉折切成一段 (每一段開始前 manager 會原地對正，
+        轉折點都選在掉得了頭的地方)。直線走得過去、或沒有規劃器時，跟以前一樣只有一段直線。
         """
         start = first_swath.poses[0].pose.position
         dx = start.x - robot_xy[0]
@@ -1074,34 +1085,56 @@ class MowerManager(Node):
                 f'(< {self.APPROACH_SKIP_DISTANCE} m)，直接開始割草')
             return None
 
-        num_segments = max(1, int(round(distance / self.APPROACH_WAYPOINT_SPACING)))
-        approach = Path()
-        # frame_id 跟割草線一致，都是 F2C 路徑的 "map"
-        approach.header.frame_id = first_swath.header.frame_id
-        approach.header.stamp = self.get_clock().now().to_msg()
+        corners = [tuple(robot_xy), (start.x, start.y)]
+        if self._transit is not None:
+            plan = self._transit.plan(corners[0], corners[1], self.TRANSIT_RELAX)
+            if plan is None:
+                self.get_logger().warn(
+                    f'⚠️ {label}：直線會碰到邊界或障礙物，也找不到繞過去的路，照舊走直線 (可能會被擋下來跳過)')
+            elif len(plan) > 2:
+                corners = plan
 
-        yaw = math.atan2(dy, dx)
-        qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
-        for k in range(num_segments + 1):
-            ratio = float(k) / float(num_segments)
-            pose = PoseStamped()
-            pose.header = approach.header
-            pose.pose.position.x = robot_xy[0] + dx * ratio
-            pose.pose.position.y = robot_xy[1] + dy * ratio
-            pose.pose.orientation.z = qz
-            pose.pose.orientation.w = qw
-            approach.poses.append(pose)
+        stamp = self.get_clock().now().to_msg()
+        legs = []
+        for (ax, ay), (bx, by) in zip(corners[:-1], corners[1:]):
+            lx, ly = bx - ax, by - ay
+            num_segments = max(1, int(round(math.hypot(lx, ly) / self.APPROACH_WAYPOINT_SPACING)))
+            approach = Path()
+            # frame_id 跟割草線一致，都是 F2C 路徑的 "map"
+            approach.header.frame_id = first_swath.header.frame_id
+            approach.header.stamp = stamp
+            yaw = math.atan2(ly, lx)
+            qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+            for k in range(num_segments + 1):
+                ratio = float(k) / float(num_segments)
+                pose = PoseStamped()
+                pose.header = approach.header
+                pose.pose.position.x = ax + lx * ratio
+                pose.pose.position.y = ay + ly * ratio
+                pose.pose.orientation.z = qz
+                pose.pose.orientation.w = qw
+                approach.poses.append(pose)
+            legs.append(approach)
 
         # 最後一個航點改成朝向第 1 條割草線的行進方向，
         # 讓車子走完 approach 就已經對準，減少開始割草前的原地迴轉。
         target_q = first_swath.poses[0].pose.orientation
-        final_q = approach.poses[-1].pose.orientation
+        final_q = legs[-1].poses[-1].pose.orientation
         final_q.x, final_q.y = target_q.x, target_q.y
         final_q.z, final_q.w = target_q.z, target_q.w
 
-        self.get_logger().info(
-            f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
-        return approach
+        if len(legs) == 1:
+            self.get_logger().info(
+                f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(legs[0].poses)} 個航點')
+        else:
+            total = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(corners[:-1], corners[1:]))
+            self.get_logger().info(
+                f'🚗 產生 {label} 路徑：直線 {distance:.2f} m 會穿過障礙物或禁區，改繞 {total:.2f} m，'
+                f'分 {len(legs)} 段 (轉折點 ' + '、'.join('(%.2f, %.2f)' % c for c in corners[1:-1]) + ')')
+        return legs
+
+    # 規劃轉場時，起點 / 終點附近這麼近的地方不檢查 (那兩點由 approach_target 與掉頭檢查把關)
+    TRANSIT_RELAX = 0.5
 
     # 跑道的航點間距，與割草線、approach 同一個來源
     LEAD_IN_WAYPOINT_SPACING = WAYPOINT_SPACING
@@ -1388,16 +1421,73 @@ class MowerManager(Node):
 
         回傳 (環繞航點 list, 其餘航點 list)。沒有環繞時回傳 ([], 全部航點)，
         舊版 f2c_server 的路徑因此完全照原本的流程走。
+        2026-10-21 起 f2c_server 每一塊作業區、每一個內環各繞一圈，這裡把前面的每一圈都切下來
+        (見 split_off_perimeter_loops)，接成一個 list 回傳。
         """
-        poses = path_msg.poses
-        if len(poses) < 4:
-            return [], list(poses)
-        p0 = poses[0].pose.position
-        for k in range(3, len(poses)):
-            pk = poses[k].pose.position
-            if math.hypot(pk.x - p0.x, pk.y - p0.y) <= self.PERIMETER_CLOSE_TOL:
-                return list(poses[:k + 1]), list(poses[k + 1:])
-        return [], list(poses)
+        loops, rest = self.split_off_perimeter_loops(path_msg)
+        return [ps for loop in loops for ps in loop], rest
+
+    def split_off_perimeter_loops(self, path_msg):
+        """路徑最前面的周邊環繞，一圈一圈切下來。回傳 ([每一圈的航點 list], 其餘航點 list)。
+
+        每一圈都是「最後一個航點的座標 = 這一圈第 0 個」；割草線不會回到自己的起點，
+        所以切到找不到這樣的一圈就是割草線開始了。
+        """
+        poses = list(path_msg.poses)
+        loops = []
+        start = 0
+        while len(poses) - start >= 4:
+            p0 = poses[start].pose.position
+            end = None
+            for k in range(start + 3, len(poses)):
+                pk = poses[k].pose.position
+                if math.hypot(pk.x - p0.x, pk.y - p0.y) <= self.PERIMETER_CLOSE_TOL:
+                    end = k
+                    break
+            if end is None:
+                break
+            loops.append(poses[start:end + 1])
+            start = end + 1
+        return loops, poses[start:]
+
+    @staticmethod
+    def rotate_loop(loop, i):
+        """閉合的一圈 (最後一點 = 第 0 點) 改從第 i 點開始繞，仍然是最後一點 = 第 0 點。"""
+        core = loop[:-1]
+        if i <= 0 or i >= len(core):
+            return list(loop)
+        out = core[i:] + core[:i]
+        closing = copy.deepcopy(out[-1])
+        closing.pose.position = copy.deepcopy(out[0].pose.position)
+        return out + [closing]
+
+    @staticmethod
+    def reversed_path(path):
+        """反方向走同一條割草線：航點倒過來，每一點的朝向轉 180°。"""
+        out = Path()
+        out.header = path.header
+        for ps in reversed(path.poses):
+            q = copy.deepcopy(ps)
+            o = q.pose.orientation
+            o.x, o.y, o.z, o.w = swath_angle.rotate_quat(o.x, o.y, o.z, o.w, math.pi)
+            out.poses.append(q)
+        return out
+
+    def make_transit_planner(self, rings):
+        """這一次規劃的轉場路線規劃器：直線離邊界 / 障礙物至少側向半寬 + 0.05 m，轉折點離邊界至少原地旋轉半徑 + 0.05 m。"""
+        if not rings or len(rings[0]) < 3:
+            return None
+        try:
+            return route_plan.TransitPlanner(
+                rings, max(self.LEAD_IN_BOUNDARY_CLEARANCE, self.LEAD_IN_OBSTACLE_CLEARANCE) + self.TRANSIT_MARGIN,
+                self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN)
+        except Exception as e:      # 算不出來就照以前走直線，不要讓任務因此開不了
+            self.get_logger().error('🧭 轉場路線規劃器建不起來 (%s: %s)，這一趟 approach 走直線。'
+                                    % (type(e).__name__, e))
+            return None
+
+    # 轉場路線比 lead-in / 掉頭門檻再多留的餘裕
+    TRANSIT_MARGIN = 0.05
 
     # 相鄰兩個航點距離超過這個值就視為「跳接」而不是同一段路徑。
     # 割草線與環繞的內插間距都是 0.1 m，所以 0.3 m 已經有 3 倍餘裕；
@@ -1631,11 +1721,14 @@ class MowerManager(Node):
                     f'⚠️ [{label}] {give_up}，放棄接近，直接送出該段落')
                 return False
 
-        approach = self.build_approach_path(robot_xy, target)
-        if approach is None:
+        legs = self.build_approach_path(robot_xy, target)
+        if legs is None:
             return False            # 夠近，不需要 approach
         self._approach_tries += 1
-        self._swath_queue.insert(self._current_swath_idx, (approach, 'approach'))
+        # 繞路時是好幾段，都叫 approach (不會再被包一層)；其中一段失敗時，剩下的幾段一起丟掉
+        # (見 follow_path_result_callback)，下一次從車子當下的位置重新規劃。
+        for k, leg in enumerate(legs):
+            self._swath_queue.insert(self._current_swath_idx + k, (leg, 'approach'))
         # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
         self._mission_total = len(self._swath_queue)
         return True
@@ -1960,6 +2053,18 @@ class MowerManager(Node):
             f'⏭️ 跳過此段 {label} {where}，繼續下一段'
             f'（臨時障礙物不應該讓整片草坪停擺）')
         self._current_swath_idx += 1
+        if label == 'approach':
+            # 繞路的 approach 有好幾段：這一段沒走完，後面幾段的起點已經不是車子所在的地方，
+            # 一起丟掉；送下一段之前 maybe_insert_approach 會從車子當下的位置重新規劃。
+            dropped = 0
+            while (self._current_swath_idx < len(self._swath_queue)
+                   and self._swath_queue[self._current_swath_idx][1] == 'approach'):
+                del self._swath_queue[self._current_swath_idx]
+                dropped += 1
+            if dropped:
+                self._mission_total = len(self._swath_queue)
+                total = len(self._swath_queue)
+                self.get_logger().warn(f'⏭️ 這段 approach 後面還有 {dropped} 段繞路一起丟掉，從車子現在的位置重新規劃')
         if self._current_swath_idx >= total:
             self.log_mission_summary()
             self.set_mission_state(MissionStatus.STATE_DONE)
@@ -2043,7 +2148,7 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None):
+    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None, rings=None):
         """
         接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
@@ -2067,20 +2172,17 @@ class MowerManager(Node):
                 if angle != 0.0:
                     # 送出去之前邊界轉了 -angle (send_f2c_request)，路線轉回來
                     self.rotate_path(response.coverage_path, angle)
-                # 【關鍵】：把路徑廣播出去給 RViz2 畫圖
-                self.path_pub.publish(response.coverage_path)
-                # 先把最前面的周邊環繞那一圈切下來 (沒有環繞時就是空的)，
+                # 先把最前面的周邊環繞切下來 (一塊作業區一圈；沒有環繞時就是空的)，
                 # 剩下的才是弓字形割草線。
-                perimeter_poses, swath_poses = self.split_off_perimeter(
-                    response.coverage_path)
+                loops, swath_poses = self.split_off_perimeter_loops(response.coverage_path)
                 rest = Path()
                 rest.header = response.coverage_path.header
                 rest.poses = swath_poses
-                perimeter_edges = self.split_perimeter_into_edges(
-                    perimeter_poses, response.coverage_path.header)
                 # 切成一條一條割草線後循序執行，一次只給 Nav2 一條直線
                 swaths = self.split_path_into_swaths(rest)
                 if not swaths:
+                    # 【關鍵】：把路徑廣播出去給 RViz2 畫圖 (切不出割草線時照 F2C 原樣)
+                    self.path_pub.publish(response.coverage_path)
                     self.get_logger().error('⚠️ 這條覆蓋路徑切不出任何割草線，任務中止。')
                     self.set_mission_state(MissionStatus.STATE_ABORTED, message=self.too_narrow_text())
                     self.clear_swath_queue()
@@ -2090,12 +2192,43 @@ class MowerManager(Node):
                 # 查不到 TF 就不啟動任務，不要用舊資料硬上。
                 robot_xy = self.get_robot_pose_in_map()
                 if robot_xy is None:
+                    self.path_pub.publish(response.coverage_path)
                     self.get_logger().error('⚠️ 不知道車子在哪裡，不啟動覆蓋任務。')
                     self.set_mission_state(
                         MissionStatus.STATE_ABORTED,
                         message='查不到車子在地圖上的位置 (建圖開了嗎？光達有資料嗎？)，沒有出發')
                     self.clear_swath_queue()
                     return
+
+                # 【割草順序與轉場，2026-10-21 will 選 1】(route_plan)
+                # (1) 周邊環繞從離車子最近的地方開始繞 (以前從 F2C 環的第 0 點，車子常常要先開過半個場地)。
+                # (2) 割草線被障礙物或凹口切開時分塊，一塊一塊照弓字形割 (以前照 F2C 清單一來一回，
+                #     相鄰兩條在障礙物兩邊，接起來穿過障礙物)。F2C 的順序本來就好時完全不動。
+                # (3) 轉場 (approach) 直線會穿過障礙物或禁區時繞過去 (build_approach_path)。
+                transit = self.make_transit_planner(rings)
+                loop_xy = [[(ps.pose.position.x, ps.pose.position.y) for ps in lp] for lp in loops]
+                loops = [self.rotate_loop(loops[k], i)
+                         for k, i in route_plan.order_loops(loop_xy, robot_xy)]
+                perimeter_poses = [ps for lp in loops for ps in lp]
+                perimeter_edges = self.split_perimeter_into_edges(
+                    perimeter_poses, response.coverage_path.header)
+                start_xy = robot_xy
+                if perimeter_edges:
+                    q = perimeter_edges[-1].poses[-1].pose.position
+                    start_xy = (q.x, q.y)
+                ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
+                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y)) for sw in swaths]
+                order, oinfo = route_plan.plan_order(
+                    ends, angle, self.swath_spacing, start_xy,
+                    dist=transit.length if transit is not None else None,
+                    clear=transit.clear if transit is not None else None)
+                if oinfo['changed']:
+                    swaths = [self.reversed_path(swaths[i]) if rev else swaths[i] for i, rev in order]
+                    self.get_logger().info(
+                        f'🧩 割草線被障礙物或凹口切開：分成 {oinfo["chains"]} 塊，一塊一塊照弓字形割')
+                # 【關鍵】：把路徑廣播出去給 RViz2 / 網頁畫圖：照真的割草順序，轉場會繞路的地方畫繞路
+                self.path_pub.publish(self.display_route(
+                    response.coverage_path, loops, swaths, transit))
 
                 total = len(swaths)
                 # 每條割草線前面接上共線的跑道，讓車子掉完頭先收斂橫向誤差，
@@ -2129,15 +2262,17 @@ class MowerManager(Node):
                 _ = robot_xy
 
                 if preview:
-                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s，共 %d 段。車子不會動；'
+                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s，共 %d 段。車子不會動；'
                             'OK 就按 LB + B 開始割。'
                             % (total, math.degrees(angle) % 180.0,
+                               '、分 %d 塊割' % oinfo['chains'] if oinfo['changed'] else '',
                                '、周邊環繞 %d 段' % n_edges if n_edges else '', len(queue)))
                     self.get_logger().info('👀 ' + text)
                     self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
                     return
 
                 self._swath_queue = queue
+                self._transit = transit
                 self._swath_total = total
                 self._current_swath_idx = 0
                 # 每次重新規劃都是一個新任務，失敗統計要歸零
@@ -2175,6 +2310,43 @@ class MowerManager(Node):
             self.get_logger().error(f'呼叫 F2C 服務時發生錯誤: {str(e)}')
             self.set_mission_state(MissionStatus.STATE_ABORTED,
                                    message='算路線時程式出錯 (%s: %s)，看 car-log' % (type(e).__name__, e))
+
+    def display_route(self, raw, loops, swaths, transit):
+        """給 RViz / Lichtblick / 網頁看的路線 (/f2c_path)：環繞 + 照割草順序的割草線，轉場會繞路的地方插入繞路的點。
+
+        跟以前一樣不含跑道與從車子出發的那段 approach。順序、方向、環繞起點都沒變、也不用繞路時，
+        直接送 F2C 原本那一條 (一個位元都不差)。
+        """
+        pieces = []
+        for lp in loops:
+            # 環繞被障礙物挖開的缺口：缺口兩邊分開，中間照轉場畫 (跟真的執行時一樣)
+            cur = [lp[0]]
+            for ps in lp[1:]:
+                a, b = cur[-1].pose.position, ps.pose.position
+                if math.hypot(b.x - a.x, b.y - a.y) > self.GAP_CUT_DISTANCE:
+                    pieces.append(cur)
+                    cur = []
+                cur.append(ps)
+            pieces.append(cur)
+        pieces += [list(sw.poses) for sw in swaths]
+        out = Path()
+        out.header = raw.header
+        detour = False
+        for piece in pieces:
+            if out.poses and transit is not None:
+                a, b = out.poses[-1].pose.position, piece[0].pose.position
+                if math.hypot(b.x - a.x, b.y - a.y) >= self.APPROACH_SKIP_DISTANCE:
+                    plan = transit.plan((a.x, a.y), (b.x, b.y), self.TRANSIT_RELAX)
+                    if plan is not None and len(plan) > 2:
+                        detour = True
+                        for (cx, cy) in plan[1:-1]:
+                            ps = copy.deepcopy(piece[0])
+                            ps.pose.position.x, ps.pose.position.y = cx, cy
+                            out.poses.append(ps)
+            out.poses.extend(piece)
+        same = (not detour and len(out.poses) == len(raw.poses) and all(
+            p is q for p, q in zip(out.poses, raw.poses)))
+        return raw if same else out
 
     def too_narrow_text(self):
         """區域太窄切不出割草線時給人看的話。寬度由地頭與線距推算 (邊界另外內縮約 0.10 m，見 map_to_boundary)。"""
