@@ -876,6 +876,10 @@ class HmiWeb(Node):
                 return {'key': 'joy', 'p': 1, 'text': text, 'hint': '打開手把，連上之後按一下 LB 才會繼續走。'}
             if latched:
                 return {'key': 'latch', 'p': 2, 'text': text, 'hint': '手把已經重新連上了。按一下 LB 車子才繼續走。'}
+            if '定位對不上' in text:
+                return {'key': 'loc', 'p': 2, 'text': text,
+                        'hint': '通常是有人或東西擋住光達，移開就會接著走。一直對不上：按停止、LB + X 回手動，'
+                                '在地圖上「設定車子位置」。停超過 15 秒這一段會跳過。'}
             if '/scan' in text or '光達' in text:
                 return {'key': 'scan', 'p': 1, 'text': text, 'hint': '檢查光達的線和電源。'}
             return {'key': 'other', 'p': 2, 'text': text, 'hint': ''}
@@ -898,11 +902,11 @@ class HmiWeb(Node):
               '光達沒有資料' + ('，車子停在原地' if auto else '：停止區沒有作用，自動割草也不會出發'))
         A.set('zone', executing and zone_blocked, 2, '前方停止區有東西，車子暫停')
         A.set('manager', running and not grace and not manager_ok, 1, 'mower_manager 沒有回應')
-        # 用存好的地圖：對不上 = 自動割草不會出發；割草中變差 = 車子照走 (不停車)，要人看著
+        # 用存好的地圖：對不上 = 自動割草不會出發；割草中變差超過 3 秒 = 車子暫停 (manager)，對上了接著走
         A.set('loclost', running and not grace and loc is not None and loc['state'] == 'lost', 2,
               '定位對不上存好的地圖：在總覽的地圖上按「設定車子位置」點出車子在哪')
         A.set('locweak', executing and loc is not None and loc['state'] == 'ok' and not loc['ok'], 2,
-              '割草中定位變差（%s）：看車子有沒有走偏，偏了就按停止' % (loc or {}).get('text', ''))
+              '割草中定位變差（%s）：超過 3 秒車子會暫停，對上了就接著走' % (loc or {}).get('text', ''))
         temp = self._sys.get('temp')
         A.set('temp', temp is not None and temp >= 85.0, 2, 'N150 溫度 %.0f °C' % (temp or 0))
         A.set('disk', 0 < self._sys.get('disk', 99) < 3.0, 2, 'SSD 只剩 %.1f GB' % self._sys.get('disk', 0))

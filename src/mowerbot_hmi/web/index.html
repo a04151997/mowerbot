@@ -99,6 +99,12 @@ kbd { font-family: var(--font-num); font-size: 11px; border: 1px solid var(--lin
 .demo strong { color: var(--fg); margin-right: 4px; }
 .demo button { border: 1px solid var(--line); background: var(--panel); border-radius: 3px; padding: 2px 8px; cursor: pointer; font-size: 12px; }
 .demo button:hover { border-color: var(--fg-3); }
+/* 展示版「下載地圖圖片」：沒辦法下載的地方 (例如網頁預覽) 把那張圖直接秀出來 */
+.demo-img { position: fixed; inset: 0; z-index: 20; background: rgba(0, 0, 0, 0.45); display: flex; align-items: center; justify-content: center;
+  padding: max(16px, env(safe-area-inset-top, 0px)) max(16px, env(safe-area-inset-right, 0px)) max(16px, env(safe-area-inset-bottom, 0px)) max(16px, env(safe-area-inset-left, 0px)); }
+.demo-img > div { background: var(--panel); border: 2px solid var(--sel); border-radius: 6px; padding: 12px 14px; max-width: min(720px, 100%); max-height: 100%; overflow: auto; display: grid; gap: 10px; }
+.demo-img p { margin: 0; font-size: 14px; }
+.demo-img img { max-width: 100%; image-rendering: pixelated; border: 1px solid var(--line); background: var(--map-free); }
 
 /* ---- nav ---- */
 .nav { grid-row: 3; background: var(--panel); border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 4px;
@@ -202,7 +208,8 @@ main { box-sizing: border-box; height: 100%; overflow: auto; padding-block: 16px
 .map-zoom button { background: var(--panel); border: 1px solid var(--line); border-radius: 3px; width: 34px; height: 34px; font-size: 18px; cursor: pointer; }
 /* 手機上畫禁區：地圖拉高到差不多一整個畫面，下面的工具列縮小，點得到的地圖才夠大 */
 @media (max-width: 760px) {
-  .mapbox.drawing { aspect-ratio: auto; height: max(380px, calc(100dvh - 240px)); }
+  /* --work-h = 上面標題列和下面分頁列之間看得到的高度 (JS 量的)；畫的時候整個地圖連工具列都要看得到 */
+  .mapbox.drawing { aspect-ratio: auto; height: max(320px, calc(var(--work-h, calc(100dvh - 240px)) - 20px)); }
   .draw-bar { left: 6px; right: 6px; bottom: 6px; padding: 6px 8px; gap: 6px; }
   .draw-bar .msg { font-size: 12px; }
   .draw-bar .btn, .draw-bar .seg button { padding: 5px 9px; font-size: 13px; }
@@ -295,8 +302,19 @@ tr.rtn td { color: var(--fg-3); }
     <button type="button" data-demo="rb">手把按 RB</button>
     <button type="button" data-demo="link">網頁斷線 6 秒</button>
     <button type="button" data-demo="auth">另一台搶操作權</button>
-    <button type="button" data-demo="reset">從頭開始</button>
+    <span>情境：</span>
+    <button type="button" data-demo="mapped">剛建完圖</button>
+    <button type="button" data-demo="reset">割草中</button>
+    <button type="button" data-demo="off">還沒啟動</button>
     <span class="muted">車子走 6 倍速</span>
+  </div>
+
+  <div class="demo-img" id="demoImg" hidden>
+    <div>
+      <p id="demoImgTxt"></p>
+      <img id="demoImgPic" alt="展示版的地圖圖片：白色空地、黑色牆、灰色沒掃過、紅色禁區">
+      <div class="btnrow"><button type="button" class="btn go" id="demoImgClose">知道了</button></div>
+    </div>
   </div>
 
   <nav class="nav" aria-label="畫面">
@@ -364,7 +382,7 @@ tr.rtn td { color: var(--fg-3); }
             <div class="panel">
               <div class="why" id="why"></div>
               <!-- 按鈕不放在 #why 裡：#why 每 0.2 秒重畫，手指按下去的時候按鈕被換掉就按不到 -->
-              <div class="why-act" id="whyAct" hidden><button type="button" class="btn" id="btnWhyLawnStop">完成記錄邊界</button><button type="button" class="btn go" id="btnWhyLocate" hidden>設定車子位置</button></div>
+              <div class="why-act" id="whyAct" hidden><button type="button" class="btn" id="btnWhyLawnStop">完成記錄邊界</button><button type="button" class="btn go" id="btnWhyLocate" hidden>設定車子位置</button><button type="button" class="btn go" id="btnWhyDraw" hidden>畫禁區</button><button type="button" class="btn" id="btnWhySave" hidden>存地圖</button></div>
             </div>
             <div class="panel">
               <h2>出發條件<span class="r muted">全部正常車子才會走</span></h2>
@@ -686,6 +704,23 @@ function demoSource() {
   })();
   const RB = (() => { const xs = SITE.fenceW.map(p => p[0]), ys = SITE.fenceW.map(p => p[1]); return { x0: Math.min(...xs) - 1.5, x1: Math.max(...xs) + 1.5, y0: Math.min(...ys) - 1.5, y1: Math.max(...ys) + 1.5 }; })();
   const RES = 0.05, RW = Math.ceil((RB.x1 - RB.x0) / RES), RH = Math.ceil((RB.y1 - RB.y0) / RES);
+  // 展示版圈外框：車子自己沿著草地邊 (往裡 0.3 m) 開一圈，開過起點 0.5 m 停 (真的車是人用手把開)
+  const FRAME_LOOP = (() => {
+    const P = [[-5.7, -2.7], [5.7, -2.7], [5.7, 1.5], [4.5, 1.5], [4.5, 2.7], [-5.7, 2.7]].map(p => SITE.W(...p));
+    const cum = [0]; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; cum.push(cum[i] + Math.hypot(b[0] - a[0], b[1] - a[1])); }
+    const L = cum[P.length];
+    const at = u => {
+      u = ((u % L) + L) % L; let i = 0; while (i < P.length - 1 && cum[i + 1] <= u) i++;
+      const a = P[i], b = P[(i + 1) % P.length], t = (u - cum[i]) / (cum[i + 1] - cum[i]);
+      return { x: a[0] + t * (b[0] - a[0]), y: a[1] + t * (b[1] - a[1]), yaw: Math.atan2(b[1] - a[1], b[0] - a[0]) };
+    };
+    const pts = () => { const out = []; for (let u = 0; u < L; u += 0.1) { const q = at(u); out.push([q.x, q.y]); } return out; };
+    return { L, at, pts, overshoot: 0.5 };
+  })();
+  function polyAreaPerim(P) {
+    let a = 0, l = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; l += Math.hypot(q[0] - p[0], q[1] - p[1]); }
+    return [Math.abs(a) / 2, l];
+  }
   const SPEED = 0.25, SPEEDUP = 6, SKIP_AFTER = 15, V = VEH0;
 
   function buildRoute(from) {
@@ -772,7 +807,7 @@ function demoSource() {
       mode: 1, mstate: 2, msg: '', route: buildRoute(SITE.start), routeShown: true, s: 0, mown: [],
       v: SPEED, w: 0, navV: SPEED, pose: { ...SITE.start }, joy: { connected: true, latched: false },
       obstacle: null, blockedFor: 0, skipped: [], authority: 'here', freezeUntil: 0, alarms: [], events: [], scan: [], zoneN: 0,
-      scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '',
+      scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '', siteKo: true, savingUntil: 0, lawnRec: null, lawnPts: null,
     });
     const R = sim.route, g = R.segs.findIndex(sg => sg.label === '割草線 4/12');
     sim.s = R.segStart[g] + 2.2; sim.mown = [[0, sim.s]]; sim.pose = poseAt(R, sim.s);
@@ -791,6 +826,22 @@ function demoSource() {
       { id: seq++, key: 'zone', p: 2, text: '前方停止區有東西，車子暫停', tIn: ago(2.1), tOut: ago(1.9), active: false, acked: false },
     ];
   }
+  // 情境 (展示版)：剛建完圖 = 開一圈建好圖、還沒存、還沒畫禁區；還沒啟動 = 車上程式沒開 (可以試「啟動」選存好的地圖)
+  function scenario(kind) {
+    reset();
+    if (kind === 'mapped') {
+      Object.assign(sim, { mode: 0, mstate: 0, msg: '', routeShown: false, s: 0, mown: [[0, 0]], v: 0, w: 0, navV: 0,
+        pose: { ...SITE.start }, mapName: null, siteKo: false, alarms: [], obstacle: null, mapVer: sim.mapVer + 1 });
+      sim.events = [
+        { t: ago(14), src: '系統', text: '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s），建新地圖' },
+        { t: ago(13), src: '手把', text: 'LB + A 開始建圖' },
+        { t: ago(0.3), src: '系統', text: '建圖中：開了一圈回到起點附近' },
+      ].reverse();
+    } else if (kind === 'off') {
+      Object.assign(sim, { running: false, mode: 2, mstate: 0, msg: '', routeShown: false, mapping: false, mapName: null, v: 0, w: 0, navV: 0, alarms: [], obstacle: null });
+      sim.events = [{ t: ago(1), src: '系統', text: '車上程式關掉了' }];
+    }
+  }
   function blockReason() {
     if (!sim.running || sim.mode !== 1 || sim.mstate !== 2) return null;
     if (!sim.joy.connected) return { key: 'joy', p: 1, text: '手把斷線', hint: '打開手把，連上之後按一下 LB 才會繼續走。' };
@@ -808,6 +859,18 @@ function demoSource() {
       if (lx >= V.front && lx <= V.front + V.zoneLen && Math.abs(ly) <= V.half + V.zoneSide) n++;
     }
     sim.zoneN = n;
+    const LR = sim.lawnRec;
+    if (LR && LR.driving && sim.mode !== 4) {
+      LR.u = Math.min(FRAME_LOOP.L + FRAME_LOOP.overshoot, LR.u + SPEED * SPEEDUP * dt);
+      const prev = sim.pose.yaw; sim.pose = FRAME_LOOP.at(LR.u); sim.v = SPEED;
+      let dy = sim.pose.yaw - prev; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
+      sim.w = Math.max(-1.2, Math.min(1.2, dt > 0 ? dy / (dt * SPEEDUP) : 0));
+      const q = LR.pts[LR.pts.length - 1];
+      if (Math.hypot(sim.pose.x - q[0], sim.pose.y - q[1]) >= 0.1) { LR.len += Math.hypot(sim.pose.x - q[0], sim.pose.y - q[1]); LR.pts.push([sim.pose.x, sim.pose.y]); }
+      if (LR.u >= FRAME_LOOP.L + FRAME_LOOP.overshoot) { LR.driving = false; sim.v = 0; sim.w = 0; logEv('系統', '（展示版）車子開回起點附近了，可以按「結束」'); }
+      return;
+    }
+    if (LR && !LR.driving) { sim.v = 0; sim.w = 0; }
     const executing = sim.mode === 1 && sim.mstate === 2, br = blockReason(), prevYaw = sim.pose.yaw;
     sim.navV = executing ? SPEED : 0;
     if (executing && !br) {
@@ -870,7 +933,12 @@ function demoSource() {
       speed: { joy: up ? sim.scale : null, nav: up ? sim.scale : null, choices: [0.10, 0.15, 0.25, 0.35, 0.50] },
       keepout: { zones: sim.koZones || 0, area: sim.koArea || 0, undo: sim.koUndo.length > 0 },
       saving: up && Date.now() < (sim.savingUntil || 0),
-      lawn: { recording: false, set: false, close_gap: 1.0 },
+      lawn: (() => {
+        const L = { recording: !!sim.lawnRec, set: !!sim.lawnPts, length: null, gap: null, area: null, perimeter: null, close_gap: 1.0 };
+        if (sim.lawnRec) { const p0 = sim.lawnRec.pts[0]; L.length = Math.round(sim.lawnRec.len * 10) / 10; L.gap = Math.round(Math.hypot(sim.pose.x - p0[0], sim.pose.y - p0[1]) * 100) / 100; }
+        if (sim.lawnPts) { const [a, l] = polyAreaPerim(sim.lawnPts); L.area = Math.round(a * 10) / 10; L.perimeter = Math.round(l * 10) / 10; }
+        return L;
+      })(),
       mapsrc: !up ? { mode: null, name: '', start: '', loc: null }
         : sim.loc ? { mode: 'localization', name: sim.locName, start: '上次關機前的位置', loc: Object.assign({}, sim.loc) }
           : { mode: 'mapping', name: '', start: '', loc: null },
@@ -882,6 +950,8 @@ function demoSource() {
         current: up && executing ? polyRange(R, sim.s, segEnd) : null,
         trail: up && sim.routeShown ? sim.mown.map(([a, b]) => polyRange(R, a, b)).filter(p => p.length > 1) : null,
         scan: sim.scan,
+        lawn: up ? sim.lawnPts : null,
+        rec: up && sim.lawnRec ? sim.lawnRec.pts : null,
       },
       vehicle: VEH0,
       alarms: sim.alarms, events: sim.events,
@@ -932,7 +1002,8 @@ function demoSource() {
       if (sim.mode === 1) return { ok: false, text: '自動割草中不能預覽，先切手動' };
       sim.mapName = mapName(Date.now()); sim.savingUntil = Date.now() + 12000;
       sim.route = buildRoute(sim.pose); sim.routeShown = true; sim.s = 0; sim.mown = [[0, 0]]; sim.skipped = []; sim.mstate = 0;
-      sim.msg = '路線預覽：割草線 12 條 (方向 32°)，共 ' + sim.route.segs.length + ' 段。車子不會動；OK 就按「自動割草」。';
+      sim.msg = '路線預覽：割草線 12 條 (方向 32°)，共 ' + sim.route.segs.length + ' 段。車子不會動；OK 就按「自動割草」。'
+        + '（展示版的路線是固定的，車上算的路線會避開你畫的禁區）';
       logEv('網頁 (' + LABEL + ')', '預覽路線，存地圖 ' + sim.mapName);
       return { ok: true };
     },
@@ -950,7 +1021,10 @@ function demoSource() {
       sim.busy = 'starting';
       setTimeout(() => {
         // 展示版：用存好的地圖的話，假裝車子被推過、開機的時候對不上 (要在地圖上點車子位置)
+        // 存好的地圖：那張圖畫的禁區、圈的外框一起載回來 (清單上寫有的才載)
+        const m = (frame().maps || []).find(x => x.name === name) || {};
         Object.assign(sim, { running: true, busy: null, since: Date.now(), mode: 2, mstate: 0, msg: '', mapping: saved, mapName: saved ? name : null, routeShown: false, s: 0, mown: [[0, 0]], skipped: [], pose: { ...SITE.start }, obstacle: null,
+          siteKo: saved && !!m.keepout, ko: [], koUndo: [], lawnRec: null, lawnPts: saved && m.lawn ? FRAME_LOOP.pts() : null, mapVer: sim.mapVer + 1,
           loc: saved ? { state: 'lost', ok: false, score: 0.21, text: '對不上地圖 (最好的位置也只有 21% 光達落在牆上)：車子可能不在上次關機的位置附近。在網頁上點出車子在哪、朝哪' } : null, locName: saved ? name : '' });
         sim.route = buildRoute(sim.pose);
         logEv('系統', '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s）' + (saved ? '，用存好的地圖 ' + name : '，建新地圖'));
@@ -981,12 +1055,39 @@ function demoSource() {
     ack(id) { const a = sim.alarms.find(x => x.id === id); if (a) a.acked = true; return { ok: true }; },
     ackAll() { sim.alarms.forEach(a => { a.acked = true; }); logEv('網頁 (' + LABEL + ')', '確認全部警報'); return { ok: true }; },
     takeAuth() { sim.authority = 'here'; logEv('網頁 (' + LABEL + ')', '操作權改到這台'); return { ok: true }; },
-    lawn() { return { ok: false, text: '展示版不能圈外框' }; },
+    lawn(a) {
+      if (!sim.running) return { ok: false, text: '車上程式沒在跑' };
+      if (a === 'start') {
+        if (sim.mode === 1) return { ok: false, text: '自動割草中不能圈外框，先切手動' };
+        if (!sim.mapping) return { ok: false, text: '還沒開始建圖：先「開始建圖」（手把 LB + A），外框要記在地圖上' };
+        if (sim.loc && !sim.loc.ok) return { ok: false, text: '定位還沒對上存好的地圖：先「設定車子位置」，外框才會記在對的地方' };
+        if (sim.lawnRec) return { ok: false, text: '已經在記錄了' };
+        sim.pose = FRAME_LOOP.at(0);
+        sim.lawnRec = { pts: [[sim.pose.x, sim.pose.y]], len: 0, u: 0, driving: true };
+        logEv('網頁 (' + LABEL + ')', '開始圈外框（展示版：車子自己沿邊開一圈；真的車是你用手把開）');
+        return { ok: true, text: '開始記錄：沿著邊開一圈，開回起點 1 m 內按「結束」' };
+      }
+      if (a === 'stop') {
+        if (!sim.lawnRec) return { ok: false, text: '目前沒有在記錄' };
+        const p0 = sim.lawnRec.pts[0], gap = Math.hypot(sim.pose.x - p0[0], sim.pose.y - p0[1]);
+        if (gap > 1.0) return { ok: false, text: '離起點還有 ' + fx(gap, 1) + ' m，開回起點 1 m 內再按結束' };
+        // 開過頭：剪掉最後一次進起點 1 m 內那段裡最靠近起點之後的點 (跟 lawn_boundary.py 一樣)
+        const P = sim.lawnRec.pts; let k = P.length - 1, best = k, bd = Infinity;
+        while (k > 0 && Math.hypot(P[k][0] - p0[0], P[k][1] - p0[1]) <= 1.0) { const d = Math.hypot(P[k][0] - p0[0], P[k][1] - p0[1]); if (d < bd) { bd = d; best = k; } k--; }
+        sim.lawnPts = P.slice(0, best + 1); sim.lawnRec = null;
+        const [ar] = polyAreaPerim(sim.lawnPts);
+        logEv('網頁 (' + LABEL + ')', '外框記好了：' + fx(ar, 1) + ' m²');
+        return { ok: true, text: '外框記好了：' + fx(ar, 1) + ' m²，割草只在它裡面' };
+      }
+      if (a === 'cancel') { if (!sim.lawnRec) return { ok: false, text: '目前沒有在記錄' }; sim.lawnRec = null; logEv('網頁 (' + LABEL + ')', '取消這次圈外框'); return { ok: true, text: '取消了，舊的外框留著' }; }
+      if (a === 'clear') { sim.lawnPts = null; logEv('網頁 (' + LABEL + ')', '清除外框'); return { ok: true, text: '外框清掉了' }; }
+      return { ok: false, text: '不認得的指令' };
+    },
     speed(v) { sim.scale = v; logEv('網頁 (' + LABEL + ')', '改速度上限 ' + fx(v, 2) + '（最快約 ' + fx(0.7 * v, 2) + ' m/s）'); return { ok: true, text: '改好了：速度上限 ' + fx(v, 2) }; },
     keepout(a) {
       if (!sim.running || !sim.mapping) return { ok: false, text: '還沒有地圖' };
       if (sim.mode === 1 && (sim.mstate === 1 || sim.mstate === 2)) return { ok: false, text: '自動割草中不能改禁區，先切手動' };
-      if (a.op === 'undo') { if (!sim.koUndo.length) return { ok: false, text: '沒有可以復原的' }; sim.ko = sim.koUndo.pop(); }
+      if (a.op === 'undo') { if (!sim.koUndo.length) return { ok: false, text: '沒有可以復原的' }; const u = sim.koUndo.pop(); sim.ko = u; if (u.siteKo !== undefined) sim.siteKo = u.siteKo; }
       else if (a.op === 'clear') { sim.koUndo.push(sim.ko.slice()); sim.ko = [{ op: 'clearAll' }]; }
       else if (a.op === 'add' || a.op === 'erase') { sim.koUndo.push(sim.ko.slice()); sim.ko = sim.ko.concat([{ op: a.op, poly: a.poly }]); }
       else return { ok: false, text: '看不懂的禁區指令' };
@@ -1019,6 +1120,8 @@ function demoSource() {
     else if (a === 'link') sim.freezeUntil = Date.now() + 6000;
     else if (a === 'auth') { sim.authority = sim.authority === 'here' ? 'other' : 'here'; logEv('網頁', sim.authority === 'here' ? '操作權交回這台' : '操作權改到另一台（Mac）'); }
     else if (a === 'reset') reset();
+    else if (a === 'mapped' || a === 'off') scenario(a);
+    if (a === 'reset' || a === 'mapped' || a === 'off') { if (typeof stopDraw === 'function' && draw) stopDraw(); show('overview'); }
     demoButtons(); publish();
   });
   function buildRaster() {
@@ -1029,7 +1132,7 @@ function demoSource() {
     g.imageSmoothingEnabled = false;
     g.fillStyle = lv(0); g.fillRect(0, 0, RW, RH);
     g.fillStyle = lv(1); poly(SITE.free); g.fill();
-    g.fillStyle = lv(3); poly(SITE.keepout); g.fill();
+    if (sim.siteKo) { g.fillStyle = lv(3); poly(SITE.keepout); g.fill(); }
     g.strokeStyle = lv(2); g.lineWidth = 0.1 / RES;
     SITE.walls.forEach(([ax, ay, bx, by]) => { g.beginPath(); g.moveTo(tx(ax), ty(ay)); g.lineTo(tx(bx), ty(by)); g.stroke(); });
     g.fillStyle = lv(2);
@@ -1040,6 +1143,7 @@ function demoSource() {
     const inPoly = (x, y, P) => { let c = false; for (let i = 0, j = P.length - 1; i < P.length; j = i++) { const [xi, yi] = P[i], [xj, yj] = P[j]; if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) c = !c; } return c; };
     (sim.ko || []).forEach(k => {
       if (k.op === 'clearAll') { for (let i = 0; i < vals.length; i++) if (vals[i] === 3) vals[i] = 1; return; }
+      if (k.op === 'image') { for (let i = 0; i < vals.length; i++) if (vals[i] === 3) vals[i] = 1; else if (k.mask[i] && vals[i] === 1) vals[i] = 3; return; }
       const xs = k.poly.map(p => p[0]), ys = k.poly.map(p => p[1]);
       const c0 = Math.max(0, Math.floor((Math.min(...xs) - RB.x0) / RES)), c1 = Math.min(RW - 1, Math.ceil((Math.max(...xs) - RB.x0) / RES));
       const r0 = Math.max(0, Math.floor((RB.y1 - Math.max(...ys)) / RES)), r1 = Math.min(RH - 1, Math.ceil((RB.y1 - Math.min(...ys)) / RES));
@@ -1050,10 +1154,11 @@ function demoSource() {
       }
     });
     let n3 = 0; for (let i = 0; i < vals.length; i++) if (vals[i] === 3) n3++;
-    sim.koArea = Math.round(n3 * RES * RES * 10) / 10; sim.koZones = n3 ? 1 + (sim.ko || []).filter(k => k.op === 'add').length : 0;
+    sim.koArea = Math.round(n3 * RES * RES * 10) / 10; sim.koZones = n3 ? (sim.siteKo ? 1 : 0) + (sim.ko || []).filter(k => k.op === 'add' || k.op === 'image').length || 1 : 0;
     return { vals, w: RW, h: RH };
   }
-  reset();
+  $('#demoImgClose').onclick = () => { $('#demoImg').hidden = true; };
+  scenario('mapped');            // 一打開就是「剛建完圖」：在地圖上畫禁區、存地圖、圈外框都能試
   $('#demo').hidden = false;
   return {
     start(onFrame) {
@@ -1074,8 +1179,52 @@ function demoSource() {
       return Promise.resolve(r);
     },
     raster() { return Promise.resolve(buildRaster()); },
-    template() { return Promise.resolve({ ok: false, text: '展示版不能下載地圖圖片（車上的網頁才可以）' }); },
-    upload() { return Promise.resolve({ ok: false, text: '展示版不能上傳（車上的網頁才可以）' }); },
+    // 展示版也能試下載 / 上傳：灰階跟 save_map 的 .pgm 一樣 (空地白、牆黑、沒掃過灰)，現在的禁區塗紅
+    template() {
+      if (!sim.running || !sim.mapping) return Promise.resolve({ ok: false, text: '還沒有地圖' });
+      const { vals } = buildRaster(), c = document.createElement('canvas'); c.width = RW; c.height = RH;
+      const g = c.getContext('2d'), im = g.createImageData(RW, RH);
+      const COL = [[205, 205, 205], [254, 254, 254], [0, 0, 0], [230, 20, 20]];
+      for (let i = 0; i < vals.length; i++) { const q = COL[vals[i]]; im.data.set([q[0], q[1], q[2], 255], i * 4); }
+      g.putImageData(im, 0, 0);
+      const name = 'keepout_demo_' + hms(Date.now()).replace(/:/g, '') + '.png';
+      // 一般瀏覽器會直接下載；網頁預覽 (artifact) 不准下載，所以也把圖秀出來，長按或右鍵就能存
+      const a = document.createElement('a');
+      a.href = c.toDataURL('image/png'); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+      $('#demoImgPic').src = a.href;
+      $('#demoImgTxt').textContent = '展示版：這就是「下載地圖圖片」給你的那張 ' + name + '（車上的網頁會直接下載）。'
+        + '長按或按右鍵把圖存下來，用紅色塗禁區，不要裁切或縮放，再按「上傳畫好的圖」試試看。';
+      $('#demoImg').hidden = false;
+      return Promise.resolve(null);
+    },
+    upload(name, data) {
+      if (sim.authority !== 'here') return Promise.resolve({ ok: false, text: '操作權在另一台' });
+      if (!sim.running || !sim.mapping) return Promise.resolve({ ok: false, text: '還沒有地圖' });
+      if (sim.mode === 1 && (sim.mstate === 1 || sim.mstate === 2)) return Promise.resolve({ ok: false, text: '自動割草中不能改禁區，先切手動' });
+      return new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => {
+          if (img.width !== RW || img.height !== RH) {
+            resolve({ ok: false, text: '圖的大小不對（' + img.width + ' x ' + img.height + '，要 ' + RW + ' x ' + RH + '）：不要裁切或縮放，用「下載地圖圖片」那張畫' });
+            return;
+          }
+          const c = document.createElement('canvas'); c.width = RW; c.height = RH;
+          const g = c.getContext('2d'); g.drawImage(img, 0, 0);
+          const d = g.getImageData(0, 0, RW, RH).data, mask = new Uint8Array(RW * RH);
+          let n = 0;
+          // 跟 keepout.red_mask 一樣：R >= 150 而且比 G、B 都多 80 以上
+          for (let i = 0; i < mask.length; i++) { const r = d[i * 4], gg = d[i * 4 + 1], bb = d[i * 4 + 2]; if (r >= 150 && r - Math.max(gg, bb) >= 80) { mask[i] = 1; n++; } }
+          const u = sim.ko.slice(); u.siteKo = sim.siteKo; sim.koUndo.push(u);
+          sim.ko = [{ op: 'image', mask }]; sim.siteKo = false; sim.mapVer++;
+          buildRaster();
+          logEv('網頁 (' + LABEL + ')', '上傳禁區圖 ' + name + '（紅色 ' + fx(n * RES * RES, 1) + ' m²）');
+          setTimeout(publish, 0);
+          resolve({ ok: true, text: '已套用（展示版）：紅色 ' + fx(n * RES * RES, 1) + ' m² 變成禁區' });
+        };
+        img.onerror = () => resolve({ ok: false, text: '讀不到這張圖（要 PNG 或 JPG）' });
+        img.src = data;
+      });
+    },
   };
 }
 
@@ -1283,7 +1432,8 @@ function renderOverview(st) {
     html = '<span class="dot-run on"></span><div><strong>對位置中</strong><p>用存好的地圖 ' + esc(st.mapsrc.name) + '：光達在比對地圖，對上了才能自動割草。' + esc(st.mapsrc.loc.text || '') + '</p></div>';
   else if (st.mode === 1 && ms.state === 2) html = '<span class="dot-run on"></span><div><strong>自動割草中</strong><p>放開 LB 不會停。要停：停止鍵、RB、LB + X。</p></div>';
   else if (st.mode === 1 && ms.state === 1) html = '<span class="dot-run on"></span><div><strong>規劃路線中</strong><p>算好就出發。</p></div>';
-  else html = '<span class="dot-run"></span><div><strong>' + esc(MODE_NAME[st.mode]) + '</strong><p>' + (st.mode === 0 ? '建圖中，用手把開。' : st.mode === 1 ? '自動割草，' + esc(MSTATE[ms.state]) + '。' : '車子只聽手把。') + '</p></div>';
+  else html = '<span class="dot-run"></span><div><strong>' + esc(MODE_NAME[st.mode]) + '</strong><p>' + (st.mode === 0 ? '用手把沿著要割的地方開一圈。開好了就可以在地圖上畫禁區（點障礙物的幾個角，馬上送到車上），'
+    + '畫完記得存地圖（手把 Y 或下面的「存地圖」），下次開機選這張圖，不用重建、重畫。' : st.mode === 1 ? '自動割草，' + esc(MSTATE[ms.state]) + '。' : '車子只聽手把。') + '</p></div>';
   setHTML(why, html);
   const drawing = draw && draw.kind === 'keepout', locating = draw && draw.kind === 'locate';
   $('#mapDraw').hidden = locating || (!(st.map.ready && isHolder(st)) && !drawing);
@@ -1291,9 +1441,15 @@ function renderOverview(st) {
   renderDraw();
   const recNow = st.program.running && st.manager && st.mode !== 4 && !b && st.lawn && st.lawn.recording;
   const lostNow = st.program.running && locMode(st) && st.mapsrc.loc && st.mapsrc.loc.state === 'lost' && !locating && !locBlock(st);
+  // 建圖中 (2026-10-21 will)：建完圖就在這裡畫禁區、存地圖，不用找到「操作」那一頁
+  const mapNow = st.program.running && st.manager && st.mode === 0 && !b && !recNow && !draw && !koBlock(st);
   $('#btnWhyLawnStop').hidden = !recNow;
   $('#btnWhyLocate').hidden = !!recNow || !lostNow;
-  $('#whyAct').hidden = !((recNow || lostNow) && isHolder(st));
+  $('#btnWhyDraw').hidden = !mapNow;
+  $('#btnWhySave').hidden = !mapNow;
+  $('#btnWhySave').disabled = !!st.saving;
+  $('#btnWhySave').textContent = st.saving ? '存地圖中…' : '存地圖';
+  $('#whyAct').hidden = !((recNow || lostNow || mapNow) && isHolder(st));
   $('#btnWhyLawnStop').classList.toggle('go', !!recNow && st.lawn.gap != null && st.lawn.gap <= st.lawn.close_gap);
 
   if (!st.program.running) {
@@ -1615,6 +1771,7 @@ function startDraw(kind = 'keepout') {
   if (kb) { notice((kind === 'locate' ? '不能設定車子位置：' : '不能畫禁區：') + kb); return; }
   draw = { kind, op: 'add', pts: [], pos: null, yaw: null, busy: false, locked: false };
   if (pending && pending.kind === 'notice') { pending = null; $('#confirm').hidden = true; }   // 上一個提示會蓋住下面的工具列
+  document.documentElement.style.setProperty('--work-h', $('.work').clientHeight + 'px');
   $('#mapbox').classList.add('drawing');
   $('#mapbox').scrollIntoView({ block: 'start' });     // 從「操作」過來的時候畫面可能捲在下面
   sizeCanvas(); computeView(last); draw.locked = true;
@@ -1699,6 +1856,8 @@ cv.addEventListener('wheel', e => { if (!draw) return; e.preventDefault(); zoomB
 $('#mapDraw').onclick = () => draw ? stopDraw() : startDraw('keepout');
 $('#mapLocate').onclick = () => draw ? stopDraw() : startDraw('locate');
 $('#btnWhyLocate').onclick = () => { if (!draw) startDraw('locate'); };
+$('#btnWhyDraw').onclick = () => { if (!draw) startDraw('keepout'); };
+$('#btnWhySave').onclick = () => ask('savemap');
 $('#locReset').onclick = () => { if (draw) { draw.pos = null; draw.yaw = null; renderDraw(); drawMap(); } };
 $('#locExit').onclick = stopDraw;
 $('#locGo').onclick = () => {

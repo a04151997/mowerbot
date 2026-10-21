@@ -400,15 +400,30 @@ class MowerManager(Node):
                               reliability=QoSReliabilityPolicy.RELIABLE)
         self.create_subscription(Bool, '/map_autosave/busy', self.map_busy_cb, busy_qos)
         # 用存好的地圖開機 (2026-10-21，map_session.py)：光達跟地圖對上了才讓自動割草出發。
-        # 對錯位置的話割草範圍、禁區、外框整片跟著偏，而且畫面上看起來一切正常。
-        # 只擋出發 (call_f2c_planner)；割草中定位變差不停車 (網頁顯示警告)。手把 Y 的預覽不擋。
+        # 對錯位置的話割草範圍、禁區、外框整片跟著偏，而且畫面上看起來一切正常。手把 Y 的預覽不擋。
+        # 割草中對不上 (2026-10-21 will 選「要停」)：連續 loc_pause_after 秒對不上就暫停 (跟手把斷線、
+        # 光達中斷一樣每個 tick 送零，不取消任務)，對上了就從原地接著走，不用按 LB。
+        # 短暫擋一下 (有人走過光達前面) 不停：map_session 自己取最近 3 秒最好的分數，這裡再等 3 秒。
+        # 暫停超過 15 s 那一段照樣被 Nav2 判失敗跳過 (跟其他暫停一樣)。建新地圖時不看 (SLAM 自己就是地圖)。
         self.declare_parameter('saved_map', '')
+        self.declare_parameter('auto_requires_localization', True)
+        self.declare_parameter('loc_pause_after', 3.0)
         self.saved_map = str(self.get_parameter('saved_map').value)
+        self.auto_requires_localization = bool(
+            self.get_parameter('auto_requires_localization').value)
+        self.loc_pause_after = float(self.get_parameter('loc_pause_after').value)
         self._loc_match = None
         self._loc_match_time = None
+        self._loc_bad_since = None
+        self._loc_pause_why = None      # 開始暫停那時候的原因 (暫停中文字不變，log 才不會一直印)
         if self.saved_map:
             self.create_subscription(String, '/map_session/match', self.loc_match_cb, busy_qos)
-            self.get_logger().info(f'🗺️ 用存好的地圖 {self.saved_map}：定位對上才讓自動割草出發')
+            self.get_logger().info(
+                f'🗺️ 用存好的地圖 {self.saved_map}：定位對上才讓自動割草出發'
+                + (f'；割草中對不上超過 {self.loc_pause_after:.0f} 秒就暫停'
+                   if self.auto_requires_localization else '；割草中對不上只警告、不停車'))
+            if self.auto_requires_localization:
+                self.create_timer(0.2, self.loc_watch)
         self.joy_status_sub = self.create_subscription(
             JoyStatus, '/joy_status', self.joy_status_cb, 10)
         if self.auto_requires_scan:
@@ -551,7 +566,29 @@ class MowerManager(Node):
                 return '還沒收到光達 /scan'
             if self._age(self._scan_time) > self.auto_input_timeout:
                 return '光達 /scan 中斷 %.1f s' % self._age(self._scan_time)
-        return None
+        return self.localization_pause_reason()
+
+    def loc_watch(self):
+        """0.2 s 一次記下定位從什麼時候開始對不上 (auto_block_reason 會提早 return，不能在那裡記)。"""
+        if self.localization_block_reason() is None:
+            self._loc_bad_since = None
+            self._loc_pause_why = None
+        elif self._loc_bad_since is None:
+            self._loc_bad_since = self.get_clock().now()
+
+    def localization_pause_reason(self):
+        """用存好的地圖、連續 loc_pause_after 秒對不上：暫停的原因；其他情況 None。"""
+        if not (self.saved_map and self.auto_requires_localization) or self._loc_bad_since is None:
+            return None
+        if self._age(self._loc_bad_since) < self.loc_pause_after:
+            return None
+        if self._loc_pause_why is None:
+            why = self.localization_block_reason()
+            if why is None:
+                return None
+            self._loc_pause_why = why
+        return '定位對不上存好的地圖超過 %.0f 秒 (%s)，對上了就接著走' % (
+            self.loc_pause_after, self._loc_pause_why)
 
     def loc_match_cb(self, msg):
         try:

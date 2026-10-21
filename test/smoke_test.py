@@ -5993,10 +5993,17 @@ def phase_l():
 #   S8  手把斷線 → 1.0 s 內歸零；重新連上 (LB 沒按) → 維持 0 (不會自己走)；按一下 LB 放開 → 恢復 0.3
 #   S9  光達中斷 → 1.0 s 內歸零；恢復 → 0.3 (不用按 LB)
 #   S10 RB 急停 (LB 沒按) → S_STOP_LATENCY 內歸零，放開 RB 之後也維持 0 (急停鎖住)
+#
+# 2026-10-21 will：用存好的地圖時，割草中定位對不上要停。S11 ~ S13 換一個 saved_map:=smoke_s 的
+# mower_manager，測試扮演 map_session 發 /map_session/match (latched，1 Hz)：
+#   S11 對上 → 照走；對不上 → S_LOC_PAUSE 秒左右歸零 (不會更早)；對上了 → 不用按 LB 接著走
+#   S12 只對不上 1.5 秒 (有人走過光達前面) → 一直照走，一筆 0 都沒有
+#   S13 map_session 停了 (回報中斷 3 秒 + 再等 S_LOC_PAUSE 秒) → 歸零；恢復 → 接著走
 # --------------------------------------------------------------------------
 S_NAV_X = 0.3
 S_STOP_LATENCY = 0.3      # 放開 LB 到 /cmd_vel 歸零的上限 (teleop 一變化就發 /joy_status)
 S_LOSS_LATENCY = 1.0      # 手把 / 光達中斷到歸零的上限 (逾時 0.5 s + 發布週期)
+S_LOC_PAUSE = 3.0         # mower_manager loc_pause_after 的預設值
 
 
 def _load_launch_module(pkg, fname):
@@ -6150,6 +6157,17 @@ class SRig(object):
         self.node.create_timer(0.05, self._tick_joy)
         self.node.create_timer(0.1, self._tick_scan)
         self.node.create_timer(0.05, self._tick_nav)
+        # S11 ~ S13：測試扮演 map_session (latched，跟 mower_manager 訂的 QoS 一樣)；None = 不發
+        from std_msgs.msg import String
+        from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+        self.String = String
+        self.match_pub = self.node.create_publisher(
+            String, '/map_session/match',
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self.match = None
+        self.match_pub_t = None     # 最後一次發 /map_session/match 的時間 (S13 從這裡算)
+        self.node.create_timer(1.0, self._tick_match)
 
     def _tick_joy(self):
         if not self.send_joy:
@@ -6180,6 +6198,18 @@ class SRig(object):
             ranges[i] = min(ranges[i], math.hypot(rx, ry))
         m.ranges = ranges
         self.scan_pub.publish(m)
+
+    def _tick_match(self):
+        if self.match is not None:
+            import json
+            self.match_pub.publish(self.String(data=json.dumps(self.match, ensure_ascii=False)))
+            self.match_pub_t = time.time()
+
+    def set_match(self, ok, score, text):
+        """換定位結果，馬上發一筆 (之後 1 Hz)"""
+        self.match = {'mode': 'localization', 'state': 'ok', 'ok': ok, 'score': score, 'n': 200,
+                      'text': text, 't': round(time.time(), 1)}
+        self._tick_match()
 
     def _tick_nav(self):
         if not self.send_nav:
@@ -6250,7 +6280,7 @@ def phase_s():
     s0_launch_defaults()
     rig = SRig()
     later = [('S2', '放開 LB 停車'), ('S3', '手把斷線停車'), ('S4', '光達中斷停車'),
-             ('S5', '光達停止區'), ('S6', '手動模式不受停止區影響')] + S_NOHOLD
+             ('S5', '光達停止區'), ('S6', '手動模式不受停止區影響')] + S_NOHOLD + S_LOC
     try:
         if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
             print(rig.manager.log_tail(30))
@@ -6368,6 +6398,7 @@ def phase_s():
         record('S', 'S6', '手動模式不受停止區影響', 'PASS' if ok else 'FAIL',
                '%d 筆全為 %.2f = %s' % (m, want, ok))
         s_nohold(rig)
+        s_localization(rig)
     finally:
         rig.close()
 
@@ -6453,6 +6484,91 @@ def s_nohold(rig):
            '歸零延遲 %s；放開後維持 0 %s' % (('%.3f s' % lat) if lat is not None else '沒有歸零', held))
 
 
+S_LOC = [('S11', '用存好的地圖：割草中定位對不上暫停、對上了接著走'), ('S12', '定位短暫變差不停'),
+         ('S13', '定位回報中斷也停')]
+
+
+def s_localization(rig):
+    """S11 ~ S13：用存好的地圖 (saved_map) 時，割草中定位對不上要停 (2026-10-21 will)。"""
+    hdr('S11  saved_map:=smoke_s 的 mower_manager：對上 → 走；對不上 %.0f 秒 → 停；對上 → 接著走'
+        % S_LOC_PAUSE)
+    rig.manager.stop()
+    rig.spin(2.0)
+    rig.set_match(True, 0.85, '對上了：光達 85% 落在地圖的牆上')
+    rig.manager = bg_start('S_mower_manager_loc',
+                           ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                            '--ros-args', '-p', 'use_sim_time:=false',
+                            '-p', 'auto_requires_deadman:=false', '-p', 'saved_map:=smoke_s']
+                           + _manager_geometry_args())
+    rig.send_nav, rig.send_joy, rig.send_scan = True, True, True
+    rig.lb, rig.rb, rig.stick, rig.obstacle = False, False, 0.0, []
+    up = False
+    t_end = time.time() + 20.0
+    while time.time() < t_end and not up:
+        rig.spin(1.0)
+        up = bool(rig.manager.log_grep(r'割草中對不上超過', 1)) and rig.set_mode(1) is True
+    sub('新的 mower_manager 起來、change_mode(1) = %s' % up)
+    for h in rig.manager.log_grep(r'用存好的地圖', 1):
+        sub('    %s' % h.strip()[:160])
+    fwd = up and rig.wait_forwarding(20.0)
+    sub('定位對上：/cmd_vel 穩定在 %.1f = %s' % (S_NAV_X, fwd))
+    if not fwd:
+        print(rig.manager.log_tail(30))
+        for cid, name in S_LOC:
+            record('S', cid, name, 'FIXTURE', '定位對上時 /cmd_vel 沒有穩定在 %.1f' % S_NAV_X)
+        return
+    t0 = time.time()
+    rig.set_match(False, 0.21, '光達只有 21% 落在地圖的牆上 (要 50%)：有人或東西擋住光達？')
+    lat, after_nz, n = rig.stop_after(t0, S_LOC_PAUSE + 2.0)
+    sub('定位對不上：歸零延遲 %s (共 %d 筆)' % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    paused = rig.manager.log_grep(r'定位對不上存好的地圖超過', 1)
+    for h in paused:
+        sub('    %s' % h.strip()[:160])
+    held, m = rig.steady(2.0, 0.0)
+    sub('還是對不上：最後 1.5 秒 %d 筆全為 0 = %s' % (m, held))
+    rig.set_match(True, 0.86, '對上了：光達 86% 落在地圖的牆上')
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('對上了 (LB 沒按)：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = (lat is not None and S_LOC_PAUSE - 0.3 <= lat <= S_LOC_PAUSE + 1.0 and bool(paused)
+          and held and resumed)
+    record('S', 'S11', '用存好的地圖：割草中定位對不上暫停、對上了接著走', 'PASS' if ok else 'FAIL',
+           '歸零延遲 %s (要 %.1f ~ %.1f s)；維持 0 %s；對上後恢復 %s'
+           % (('%.3f s' % lat) if lat is not None else '沒有歸零', S_LOC_PAUSE - 0.3,
+              S_LOC_PAUSE + 1.0, held, resumed))
+
+    hdr('S12  只對不上 1.5 秒 (有人走過光達前面) → 一直照走')
+    t0 = time.time()
+    rig.set_match(False, 0.30, '光達只有 30% 落在地圖的牆上 (要 50%)')
+    rig.spin(1.5)
+    rig.set_match(True, 0.84, '對上了：光達 84% 落在地圖的牆上')
+    rig.spin(S_LOC_PAUSE + 1.0)
+    w = rig.since(t0)
+    zeros = sum(1 for _t, x in w if abs(x) < 1e-9)
+    ok = len(w) >= 50 and zeros == 0
+    sub('%.1f 秒內 %d 筆，0 的有 %d 筆' % (2.5 + S_LOC_PAUSE, len(w), zeros))
+    record('S', 'S12', '定位短暫變差 (1.5 秒) 不停', 'PASS' if ok else 'FAIL',
+           '%d 筆裡 %d 筆是 0' % (len(w), zeros))
+
+    hdr('S13  map_session 停了 → 回報中斷 3 秒再等 %.0f 秒 → 停；恢復 → 接著走' % S_LOC_PAUSE)
+    # 回報中斷的 3 秒從最後收到的那一筆算 (1 Hz，最多比停發早 1 秒)，所以延遲也從最後一筆算
+    t0 = time.time()
+    rig.match = None
+    t_last = rig.match_pub_t
+    lat, after_nz, n = rig.stop_after(t0, 3.0 + S_LOC_PAUSE + 2.0)
+    if lat is not None:
+        lat += t0 - t_last
+    sub('定位回報停發：從最後一筆算的歸零延遲 %s (共 %d 筆)'
+        % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    rig.set_match(True, 0.85, '對上了：光達 85% 落在地圖的牆上')
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('定位回報恢復：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = lat is not None and 3.0 + S_LOC_PAUSE - 0.3 <= lat <= 3.0 + S_LOC_PAUSE + 1.0 and resumed
+    record('S', 'S13', '定位回報中斷也停、恢復接著走', 'PASS' if ok else 'FAIL',
+           '從最後一筆回報算的歸零延遲 %s (要 %.1f ~ %.1f s)；恢復 %s'
+           % (('%.3f s' % lat) if lat is not None else '沒有歸零', 3.0 + S_LOC_PAUSE - 0.3,
+              3.0 + S_LOC_PAUSE + 1.0, resumed))
+
+
 # --------------------------------------------------------------------------
 # Phase M  手把三種模式 (2026-10-18 will)：LB + X 手動、LB + A 才開始建圖、LB + B 先存圖再規劃。
 # 不需要 Gazebo。mower_manager、slam_scan_gate 是真的；存圖服務 (map_autosave) 與
@@ -6503,7 +6619,8 @@ def m0_launch_defaults():
 
 def _m0_launch_defaults():
     from launch import LaunchContext
-    from launch.actions import IncludeLaunchDescription, OpaqueFunction
+    from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction,
+                                SetLaunchConfiguration)
     from launch.utilities import perform_substitutions
 
     def txt(c, x):
@@ -6522,11 +6639,16 @@ def _m0_launch_defaults():
         base.update(cfg)
         for k, v in base.items():
             c.launch_configurations[k] = v
+        # 其他宣告過的參數用 launch 檔自己的預設值 (跟真的 ros2 launch 一樣；10-21 起有 saved_map 等)
+        for d in declared:
+            if d.name not in c.launch_configurations and d.default_value is not None:
+                c.launch_configurations[d.name] = perform_substitutions(c, d.default_value)
         return c
 
     problems = []
     mc, _ = _load_launch_module('mowerbot_bringup', 'mower_control.launch.py')
     ld = mc.generate_launch_description()
+    declared = [e for e in ld.entities if isinstance(e, DeclareLaunchArgument)]
     fns = [e for e in ld.entities if isinstance(e, OpaqueFunction)]
     # (use_sim_time, mapping_on_button, save_map_before_f2c) -> (閘門 + SLAM 讀 /scan_slam, 存圖節點, manager 先存圖)
     # 10-19 起 save_map_before_f2c 留空 = false (不跟 use_sim_time)；存圖節點跟著 mapping_on_button (給 Y 存圖)
@@ -6539,6 +6661,9 @@ def _m0_launch_defaults():
         execs, scan_topic, manager_save = [], None, None
         for fn in fns:
             for a in fn.execute(c) or []:
+                if isinstance(a, SetLaunchConfiguration):    # resolve_map_session 算好的 session 給後面用
+                    a.execute(c)
+                    continue
                 ex = getattr(a, 'node_executable', None)
                 if ex:
                     execs.append(ex)

@@ -40,6 +40,16 @@ echo ""
 
 rc=0
 
+# 這張圖的 session_id 先問、先寫 (2026-10-21)：網頁的地圖清單看到四個檔案就列出這張圖，
+# .session 晚寫的話，存好後那幾秒清單會說這張圖沒有禁區 (清單用 session 找禁區、外框)。
+# session 整次開機都一樣，先問後問結果相同。
+session=""
+if session="$(ros2 run mowerbot_action keepout_tool session 2>/dev/null)" && [ -n "${session}" ]; then
+    echo "${session}" > "${TARGET}.session"
+else
+    session=""
+fi
+
 echo "[1/2] serialize_map -> ${NAME}.posegraph + ${NAME}.data"
 if ! ros2 service call /slam_toolbox/serialize_map \
         slam_toolbox/srv/SerializePoseGraph \
@@ -116,8 +126,7 @@ echo ""
 # (用法見 mowerbot_action/keepout.py)。keepout_server 沒開時 (只跑 SLAM、舊版程式) 跳過，
 # 不影響存圖本身，也不改 rc。
 if [ -f "${TARGET}.yaml" ]; then
-    if session="$(ros2 run mowerbot_action keepout_tool session 2>/dev/null)" && [ -n "${session}" ]; then
-        echo "${session}" > "${TARGET}.session"
+    if [ -n "${session}" ]; then
         echo "  地圖的 session：${session}（禁區、外框跟著它存；下次用這張圖啟動會載回來）"
         ros2 run mowerbot_action keepout_tool template "${TARGET}" \
             || echo "  !! 畫禁區用的圖沒有產生" >&2
