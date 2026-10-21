@@ -247,7 +247,8 @@ def test_edge_loops_walls_keep_stop_zone_clear():
     for r in routes:
         assert r['full']
         check_route(el, r)
-    plain = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W).routes([1.10], SAFE, ROT_NEED)[0]
+    plain = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W).routes(
+        [1.10], SAFE, ROT_NEED)[0]
     assert routes[0]['length'] < plain['length']
 
 
@@ -310,7 +311,8 @@ def hairpin(r=1.0, leg=4.0, step=0.1):
     a = np.column_stack([np.arange(0.0, leg, step), np.zeros(int(round(leg / step)))])
     t = np.linspace(-math.pi / 2, math.pi / 2, int(round(math.pi * r / step)) + 1)
     arc = np.column_stack([leg + r * np.cos(t), r + r * np.sin(t)])
-    b = np.column_stack([np.arange(leg - step, -1e-9, -step), np.full(int(round(leg / step)), 2 * r)])
+    b = np.column_stack([np.arange(leg - step, -1e-9, -step),
+                         np.full(int(round(leg / step)), 2 * r)])
     return np.vstack([a, arc, b])
 
 
@@ -333,3 +335,100 @@ def test_rotation_ok_near_edge():
     assert el.rotation_ok((5.0, 0.75), 0.0, math.radians(30.0))
     assert not el.rotation_ok((5.0, 0.75), 0.0, math.radians(-90.0))
     assert el.rotation_ok((5.0, 3.0), 0.0, math.pi - 0.01)     # 場地中間轉一圈都沒問題
+
+
+# ---- 原地轉身的地方離牆夠遠 (第 4 節) ----
+ZONE_NEED = (route_plan.stop_zone_turn_radius(FRONT, HALF_W, 0.40, 0.05)
+             + route_plan.TURN_WALL_MARGIN)
+
+
+def test_stop_zone_turn_radius():
+    r = route_plan.stop_zone_turn_radius(0.975, 0.42, 0.40, 0.05)
+    assert abs(r - math.hypot(1.375, 0.47)) < 1e-12
+    assert 1.59 < ZONE_NEED < 1.61
+
+
+def test_wall_clearance_ignores_specks_and_outside():
+    res, ox, oy = 0.05, -1.0, -1.0
+    grid = np.zeros((200, 200), bool)
+    grid[100:102, 20:180] = True                 # 一道牆 y = 4.0 ~ 4.1 (x 0 ~ 8)
+    grid[40, 40] = True                          # 一個雜點 (1, 1)：不算牆
+    wc = route_plan.WallClearance((grid, res, ox, oy))
+    d = wc.at(np.array([[3.0, 2.0], [1.0, 1.0], [3.0, 3.5], [50.0, 50.0]]))
+    assert abs(d[0] - 2.0) < 0.06 and abs(d[2] - 0.5) < 0.06
+    assert d[1] > 2.5                            # 雜點旁邊不算離牆近
+    assert math.isinf(d[3])                      # 地圖外面當作沒有牆
+    empty = route_plan.WallClearance((np.zeros((10, 10), bool), res, 0.0, 0.0))
+    assert math.isinf(float(empty.at((0.2, 0.2))))
+
+
+def test_trim_ends():
+    pts = np.column_stack([np.arange(0.0, 5.01, 0.1), np.zeros(51)])
+    assert route_plan.trim_ends(pts, np.ones(51, bool)) == (0, 50)
+    ok = pts[:, 0] <= 4.0                        # 盡頭那 1 m 離牆太近
+    assert route_plan.trim_ends(pts, ok) == (0, 40)
+    ok = (pts[:, 0] >= 0.5) & (pts[:, 0] <= 4.0)
+    ok[25] = False                               # 中間不能轉身沒關係 (直直開過去)
+    assert route_plan.trim_ends(pts, ok) == (5, 40)
+    assert route_plan.trim_ends(pts, (pts[:, 0] >= 2.4) & (pts[:, 0] <= 2.8)) is None   # 剩 0.4 m
+    assert route_plan.trim_ends(pts, np.zeros(51, bool)) is None
+
+
+def box_walls(box, res=0.05):
+    """一個方塊 (x0, y0, x1, y1) 是光達看得到的牆：(grid, res, ox, oy)。"""
+    ox, oy = -3.0, -3.0
+    grid = np.zeros((int(14 / res), int(18 / res)), bool)
+    x0, y0, x1, y1 = box
+    r0, r1 = int((y0 - oy) / res), int((y1 - oy) / res)
+    c0, c1 = int((x0 - ox) / res), int((x1 - ox) / res)
+    grid[r0:r1, c0:c1] = True
+    return grid, res, ox, oy
+
+
+def test_transit_corners_keep_away_from_walls():
+    """障礙物是真的牆：繞過去的轉折點離它 >= ZONE_NEED (光達停止區原地轉一圈掃不到)，還是繞得過去。"""
+    wc = route_plan.WallClearance(box_walls(BOX))
+    tp = route_plan.TransitPlanner(field_with_hole(), 0.47, 1.11, walls=wc, wall_need=ZONE_NEED)
+    a, b = (2.0, 1.65), (8.0, 1.65)
+    path = tp.plan(a, b, relax=0.0)
+    assert path is not None and len(path) > 2
+    for p, q in zip(path[:-1], path[1:]):
+        assert not seg_hits_box(p, q, BOX, 0.45)
+    for c in path[1:-1]:
+        assert float(wc.at(c)) >= ZONE_NEED - 1e-6
+        assert tp.clearance(*c) >= 1.11 - 1e-6
+    plain = route_plan.TransitPlanner(field_with_hole(), 0.47, 1.11)
+    # 以前轉折點離牆比較近
+    assert min(float(wc.at(c)) for c in plain.plan(a, b, relax=0.0)[1:-1]) < ZONE_NEED
+
+
+def test_edge_loops_ramp_ends_keep_away_from_walls():
+    """四周是牆：匝道兩頭 (原地轉身的地方) 要離牆 >= ZONE_NEED，匝道往裡面多挪、斜一點，還是繞得了。"""
+    w, h = 12.0, 8.0
+    walls = room_walls(w, h)
+    el = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W, walls=walls, turn_wall=ZONE_NEED)
+    routes = el.routes([1.10, 0.75], SAFE, ROT_NEED)
+    assert [r['d'] for r in routes] == [1.10]
+    wc = route_plan.WallClearance(walls)
+    for r in routes:
+        check_route(el, r)
+        assert float(wc.at(r['pts'][0])) >= ZONE_NEED - 0.03
+        assert float(wc.at(r['pts'][-1])) >= ZONE_NEED - 0.03
+    old = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W, walls=walls).routes(
+        [1.10], SAFE, ROT_NEED)[0]
+    assert float(wc.at(old['pts'][0])) < ZONE_NEED                    # 以前匝道起點離牆只有 1.30 m
+    got = el.escape((6.0, 1.10), 0.0, ROT_NEED)                       # 往回開也要開到離牆夠遠
+    assert got is not None and float(wc.at(got[0][-1])) >= ZONE_NEED - 0.03
+
+
+def test_zone_sweep_clearance():
+    """前面 1.3 m 有一道牆 (y = 1.3)：朝牆的停止區已經碰到；背對牆轉 30° 掃不到；轉 180° 一定掃到。"""
+    res, ox, oy = 0.05, -5.0, -5.0
+    grid = np.zeros((200, 200), bool)
+    grid[int((1.3 - oy) / res):int((1.5 - oy) / res), :] = True
+    wc = route_plan.WallClearance((grid, res, ox, oy))
+    up, down = math.pi / 2, -math.pi / 2
+    x0, x1, hw = FRONT, FRONT + 0.40, HALF_W + 0.05
+    assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), up, up, x0, x1, hw) < 0.05
+    assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), down, down + 0.5, x0, x1, hw) > 1.0
+    assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), down, up - 0.01, x0, x1, hw) < 0.05

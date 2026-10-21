@@ -61,7 +61,8 @@ def test_score_high_at_true_pose_and_low_when_off():
     good, n = map_match.score(field, map_match.transform(pts, *true))
     assert n > 300
     assert good > 0.95
-    bad, _ = map_match.score(field, map_match.transform(pts, true[0] + 0.8, true[1] - 0.5, true[2] + 0.25))
+    off = map_match.transform(pts, true[0] + 0.8, true[1] - 0.5, true[2] + 0.25)
+    bad, _ = map_match.score(field, off)
     assert bad < 0.4
 
 
@@ -103,6 +104,7 @@ def test_scan_points_drops_invalid_and_far_returns():
     p = map_match.scan_points(ranges, 0.0, math.pi / 2, 0.15, 40.0)
     assert p.shape == (2, 2)
     assert np.allclose(p[0], [1.0, 0.0])
-    assert np.allclose(p[1], [2.0 * math.cos(5 * math.pi / 2), 2.0 * math.sin(5 * math.pi / 2)], atol=1e-9)
+    a = 5 * math.pi / 2
+    assert np.allclose(p[1], [2.0 * math.cos(a), 2.0 * math.sin(a)], atol=1e-9)
     many = map_match.scan_points([3.0] * 720, -math.pi, 2 * math.pi / 720, 0.15, 40.0)
     assert len(many) == map_match.MAX_POINTS

@@ -31,7 +31,8 @@ class MapField:
         self.h, self.w = occ.shape
         self.n_occupied = int(np.count_nonzero(occ))
         free = (~occ).astype(np.uint8)
-        self.dist = cv2.distanceTransform(free, cv2.DIST_L2, cv2.DIST_MASK_PRECISE).astype(np.float32) * self.res
+        self.dist = cv2.distanceTransform(
+            free, cv2.DIST_L2, cv2.DIST_MASK_PRECISE).astype(np.float32) * self.res
         self.far = float(max(self.h, self.w) * self.res)
 
     def distance_at(self, xy):
@@ -45,7 +46,8 @@ class MapField:
         return out
 
 
-def scan_points(ranges, angle_min, angle_inc, range_min, range_max, max_range=11.5, max_points=MAX_POINTS):
+def scan_points(ranges, angle_min, angle_inc, range_min, range_max, max_range=11.5,
+                max_points=MAX_POINTS):
     """LaserScan -> 光達座標系的點 (N, 2)。無效、太近、太遠 (超過 max_range) 的不要；最多 max_points 點。"""
     r = np.asarray(ranges, dtype=float)
     a = angle_min + np.arange(len(r)) * angle_inc

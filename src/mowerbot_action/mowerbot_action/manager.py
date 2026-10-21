@@ -298,16 +298,32 @@ class MowerManager(Node):
         # 沿邊那幾圈在牆邊轉彎時，停止區不能掃到地圖上的牆 (掃到車子就停，那一段 15 s 後判失敗)
         self.declare_parameter('stop_zone_length', 0.40)
         self.declare_parameter('stop_zone_side_margin', 0.05)
+        # 光達停止區有沒有開 (mower_control.launch.py 照 navigation.launch.py 的規則傳進來：實車開、模擬關)。
+        # 開著的時候，要原地轉身的地方 (割草線兩頭、跑道起點、轉場轉折點、環繞的轉角、沿邊的匝道)
+        # 離地圖上的牆要夠遠，停止區轉一圈才掃不到牆 (route_plan 第 4 節，2026-10-21)。
+        self.declare_parameter('stop_zone_active', False)
+        self.stop_zone_active = bool(self.get_parameter('stop_zone_active').value)
         self.edge_offsets = self.parse_edge_loops(str(self.get_parameter('edge_loops').value))
         self._edge = None               # 這一趟的 route_plan.EdgeLoops (執行中失敗時算退出路線)
         self._edge_cont = set()         # 沿邊路線「接著上一段」的那幾段 (id(Path))：不原地對正
         self.map_msg = None
-        if self.edge_offsets:
+        if self.edge_offsets or self.stop_zone_active:
             self.FRONT_EXTENT = float(self.get_parameter('front_extent').value)
             self.REAR_EXTENT = float(self.get_parameter('rear_extent').value)
+        if self.edge_offsets:
             self.get_logger().info(
                 '🪢 沿邊多繞 %d 圈：離邊界 %s m (轉角邊走邊轉)'
                 % (len(self.edge_offsets), '、'.join('%.2f' % d for d in self.edge_offsets)))
+        self.turn_wall_need = 0.0       # 要原地轉身的點離牆至少多遠 (0 = 不查)
+        self._wall_turn_cache = None    # (地圖的 stamp 與大小, route_plan.WallClearance)
+        if self.stop_zone_active:
+            self.turn_wall_need = route_plan.TURN_WALL_MARGIN + route_plan.stop_zone_turn_radius(
+                self.FRONT_EXTENT, self.LEAD_IN_BOUNDARY_CLEARANCE,
+                float(self.get_parameter('stop_zone_length').value),
+                float(self.get_parameter('stop_zone_side_margin').value))
+            self.get_logger().info(
+                '🧱 光達停止區開著：要原地轉身的地方離地圖上的牆至少 %.2f m (停止區轉一圈掃不到牆)'
+                % self.turn_wall_need)
         # mode 3 是**保留值，沒有實作**(階段 23)。
         #
         # 【為什麼不重新編號】
@@ -451,8 +467,8 @@ class MowerManager(Node):
         self.costmap_sub = self.create_subscription(
             OccupancyGrid, '/local_costmap/costmap',
             self.costmap_cb, costmap_qos)
-        # 沿邊繞圈要知道哪裡是真的牆 (光達看得到、停止區會停)：地圖上的佔據格
-        if self.edge_offsets:
+        # 沿邊繞圈、原地轉身的地方要知道哪裡是真的牆 (光達看得到、停止區會停)：地圖上的佔據格
+        if self.edge_offsets or self.stop_zone_active:
             self.create_subscription(OccupancyGrid, '/map', self.map_cb, costmap_qos)
 
         self.obstacles_sub = self.create_subscription(
@@ -687,6 +703,105 @@ class MowerManager(Node):
         o = m.info.origin.position
         return grid, float(m.info.resolution), float(o.x), float(o.y)
 
+    def wall_turn(self):
+        """原地轉身時光達停止區掃不掃得到地圖上的牆：回傳 route_plan.WallClearance (離牆多遠)。
+
+        光達停止區沒開、或還沒有地圖時回傳 None (不查)。地圖換了 (建圖中每幾秒一張) 才重算。
+        """
+        if not self.stop_zone_active:
+            return None
+        m = self.map_msg
+        if m is None or m.info.width == 0 or m.info.height == 0:
+            return None
+        key = (m.header.stamp.sec, m.header.stamp.nanosec, m.info.width, m.info.height)
+        if self._wall_turn_cache is None or self._wall_turn_cache[0] != key:
+            self._wall_turn_cache = (key, route_plan.WallClearance(self.map_walls()))
+        return self._wall_turn_cache[1]
+
+    def check_perimeter_corners(self, edges):
+        """周邊環繞每一個轉角原地轉身 (轉比較短的那一邊) 時，光達停止區離牆很近的印 WARN。
+
+        環繞那一圈離牆大約 1.4 ~ 1.7 m，比停止區轉一整圈要的距離近，但轉角只轉 90° 左右、而且轉向裡面，
+        所以不像割草線兩頭那樣縮短，只照實際轉的角度查。這是估計：車子到轉角時的方向跟這一邊的方向會差
+        幾度 (半徑 1.45 m，差 5° 就差 0.13 m)。lab1 紅線當牆的模擬印了 6 個，車子實際轉的時候停止區
+        離牆 0.07 ~ 0.18 m，都轉過去了；實車定位再差一點就可能停在那裡。
+        第一段由 approach 開過去 (方向不一定)，那裡由 approach_target 查。
+        """
+        wc = self.wall_turn()
+        if wc is None or len(edges) < 2:
+            return
+        x0 = self.FRONT_EXTENT
+        x1 = x0 + float(self.get_parameter('stop_zone_length').value)
+        hw = (self.LEAD_IN_BOUNDARY_CLEARANCE
+              + float(self.get_parameter('stop_zone_side_margin').value))
+
+        def heading(poses, from_end):
+            # 這一邊在轉角那一頭的方向：取離轉角 0.3 m 以上的點 (F2C 在轉角常有重複或很密的點)
+            seq = poses[::-1] if from_end else poses
+            p0 = seq[0].pose.position
+            for ps in seq[1:]:
+                q = ps.pose.position
+                if math.hypot(q.x - p0.x, q.y - p0.y) >= 0.3:
+                    return (math.atan2(p0.y - q.y, p0.x - q.x) if from_end
+                            else math.atan2(q.y - p0.y, q.x - p0.x))
+            return None
+
+        bad = []
+        for prev, nxt in zip(edges[:-1], edges[1:]):
+            if len(prev.poses) < 2 or len(nxt.poses) < 2:
+                continue
+            b, c = prev.poses[-1].pose.position, nxt.poses[0].pose.position
+            if math.hypot(c.x - b.x, c.y - b.y) > 0.5:
+                continue        # 不是同一圈接著的 (換下一圈要先開過去，那裡由 approach_target 查)
+            h_in, h_out = heading(prev.poses, True), heading(nxt.poses, False)
+            if h_in is None or h_out is None:
+                continue
+            gap = route_plan.zone_sweep_clearance(wc, (c.x, c.y), h_in, h_out, x0, x1, hw)
+            if gap < route_plan.EDGE_ZONE_MARGIN:
+                bad.append('(%.2f, %.2f) %.0f°->%.0f° 離牆 %.2f m'
+                           % (c.x, c.y, math.degrees(h_in), math.degrees(h_out), gap))
+        if bad:
+            self.get_logger().warn(
+                '🧱 周邊環繞有 %d 個轉角原地轉身時光達停止區離牆不到 %.2f m (估計)，'
+                '車子可能停在那裡：%s' % (len(bad), route_plan.EDGE_ZONE_MARGIN, '、'.join(bad)))
+
+    def trim_for_wall_turns(self, paths, what):
+        """割草線 / 環繞的直邊兩頭要原地轉身：離牆不夠遠的那一頭往裡面縮短，剩太短的不割。
+
+        光達停止區轉身會掃到牆的話車子就停在那裡 (route_plan 第 4 節)。停止區沒開、
+        或還沒有地圖時原樣回傳。
+        """
+        wc = self.wall_turn()
+        if wc is None or not paths:
+            return paths
+        out, cut, dropped, lost = [], 0, 0, 0.0
+        for p in paths:
+            xy = np.array([(ps.pose.position.x, ps.pose.position.y) for ps in p.poses])
+            if len(xy) < 2:
+                out.append(p)
+                continue
+            full = float(np.sum(np.hypot(*np.diff(xy, axis=0).T)))
+            r = route_plan.trim_ends(xy, wc.at(xy) >= self.turn_wall_need)
+            if r is None:
+                dropped += 1
+                lost += full
+                continue
+            i0, i1 = r
+            if (i0, i1) != (0, len(xy) - 1):
+                q = Path()
+                q.header = p.header
+                q.poses = list(p.poses[i0:i1 + 1])
+                cut += 1
+                lost += full - float(np.sum(np.hypot(*np.diff(xy[i0:i1 + 1], axis=0).T)))
+                p = q
+            out.append(p)
+        if cut or dropped:
+            self.get_logger().info(
+                '🧱 %s兩頭離牆不到 %.2f m (原地轉身時光達停止區會掃到牆)：'
+                '%d 條往裡面縮短、%d 條太短不割，少割 %.1f m'
+                % (what, self.turn_wall_need, cut, dropped, lost))
+        return out
+
     def costmap_cost_at(self, x, y):
         """回傳 (x, y) 在 local costmap 上的值，拿不到就回傳 None。
 
@@ -764,8 +879,9 @@ class MowerManager(Node):
         blocked = self.start_pose_blocked()
         if blocked is not None:
             text = ('車子現在的位置沒辦法開始：%s，不足以原地掉頭。'
-                    '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m 以上的開闊處，再按一次。'
-                    % blocked)
+                    '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m%s以上的開闊處，再按一次。'
+                    % (blocked, '、離牆 %.1f m ' % self.turn_wall_need
+                       if self.wall_turn() is not None else ' '))
             self.get_logger().error('🚫 ' + text)
             self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             return
@@ -1244,10 +1360,12 @@ class MowerManager(Node):
             self.get_logger().info(
                 f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(legs[0].poses)} 個航點')
         else:
-            total = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(corners[:-1], corners[1:]))
+            total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                        for a, b in zip(corners[:-1], corners[1:]))
             self.get_logger().info(
                 f'🚗 產生 {label} 路徑：直線 {distance:.2f} m 會穿過障礙物或禁區，改繞 {total:.2f} m，'
-                f'分 {len(legs)} 段 (轉折點 ' + '、'.join('(%.2f, %.2f)' % c for c in corners[1:-1]) + ')')
+                f'分 {len(legs)} 段 (轉折點 '
+                + '、'.join('(%.2f, %.2f)' % c for c in corners[1:-1]) + ')')
         return legs
 
     # 規劃轉場時，起點 / 終點附近這麼近的地方不檢查 (那兩點由 approach_target 與掉頭檢查把關)
@@ -1378,6 +1496,15 @@ class MowerManager(Node):
                 return '落在邊界外面'
             if bd < need_b:
                 return '離邊界只有 %.2f m (%s需要 %.2f m)' % (bd, what, need_b)
+
+        # 光達停止區開著：原地轉身時停止區 (車頭前 0.40 m) 掃到地圖上的牆，車子就停在那裡
+        if need_rotation:
+            wc = self.wall_turn()
+            if wc is not None:
+                wd = float(wc.at((x, y)))
+                if wd < self.turn_wall_need:
+                    return ('離牆只有 %.2f m (掉頭時光達停止區會掃到牆，需要 %.2f m)'
+                            % (wd, self.turn_wall_need))
         return None
 
     def start_pose_blocked(self):
@@ -1591,13 +1718,20 @@ class MowerManager(Node):
         return out
 
     def make_transit_planner(self, rings):
-        """這一次規劃的轉場路線規劃器：直線離邊界 / 障礙物至少側向半寬 + 0.05 m，轉折點離邊界至少原地旋轉半徑 + 0.05 m。"""
+        """這一次規劃的轉場路線規劃器。
+
+        直線離邊界 / 障礙物至少側向半寬 + 0.05 m，轉折點離邊界至少原地旋轉半徑 + 0.05 m；
+        光達停止區開著時轉折點也要離牆夠遠 (wall_turn)。
+        """
         if not rings or len(rings[0]) < 3:
             return None
         try:
             return route_plan.TransitPlanner(
-                rings, max(self.LEAD_IN_BOUNDARY_CLEARANCE, self.LEAD_IN_OBSTACLE_CLEARANCE) + self.TRANSIT_MARGIN,
-                self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN)
+                rings,
+                max(self.LEAD_IN_BOUNDARY_CLEARANCE, self.LEAD_IN_OBSTACLE_CLEARANCE)
+                + self.TRANSIT_MARGIN,
+                self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN,
+                walls=self.wall_turn(), wall_need=self.turn_wall_need)
         except Exception as e:      # 算不出來就照以前走直線，不要讓任務因此開不了
             self.get_logger().error('🧭 轉場路線規劃器建不起來 (%s: %s)，這一趟 approach 走直線。'
                                     % (type(e).__name__, e))
@@ -1631,7 +1765,8 @@ class MowerManager(Node):
                 rings, self.FRONT_EXTENT, self.REAR_EXTENT, self.LEAD_IN_BOUNDARY_CLEARANCE,
                 walls=walls,
                 stop_len=float(self.get_parameter('stop_zone_length').value),
-                stop_side=float(self.get_parameter('stop_zone_side_margin').value))
+                stop_side=float(self.get_parameter('stop_zone_side_margin').value),
+                turn_wall=self.turn_wall_need if walls is not None else 0.0)
             routes = edge.routes(self.edge_offsets, self.headland_width, rot_need)
         except Exception as e:     # 算不出來就不繞，不要讓任務因此開不了
             self.get_logger().error('🪢 沿邊繞圈算不出來 (%s: %s)，這一趟不繞。' % (type(e).__name__, e))
@@ -2419,7 +2554,8 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None, rings=None):
+    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None,
+                              rings=None):
         """
         接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
@@ -2451,6 +2587,8 @@ class MowerManager(Node):
                 rest.poses = swath_poses
                 # 切成一條一條割草線後循序執行，一次只給 Nav2 一條直線
                 swaths = self.split_path_into_swaths(rest)
+                # 光達停止區開著：割草線兩頭離牆太近 (掉頭時停止區會掃到牆) 的往裡面縮短
+                swaths = self.trim_for_wall_turns(swaths, '割草線')
                 if not swaths:
                     # 【關鍵】：把路徑廣播出去給 RViz2 畫圖 (切不出割草線時照 F2C 原樣)
                     self.path_pub.publish(response.coverage_path)
@@ -2483,18 +2621,21 @@ class MowerManager(Node):
                 perimeter_poses = [ps for lp in loops for ps in lp]
                 perimeter_edges = self.split_perimeter_into_edges(
                     perimeter_poses, response.coverage_path.header)
+                self.check_perimeter_corners(perimeter_edges)
                 start_xy = robot_xy
                 if perimeter_edges:
                     q = perimeter_edges[-1].poses[-1].pose.position
                     start_xy = (q.x, q.y)
                 ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
-                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y)) for sw in swaths]
+                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y))
+                        for sw in swaths]
                 order, oinfo = route_plan.plan_order(
                     ends, angle, self.swath_spacing, start_xy,
                     dist=transit.length if transit is not None else None,
                     clear=transit.clear if transit is not None else None)
                 if oinfo['changed']:
-                    swaths = [self.reversed_path(swaths[i]) if rev else swaths[i] for i, rev in order]
+                    swaths = [self.reversed_path(swaths[i]) if rev else swaths[i]
+                              for i, rev in order]
                     self.get_logger().info(
                         f'🧩 割草線被障礙物或凹口切開：分成 {oinfo["chains"]} 塊，一塊一塊照弓字形割')
                 # (4) 沿邊多繞幾圈 (2026-10-21 will 同意)：割草線全部割完之後才繞。

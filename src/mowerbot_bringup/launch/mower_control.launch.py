@@ -73,6 +73,14 @@ def resolve_auto_gates(context):
     return resolve_sim_default(context, AUTO_GATES)
 
 
+def stop_zone_active(context):
+    """光達停止區有沒有開：跟 navigation.launch.py 同一套規則 (collision_monitor 留空 = 實車開、模擬關)。"""
+    sim = launch_bool(LaunchConfiguration('use_sim_time', default='true').perform(context),
+                      'use_sim_time')
+    v = LaunchConfiguration('collision_monitor', default='').perform(context)
+    return (not sim) if v.strip() == '' else launch_bool(v, 'collision_monitor')
+
+
 def resolve_swath_angle(context):
     """割草線方向 (2026-10-19)：auto 或角度 (度)。留空 = 跟著 use_sim_time：實車 auto、模擬 0
     (Gazebo 的既有測試與報告數據都是沿 x 軸的割草線)。其他值拒絕啟動，不要猜。"""
@@ -383,6 +391,11 @@ def generate_launch_description():
                 'edge_loops': LaunchConfiguration('edge_loops', default='').perform(context),
                 'front_extent': geom.front_extent,
                 'rear_extent': geom.rear_extent,
+                # 光達停止區開著的話，要原地轉身的地方離地圖上的牆要夠遠，停止區轉一圈才掃不到牆
+                # (2026-10-21)。長度跟 navigation.launch.py 的 stop_zone_length 一樣 (預設 STOP_ZONE_LENGTH)
+                'stop_zone_active': stop_zone_active(context),
+                'stop_zone_length': float(
+                    LaunchConfiguration('stop_zone_length', default='0.40').perform(context)),
                 # 用存好的地圖 (2026-10-21)：定位對上 (map_session) 才讓自動割草出發
                 'saved_map': LaunchConfiguration('mowerbot_saved_map').perform(context),
             }]

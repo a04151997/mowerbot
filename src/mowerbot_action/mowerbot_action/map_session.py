@@ -14,14 +14,16 @@ map 座標系就是存圖那一次的座標系，那一次畫的禁區、圈的�
 
 【車子在地圖上的哪裡】定位模式要先知道車子大概在地圖上的哪裡 (slam_toolbox 只在附近 ±0.25 m、±20° 找)：
   1. car-start 有指定 (map_start_pose) 就用它
-  2. 上次關機前記下的位置 (這個節點每秒記一次，同一個 session 才用)
+  2. 上次用這張地圖時，關機前記下的位置 (這個節點每秒記一次，每張地圖各記一份，
+     ~/.ros/mowerbot_last_pose/<session>.yaml；~/.ros/mowerbot_last_pose.yaml 是最後一次的)
   3. 都沒有就當作在建圖的起點 (0, 0, 0)
 開機之後這個節點再拿光達跟地圖比對 (map_match)，在猜的位置附近 ±1.5 m、±30° 找最對得上的位置，
 差得多就送 /initialpose 叫 slam_toolbox 換到那裡。還是對不上 (換了場地、車子被搬到很遠) 就停在「對不上」，
 網頁上點出車子在哪、朝哪 (~/locate_request) 再找一次。對上之前 mower_manager 不讓自動割草出發。
 
 發布：
-    ~/info   (std_msgs/String JSON，latched) {mode: mapping | localization, session, saved_map, start}
+    ~/info   (std_msgs/String JSON，latched)
+             {mode: mapping | localization, session, saved_map, start}
     ~/match  (std_msgs/String JSON，latched，每秒) {mode, state, score, n, ok, text}
              state：mapping (建新地圖，不用比對) / waiting (等地圖、光達) / locating / ok / lost
              score = 光達的點落在地圖牆邊 10 cm 內的比例；ok = state 是 ok 而且最近 3 秒最好的 score 夠高
@@ -106,15 +108,22 @@ def write_last_pose(path, session, x, y, yaw, mode):
     os.replace(tmp, path)
 
 
+def session_pose_file(session, last_pose_file=LAST_POSE_FILE):
+    """每張地圖 (session) 各自的「上次的位置」：中間建過別張圖，回來用這張時還找得到。"""
+    return os.path.join(os.path.splitext(last_pose_file)[0], session + '.yaml')
+
+
 def start_pose(session, explicit_text='', last_pose_file=LAST_POSE_FILE):
     """定位模式的起點：(x, y, yaw, 說明)。順序見開頭的說明。"""
     p = parse_start_pose(explicit_text)
     if p is not None:
         return p + ('car-start 指定的位置',)
-    last = read_last_pose(last_pose_file)
-    if last is not None and last['session'] == session:
-        when = time.strftime('%m-%d %H:%M', time.localtime(last['stamp'])) if last['stamp'] else '?'
-        return last['x'], last['y'], last['yaw'], '上次關機前的位置 (%s 記的)' % when
+    for path in (session_pose_file(session, last_pose_file), last_pose_file):
+        last = read_last_pose(path)
+        if last is not None and last['session'] == session:
+            when = (time.strftime('%m-%d %H:%M', time.localtime(last['stamp']))
+                    if last['stamp'] else '?')
+            return last['x'], last['y'], last['yaw'], '上次關機前的位置 (%s 記的)' % when
     return 0.0, 0.0, 0.0, '建圖的起點 (沒有記到上次的位置)'
 
 
@@ -125,7 +134,8 @@ def default_maps_dir():
         share = get_package_share_directory('mowerbot_bringup')
     except Exception:          # 套件找不到 (單元測試)
         return ''
-    src = os.path.normpath(os.path.join(share, '..', '..', '..', '..', 'src', 'mowerbot_bringup', 'maps'))
+    src = os.path.normpath(
+        os.path.join(share, '..', '..', '..', '..', 'src', 'mowerbot_bringup', 'maps'))
     return src if os.path.isdir(src) else os.path.join(share, 'maps')
 
 
@@ -229,7 +239,8 @@ def main(args=None):
             if self.mode == 'localization':
                 self.create_subscription(OccupancyGrid, '/map', self.map_cb, latched)
                 self.create_subscription(LaserScan, '/scan', self.scan_cb, qos_profile_sensor_data)
-                self.create_subscription(PoseWithCovarianceStamped, '~/locate_request', self.request_cb, 10)
+                self.create_subscription(PoseWithCovarianceStamped, '~/locate_request',
+                                         self.request_cb, 10)
                 self.create_service(Trigger, '~/locate', self.locate_srv)
             self.create_subscription(Odometry, '/odom', self.odom_cb, 10)
             self.create_subscription(MowerStatus, '/mower_status', self.status_cb, 10)
@@ -261,7 +272,8 @@ def main(args=None):
         # ---- TF ----
         def robot_pose(self, stamp=None):
             try:
-                tr = self.tf.lookup_transform(self.gf, self.rf, Time() if stamp is None else Time.from_msg(stamp))
+                when = Time() if stamp is None else Time.from_msg(stamp)
+                tr = self.tf.lookup_transform(self.gf, self.rf, when)
             except Exception:       # tf2 的各種例外 (還沒有 map、時間超出)
                 return None
             t = tr.transform.translation
@@ -324,14 +336,16 @@ def main(args=None):
                 elif time.monotonic() - self._tf_since >= 2.0:
                     # slam_toolbox 已經在猜的起點上對過第一筆光達了：在它附近再找一次
                     self.try_locate(pts, pose, '開機的起點')
-            elif self.state == 'locating' and self._check_at is not None and time.monotonic() >= self._check_at:
+            elif (self.state == 'locating' and self._check_at is not None
+                    and time.monotonic() >= self._check_at):
                 self._check_at = None
                 if good:
                     self.set_state('ok', '對上了：光達 %d%% 落在地圖的牆上' % round(100 * frac))
                 elif self._attempts < 2:
                     self.try_locate(pts, pose, '再找一次')
                 else:
-                    self.set_state('lost', '還是對不上 (光達 %d%% 落在牆上)：在網頁上點出車子在哪、朝哪' % round(100 * frac))
+                    self.set_state('lost', '還是對不上 (光達 %d%% 落在牆上)：在網頁上點出車子在哪、朝哪'
+                                   % round(100 * frac))
             elif self.state == 'lost':
                 if len(self.scores) == self.scores.maxlen and min(self.scores)[0] >= self.ok_score:
                     # 開到看得見地圖上的牆的地方，自己對上了
@@ -352,8 +366,10 @@ def main(args=None):
             r = map_match.locate(self.field, pts, guess,
                                  xy_half=1.5, yaw_half=math.radians(45.0 if wide else 30.0))
             self.get_logger().info(
-                '📍 找位置 (%s)：(%.2f, %.2f, %.0f°) -> (%.2f, %.2f, %.0f°)，光達 %d%% 對上 (%d 點，%.1f s)' % (
-                    what, guess[0], guess[1], math.degrees(guess[2]), r['x'], r['y'], math.degrees(r['yaw']),
+                '📍 找位置 (%s)：(%.2f, %.2f, %.0f°) -> (%.2f, %.2f, %.0f°)，'
+                '光達 %d%% 對上 (%d 點，%.1f s)' % (
+                    what, guess[0], guess[1], math.degrees(guess[2]),
+                    r['x'], r['y'], math.degrees(r['yaw']),
                     round(100 * r['score']), r['n'], time.monotonic() - t0))
             if r['n'] < OK_POINTS or r['score'] < self.ok_score:
                 self.set_state('lost', '對不上地圖 (最好的位置也只有 %d%% 光達落在牆上)：'
@@ -361,7 +377,8 @@ def main(args=None):
                                % (round(100 * r['score']), what))
                 return
             near_now = self.robot_pose()
-            if (near_now is not None and math.hypot(r['x'] - near_now[0], r['y'] - near_now[1]) < MOVED_M
+            if (near_now is not None
+                    and math.hypot(r['x'] - near_now[0], r['y'] - near_now[1]) < MOVED_M
                     and _angle_diff(r['yaw'], near_now[2]) < MOVED_RAD):
                 self.set_state('ok', '對上了：光達 %d%% 落在地圖的牆上' % round(100 * r['score']))
                 return
@@ -381,7 +398,8 @@ def main(args=None):
             m.pose.covariance[0] = m.pose.covariance[7] = 0.05 ** 2
             m.pose.covariance[35] = math.radians(2.0) ** 2
             self.init_pub.publish(m)
-            self.get_logger().info('📍 /initialpose -> (%.2f, %.2f, %.1f°)' % (x, y, math.degrees(yaw)))
+            self.get_logger().info('📍 /initialpose -> (%.2f, %.2f, %.1f°)'
+                                   % (x, y, math.degrees(yaw)))
 
         def set_state(self, state, text):
             if (state, text) != (self.state, self.text):
@@ -456,10 +474,13 @@ def main(args=None):
                 return
             if self.last_written is not None:
                 lx, ly, lyaw = self.last_written
-                if math.hypot(pose[0] - lx, pose[1] - ly) < 0.05 and _angle_diff(pose[2], lyaw) < math.radians(3.0):
+                if (math.hypot(pose[0] - lx, pose[1] - ly) < 0.05
+                        and _angle_diff(pose[2], lyaw) < math.radians(3.0)):
                     return
             try:
-                write_last_pose(self.last_pose_file, self.session, pose[0], pose[1], pose[2], self.mode)
+                for path in (self.last_pose_file,
+                             session_pose_file(self.session, self.last_pose_file)):
+                    write_last_pose(path, self.session, pose[0], pose[1], pose[2], self.mode)
                 self.last_written = pose
             except OSError as exc:
                 self.get_logger().warn('記不了車子的位置 (%s)：%s' % (self.last_pose_file, exc),

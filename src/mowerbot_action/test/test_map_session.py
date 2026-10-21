@@ -76,6 +76,18 @@ def test_start_pose_order(tmp_path):
     assert (x, y) == (-1.0, 2.0) and yaw == pytest.approx(math.pi) and '指定' in why
 
 
+def test_each_map_keeps_its_own_last_pose(tmp_path):
+    f = str(tmp_path / 'last.yaml')
+    assert map_session.session_pose_file('s1', f) == str(tmp_path / 'last' / 's1.yaml')
+    # 用 s1 那張圖停在 (1, 2)，之後又建了一張新圖 s2 (最後一次的位置變成 s2 的)
+    for sid, x in (('s1', 1.0), ('s2', 7.0)):
+        for path in (f, map_session.session_pose_file(sid, f)):
+            map_session.write_last_pose(path, sid, x, 2.0, 0.3, 'mapping')
+    assert map_session.start_pose('s2', '', f)[:3] == (7.0, 2.0, 0.3)
+    assert map_session.start_pose('s1', '', f)[:3] == (1.0, 2.0, 0.3)
+    assert map_session.start_pose('s3', '', f)[:3] == (0.0, 0.0, 0.0)
+
+
 def test_list_saved_maps(tmp_path, monkeypatch):
     maps = tmp_path / 'maps'
     maps.mkdir()
