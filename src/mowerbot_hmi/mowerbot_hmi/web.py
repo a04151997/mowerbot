@@ -329,6 +329,8 @@ class HmiWeb(Node):
         self.loc = None
         self.saved_maps = []
         self._maps_t = -SAVED_MAPS_PERIOD
+        # 割草要多久 (2026-10-21 will)：mower_manager 發的 /mission_plan (每一段的幾何 + 走到第幾段)
+        self.plan = None
 
         # ---- 送給網頁的 ----
         self.frame = {}
@@ -420,6 +422,7 @@ class HmiWeb(Node):
         sub(PolygonStamped, '/polygon_stop', self._on_zone, qos_profile_sensor_data)
         sub(String, '/map_session/info', self._on_map_info, LATCHED)
         sub(String, '/map_session/match', self._on_loc, LATCHED)
+        sub(String, '/mission_plan', self._on_plan, LATCHED)
 
         self.vehicle = self._vehicle()
         self.alarms.on_raise = lambda p, text: self.log('系統', ('警報 %d：' % p) + text)
@@ -547,6 +550,55 @@ class HmiWeb(Node):
         except ValueError:
             return
         self._tick_rate('/map_session/match')
+
+    def _on_plan(self, msg):
+        try:
+            self.plan = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def eta(self, state):
+        """預計要多久給網頁 (mowerbot_action/mission_time.py)：照現在 Nav2 的速度上限換算，改速度跟著變。
+
+        預覽之後 (待命)：整趟要多久；割草中：還要多久；這一趟結束：實際花了多久、當初估多久。
+        其他時候 None。最高速 (SPEED_CHOICES 最後一個) 要多久也一起給，讓人判斷要不要加快。
+        """
+        from mowerbot_action import mission_time
+        p = self.plan
+        if not p or not p.get('segs'):
+            return None
+        kind, ended = p.get('kind'), p.get('ended')
+        if kind == 'preview' and state != MissionStatus.STATE_IDLE:
+            return None
+        if kind == 'mission' and ended is None and state != MissionStatus.STATE_EXECUTING:
+            return None
+        segs = p['segs']
+        speed = self.speed.get('nav')
+        top = SPEED_CHOICES[-1]
+        out = {'kind': kind, 'route_m': round(mission_time.route_meters(segs)), 'speed': speed,
+               'total_s': None, 'remaining_s': None, 'top': top,
+               'top_s': round(mission_time.total_seconds(segs, top)), 'top_remaining_s': None,
+               'actual_s': None}
+        if speed:
+            out['total_s'] = round(mission_time.total_seconds(segs, speed))
+        if kind == 'mission' and ended is not None:
+            if p.get('started') is not None:
+                out['actual_s'] = round(ended - p['started'])
+            out['kind'] = 'ended'
+        elif kind == 'mission':
+            cur, cur_t = p.get('cur'), p.get('cur_t')
+            elapsed = (time.time() - cur_t) if cur_t else 0.0
+            if speed:
+                out['remaining_s'] = round(
+                    mission_time.remaining_seconds(segs, speed, cur, elapsed))
+            # 改成最高速：這一段已經走的比例照算 (讀不到速度上限就當這一段剛開始)，剩下的用最高速
+            if speed and cur is not None and 0 <= cur < len(segs):
+                now, fast = (mission_time.seconds(segs[cur], v) for v in (speed, top))
+                elapsed = elapsed * fast / now if now > 0 else 0.0
+            else:
+                elapsed = 0.0
+            out['top_remaining_s'] = round(mission_time.remaining_seconds(segs, top, cur, elapsed))
+        return out
 
     def localization(self):
         """用存好的地圖開的 (slam_toolbox 定位模式)。"""
@@ -775,6 +827,7 @@ class HmiWeb(Node):
                 'completed': int(ms.completed_segments) if ms else 0, 'skipped': int(ms.skipped_segments) if ms else 0,
                 'label': ms.current_label if ms else '', 'skipped_labels': list(ms.skipped_labels) if ms else [],
                 'message': message, 'swath_deg': None, 'lines': None,
+                'eta': self.eta(state) if manager_ok else None,
             }
             md = re.search(r'割草線 (\d+) 條 \(方向 (-?\d+)°\)', message)
             if md:
@@ -1040,6 +1093,7 @@ class HmiWeb(Node):
                 self.map_meta = {'ready': False, 'ver': 0}
                 self.map_info = None
                 self.loc = None
+                self.plan = None
                 self.mission = None
                 self.mower = None
                 if self.expect_down:

@@ -2,6 +2,7 @@
 import copy
 import json
 import math
+import time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import tf2_ros
@@ -25,6 +26,7 @@ from mowerbot_interfaces.srv import SetDriveMode
 from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from rcl_interfaces.msg import ParameterDescriptor
+from mowerbot_action import mission_time
 from mowerbot_action import route_plan
 from mowerbot_action import swath_angle
 
@@ -107,6 +109,15 @@ class MowerManager(Node):
         # 沿邊多繞幾圈的路線 (2026-10-21) 另外發一個話題：/f2c_path 的內容維持「環繞 + 割草線」
         # (smoke M10 用它檢查割草線的方向與地頭)，網頁和 Lichtblick 另外畫這一條。沒有沿邊時發空的。
         self.edge_path_pub = self.create_publisher(Path, '/edge_path', qos_profile)
+        # 割草要多久 (2026-10-21 will 要的)：規劃好時每一段的幾何 (mission_time.plan_geometry) 與現在走到
+        # 第幾段，網頁照當下的速度上限換算成分鐘 (速度改了跟著變)。latched：網頁晚開也拿得到。
+        self.plan_pub = self.create_publisher(
+            String, '/mission_plan',
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self._plan = None           # 最後發出去的那一份 (dict)
+        self._plan_ids = {}         # 割草的佇列裡原本那幾段：id(Path) -> 第幾段 (執行中插的轉場不在裡面)
+        self._plan_paths = []       # 留著那幾個 Path，id 才不會被之後新建的 Path 重複用到
         self.current_mode = 2
         # 保存 Nav2 FollowPath 的 goal handle，急停時用來取消任務
         self._goal_handle = None
@@ -1247,6 +1258,8 @@ class MowerManager(Node):
         if state in (MissionStatus.STATE_IDLE, MissionStatus.STATE_DONE,
                      MissionStatus.STATE_ABORTED):
             self._current_label = ''
+        if state in (MissionStatus.STATE_DONE, MissionStatus.STATE_ABORTED):
+            self.end_plan()
 
     # ==================================================================
     # 覆蓋任務：路徑切割與循序執行
@@ -2287,6 +2300,7 @@ class MowerManager(Node):
             return
         path, label = self._swath_queue[self._current_swath_idx]
         self._mission_state = MissionStatus.STATE_EXECUTING
+        self.plan_progress()
         # 【兩階段，階段 38 決定 1】每一段 (含 approach) 先原地對正，對正成功之後才送那一段本身。
         # 原因：DWB 在段落開頭是「邊前進邊轉」(vx 0.70 + wz 1.2 的弧)，新車車頭在旋轉中心前方 0.975 m，
         # 同一個弧讓車頭角撞牆 / 頂住箱子 (docs/stage38_collision_brief.md)。
@@ -2723,6 +2737,7 @@ class MowerManager(Node):
                 # 正常推進、跳過之後、任務開頭全部走同一條路徑。
                 _ = robot_xy
 
+                self.publish_plan(queue, 'preview' if preview else 'mission', transit, robot_xy)
                 if preview:
                     text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。車子不會動；'
                             'OK 就按 LB + B 開始割。'
@@ -2775,6 +2790,71 @@ class MowerManager(Node):
             self.get_logger().error(f'呼叫 F2C 服務時發生錯誤: {str(e)}')
             self.set_mission_state(MissionStatus.STATE_ABORTED,
                                    message='算路線時程式出錯 (%s: %s)，看 car-log' % (type(e).__name__, e))
+
+    def publish_plan(self, queue, kind, transit, robot_xy):
+        """這次路線每一段的幾何發到 /mission_plan (網頁換算要多久)。算不出來只少了預計時間，任務照常。"""
+        try:
+            pose = self.get_robot_pose2d()
+            if pose is None:
+                pose = (robot_xy[0], robot_xy[1], 0.0)
+            entries = [([(ps.pose.position.x, ps.pose.position.y) for ps in pth.poses],
+                        id(pth) in self._edge_cont) for pth, _lbl in queue]
+            plan = ((lambda a, b: transit.plan(a, b, self.TRANSIT_RELAX))
+                    if transit is not None else None)
+            segs = mission_time.plan_geometry(entries, pose, plan)
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn('⏱️ 算不出這次路線要開多遠 (%s: %s)，網頁不會顯示預計時間'
+                                   % (type(e).__name__, e))
+            return
+        self._plan = {'kind': kind, 'segs': [[round(v, 3) for v in sg] for sg in segs],
+                      'labels': [lbl for _pth, lbl in queue], 'cur': None, 'cur_t': None,
+                      'started': None, 'ended': None, 't': round(time.time(), 1)}
+        self._plan_paths = [pth for pth, _lbl in queue] if kind == 'mission' else []
+        self._plan_ids = {id(pth): k for k, pth in enumerate(self._plan_paths)}
+        n_align = sum(1 for sg in segs for a in (sg[0], sg[3]) if a >= mission_time.ALIGN_TOL)
+        self.get_logger().info(
+            '⏱️ 這次路線實際要開 %.0f m (含轉場)、原地轉身 %d 次，'
+            '速度上限 0.25 約 %.0f 分鐘、0.50 約 %.0f 分鐘'
+            % (mission_time.route_meters(segs), n_align,
+               mission_time.total_seconds(segs, 0.25) / 60.0,
+               mission_time.total_seconds(segs, 0.5) / 60.0))
+        self.send_plan()
+
+    def send_plan(self):
+        if self._plan is not None:
+            self.plan_pub.publish(String(data=json.dumps(self._plan, ensure_ascii=False)))
+
+    def plan_progress(self):
+        """送出佇列裡的下一個東西之前：記下現在在走原本的第幾段 (轉場算在它後面那一段)。"""
+        if self._plan is None or not self._plan_ids or self._plan['ended'] is not None:
+            return
+        k = None
+        for pth, _lbl in self._swath_queue[self._current_swath_idx:]:
+            k = self._plan_ids.get(id(pth))
+            if k is not None:
+                break
+        if k is None or k == self._plan['cur']:
+            return
+        now = round(time.time(), 1)
+        self._plan['cur'], self._plan['cur_t'] = k, now
+        if self._plan['started'] is None:
+            self._plan['started'] = now
+        self.send_plan()
+
+    def end_plan(self):
+        """任務結束 (做完或中止)：記下結束時間，印實際花多久 (之後拿來調 mission_time 的常數)。"""
+        p = self._plan
+        if p is None or p['kind'] != 'mission' or p['ended'] is not None:
+            return
+        self._plan['ended'] = round(time.time(), 1)
+        if self._plan['started'] is not None:
+            self.get_logger().info(
+                '⏱️ 這一趟從出發到結束 %.1f 分鐘 (路線 %.0f m)'
+                % ((self._plan['ended'] - self._plan['started']) / 60.0,
+                   mission_time.route_meters(self._plan['segs'])))
+        self._plan_ids = {}
+        self._plan_paths = []
+        self.send_plan()
 
     def display_route(self, raw, loops, swaths, transit):
         """給 RViz / Lichtblick / 網頁看的路線 (/f2c_path)：環繞 + 照割草順序的割草線，轉場會繞路的地方插入繞路的點。

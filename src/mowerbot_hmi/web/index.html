@@ -164,6 +164,7 @@ main { box-sizing: border-box; height: 100%; overflow: auto; padding-block: 16px
 .kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 4px 14px; font-size: 13px; margin: 0; }
 .kv dt { color: var(--fg-3); }
 .kv dd { margin: 0; text-align: right; min-width: 0; overflow-wrap: anywhere; }
+.kv dd .sub { display: block; font-size: 0.85em; color: var(--fg-3); }
 .prog { height: 10px; background: var(--sunk); border-radius: 2px; overflow: hidden; margin: 8px 0 6px; border: 1px solid var(--line); }
 .prog > div { height: 100%; background: var(--fg-2); width: 0; transition: width .3s; }
 .mission-msg { margin: 8px 0 0; font-size: 13px; color: var(--fg-2); background: var(--sunk); border-radius: 3px; padding: 6px 8px; }
@@ -399,6 +400,7 @@ tr.rtn td { color: var(--fg-3); }
                 <dl class="kv">
                   <dt>進度</dt><dd class="num" id="mCount">—</dd>
                   <dt>跳過</dt><dd id="mSkip">—</dd>
+                  <dt>預計時間</dt><dd id="mEta">—</dd>
                 </dl>
                 <p class="mission-msg" id="mMsg" hidden></p>
               </div>
@@ -721,7 +723,7 @@ function demoSource() {
     let a = 0, l = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; l += Math.hypot(q[0] - p[0], q[1] - p[1]); }
     return [Math.abs(a) / 2, l];
   }
-  const SPEED = 0.25, SPEEDUP = 6, SKIP_AFTER = 15, V = VEH0;
+  const SPEEDUP = 6, SKIP_AFTER = 15, V = VEH0;
 
   function buildRoute(from) {
     const { W, peri } = SITE, segs = [], P0 = W(...peri[0]);
@@ -805,7 +807,7 @@ function demoSource() {
     Object.assign(sim, {
       running: true, since: ago(24), busy: null, mapping: true, mapName: mapName(ago(9)),
       mode: 1, mstate: 2, msg: '', route: buildRoute(SITE.start), routeShown: true, s: 0, mown: [],
-      v: SPEED, w: 0, navV: SPEED, pose: { ...SITE.start }, joy: { connected: true, latched: false },
+      v: 0.175, w: 0, navV: 0.175, pose: { ...SITE.start }, joy: { connected: true, latched: false },
       obstacle: null, blockedFor: 0, skipped: [], authority: 'here', freezeUntil: 0, alarms: [], events: [], scan: [], zoneN: 0,
       scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '', siteKo: true, savingUntil: 0, lawnRec: null, lawnPts: null,
     });
@@ -850,6 +852,7 @@ function demoSource() {
     return null;
   }
   function step(dt) {
+    const SPEED = 0.7 * sim.scale;
     if (!sim.running) { sim.v = 0; sim.navV = 0; sim.scan = []; return; }
     const R = sim.route, c = Math.cos(sim.pose.yaw), sn = Math.sin(sim.pose.yaw);
     sim.scan = rayHits(sim.pose.x + V.lidarX * c, sim.pose.y + V.lidarX * sn, SITE.trees.concat(sim.obstacle ? [sim.obstacle] : []));
@@ -907,6 +910,18 @@ function demoSource() {
     setAlarm('latch', sim.joy.latched && sim.joy.connected, 2, '手把重新連上了，按一下 LB 車子才繼續走');
     setAlarm('zone', !!br && br.key === 'zone', 2, '前方停止區有東西，車子暫停');
   }
+  // 展示用的預計時間：跟車上同一種算法的粗略版 (直線 0.7 x 速度、每段一次原地轉身)
+  function demoEta(R, executing) {
+    if (!sim.routeShown || !sim.running) return null;
+    const t = (len, n, s) => len / (0.7 * s) + n * (3.7 + 2.0 / (0.94 * s));
+    const s = sim.scale, top = 0.50;
+    const kind = sim.mstate === 3 ? 'ended' : executing ? 'mission' : sim.mstate === 0 ? 'preview' : null;
+    if (!kind) return null;
+    const left = Math.max(0, R.total - sim.s), nLeft = R.segs.length - segAt(R, sim.s);
+    return { kind, route_m: Math.round(R.total), speed: s, top, total_s: t(R.total, R.segs.length, s),
+             top_s: t(R.total, R.segs.length, top), remaining_s: t(left, nLeft, s), top_remaining_s: t(left, nLeft, top),
+             actual_s: kind === 'ended' ? t(R.total, R.segs.length, s) * 1.05 : null };
+  }
   function frame() {
     const R = sim.route, g = segAt(R, sim.s), up = sim.running;
     const executing = sim.mode === 1 && sim.mstate === 2;
@@ -922,6 +937,7 @@ function demoSource() {
         state: sim.mstate, total: sim.routeShown ? R.segs.length : 0, completed, skipped: sim.skipped.length,
         label: executing ? R.segs[g].label : '', skipped_labels: sim.skipped.slice(), message: sim.msg,
         swath_deg: sim.routeShown ? SITE.deg : null, lines: 12,
+        eta: demoEta(R, executing),
       },
       block: blockReason(),
       joy: { connected: sim.joy.connected, latched: sim.joy.latched },
@@ -1286,6 +1302,27 @@ function confirmText(tile) {
   }
   return ['', ''];
 }
+// 割草要多久 (2026-10-21 will：想知道一張圖跑完要多久，判斷要不要加快)。web.py 照現在的速度上限算好
+// (mowerbot_action/mission_time.py)；這裡只負責寫成人看得懂的話。
+function minText(s) {
+  if (s == null) return '—';
+  if (s < 60) return '不到 1 分鐘';
+  const m = Math.round(s / 60);
+  return m < 60 ? '約 ' + m + ' 分鐘' : '約 ' + Math.floor(m / 60) + ' 小時 ' + (m % 60) + ' 分鐘';
+}
+function etaHTML(e) {
+  if (!e) return '<span class="muted">預覽路線之後就知道</span>';
+  const sub = t => '<span class="sub">' + esc(t) + '</span>';
+  const route = '路線 ' + e.route_m + ' m';
+  if (e.kind === 'ended') return '這一趟花了 ' + minText(e.actual_s).replace('約 ', '') + sub(route + (e.total_s != null ? '・預估' + minText(e.total_s) : ''));
+  const top = e.top.toFixed(2);
+  if (!e.speed) return route + sub('讀不到速度上限；' + top + ' ' + minText(e.kind === 'mission' ? e.top_remaining_s : e.top_s));
+  const faster = e.speed < e.top - 1e-3;
+  if (e.kind === 'mission') return '還要' + minText(e.remaining_s) + sub('整趟' + minText(e.total_s) + '・速度上限 ' + e.speed.toFixed(2))
+    + (faster && e.top_remaining_s != null ? sub('改成 ' + top + ' 還要' + minText(e.top_remaining_s)) : '');
+  return minText(e.total_s) + '・' + route + sub('速度上限 ' + e.speed.toFixed(2)) + (faster ? sub('改成 ' + top + minText(e.top_s)) : '');
+}
+
 function ask(kind, tile) {
   let title, detail, run, pick = false;
   if (kind === 'tile') { [title, detail] = confirmText(tile); run = () => tile.m === 'preview' ? Source.send('preview') : Source.send('mode', tile.m); }
@@ -1476,6 +1513,7 @@ function renderOverview(st) {
   $('#mBar').style.width = ms.total ? (100 * ms.completed / ms.total) + '%' : '0';
   setHTML($('#mSkip'), ms.skipped ? almIcon(3) + ' ' + ms.skipped + ' 段：' + esc(ms.skipped_labels.join('、')) : '<span class="muted">沒有</span>');
   $('#mDir').textContent = ms.swath_deg != null ? (ms.lines ? '割草線 ' + ms.lines + ' 條・' : '') + '方向 ' + ms.swath_deg + '°' : '';
+  setHTML($('#mEta'), etaHTML(ms.eta));
   const mm = $('#mMsg'); mm.hidden = !ms.message; mm.textContent = ms.message || '';
   const up = st.program.running;
   $('#cSpeed').textContent = up && st.vel ? fx(st.vel.v, 2) + ' m/s（最快 ' + fx(0.7 * (speedNow(st) || 1), 2) + '）' : '—';
