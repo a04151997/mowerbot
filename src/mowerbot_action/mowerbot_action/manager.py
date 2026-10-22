@@ -398,6 +398,19 @@ class MowerManager(Node):
         self._joy_status_time = None
         self._scan_time = None
         self._auto_block_prev = None    # 上一次的暫停原因，只在變化時印 log
+        # 管理程式自己在忙的時候 (算路線在這條執行緒上：will 那張圖沙盒 1.2 s，N150 更久)，/joy_status、
+        # /scan 的訊息排在佇列裡還沒讀，看起來像中斷，其實 teleop、光達都還在送。2026-10-22 整套模擬：
+        # 算完路線馬上被判「/joy_status 中斷 2.2 s」，當成手把斷線過鎖住，要再按一下 LB。
+        # 所以 0.1 s 一次心跳記下自己什麼時候停過 (heartbeat，隔超過 busy_gap 就算)：剛忙完、還沒收到
+        # 忙完之後才發的新一筆之前先暫停 (車子一樣不動)，不當成中斷、不鎖；忙完 auto_input_timeout 秒還是
+        # 沒有新資料才是真的中斷，跟以前一樣暫停 / 鎖住 (busy_wait_reason)。
+        # 排在佇列裡的舊訊息不算新的 (忙的時候 teleop 停了，佇列裡的還是會讓它看起來剛收到)；
+        # 排在佇列裡「手把斷線」的那一筆照樣會鎖 (joy_status_cb)。
+        self._beat_time = None
+        self._busy_end = None
+        self.busy_gap = 0.25            # /joy_status 5 Hz：停超過這麼久，下一筆就可能晚到 0.5 s 以上
+        self.queue_drain = 0.1          # 忙完之後佇列裡排著的訊息幾毫秒內就讀完；這之後收到的才是新發的
+        self.create_timer(0.1, self.heartbeat)
         # 規劃好之後先等放行條件成立才送第一段 (2026-10-19 will)。
         # 以前算好就送，沒按住 LB 時車子雖然不動，但 Nav2 的 progress checker 15 s 一到就把那一段
         # 判失敗跳過，連續 max_consecutive_failures 段整個任務停止，所以沒辦法「先慢慢看路線再出發」。
@@ -586,6 +599,11 @@ class MowerManager(Node):
     def joy_status_cb(self, msg):
         self._joy_status = msg
         self._joy_status_time = self.get_clock().now()
+        # 「手把斷線」的那一筆一讀到就鎖，不等 auto_block_reason 下一次被叫到：管理程式在忙的時候
+        # 排在佇列裡的斷線也算數，就算後面那一筆又連上了 (重新連上不代表有人要它走)
+        if (not msg.connected and self.auto_requires_joystick and not self.auto_requires_deadman
+                and self.current_mode in (1, 3)):
+            self._joy_lost_latched = True
         # LB 一按下 teleop 就立刻發一筆，這裡馬上判斷，不等 0.1 s 的定時器
         self.maybe_start_waiting()
 
@@ -596,12 +614,45 @@ class MowerManager(Node):
     def _age(self, t):
         return (self.get_clock().now() - t).nanoseconds / 1e9
 
+    def heartbeat(self):
+        """0.1 s 一次：跟上一次隔太久 = 管理程式自己剛忙完，訊息還排在佇列裡 (見 __init__)。"""
+        now = self.get_clock().now()
+        if self._beat_time is not None:
+            gap = (now - self._beat_time).nanoseconds / 1e9
+            if gap > self.busy_gap:
+                self._busy_end = now
+                if self.current_mode in (1, 3):
+                    self.get_logger().info(
+                        '⏳ 管理程式 %.1f s 沒讀訊息 (在算路線之類)：手把、光達等收到新的一筆再判斷' % gap)
+        self._beat_time = now
+
+    def busy_wait_reason(self, t, what):
+        """管理程式剛忙完、輸入 (上一次收到是 t) 還沒收到忙完之後才發的新一筆：還不能判斷。
+
+        回傳暫停的原因 (車子不動，不當成中斷、不鎖)；可以照平常判斷時回傳 None：
+        沒有忙過、忙完之後收到了新發的一筆 (忙完 queue_drain 秒以後才收到的；之前的是佇列裡排著的)、
+        或忙完已經超過 auto_input_timeout + queue_drain 秒 (那就是真的中斷，照平常判斷會暫停 / 鎖住)。
+        """
+        text = '管理程式剛忙完，等%s的新資料' % what
+        if self._beat_time is not None and self._age(self._beat_time) > self.busy_gap:
+            return text     # 正在忙完的這一刻：心跳自己都還沒跑到 (定時器誰先跑不一定)
+        if self._busy_end is None:
+            return None
+        if t is not None and (t - self._busy_end).nanoseconds / 1e9 >= self.queue_drain:
+            return None
+        if self._age(self._busy_end) > self.auto_input_timeout + self.queue_drain:
+            return None
+        return text
+
     def auto_block_reason(self):
         """自動模式 (1 / 3) 現在不能動的原因；可以動時回傳 None。
 
         失效方向是安全的：沒收過、收不到、逾時一律當成不能動。
         """
         if self.auto_requires_deadman or self.auto_requires_joystick:
+            busy = self.busy_wait_reason(self._joy_status_time, '手把 (/joy_status) ')
+            if busy is not None:
+                return busy
             joy = None
             if self._joy_status_time is None:
                 joy = '還沒收到 /joy_status (teleop 沒在跑？)'
@@ -622,6 +673,9 @@ class MowerManager(Node):
                     return '手把斷線過，重新連上了，按一下 LB 才繼續走'
                 self._joy_lost_latched = False
         if self.auto_requires_scan:
+            busy = self.busy_wait_reason(self._scan_time, '光達 (/scan) ')
+            if busy is not None:
+                return busy
             if self._scan_time is None:
                 return '還沒收到光達 /scan'
             if self._age(self._scan_time) > self.auto_input_timeout:
@@ -1952,9 +2006,15 @@ class MowerManager(Node):
         out = Path()
         out.header = path.header
         for ps in reversed(path.poses):
-            q = copy.deepcopy(ps)
-            o = q.pose.orientation
-            o.x, o.y, o.z, o.w = swath_angle.rotate_quat(o.x, o.y, o.z, o.w, math.pi)
+            # 一個一個欄位抄，不用 deepcopy (一條割草線上百點，deepcopy 一次規劃要 0.3 s)
+            q = PoseStamped()
+            q.header.frame_id = ps.header.frame_id
+            q.header.stamp.sec = ps.header.stamp.sec
+            q.header.stamp.nanosec = ps.header.stamp.nanosec
+            p, o = ps.pose.position, ps.pose.orientation
+            q.pose.position.x, q.pose.position.y, q.pose.position.z = p.x, p.y, p.z
+            r = q.pose.orientation
+            r.x, r.y, r.z, r.w = swath_angle.rotate_quat(o.x, o.y, o.z, o.w, math.pi)
             out.poses.append(q)
         return out
 

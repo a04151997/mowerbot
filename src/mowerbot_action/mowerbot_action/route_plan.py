@@ -402,6 +402,7 @@ class TransitPlanner:
         self.nodes = self._corner_nodes()
         self._adj = None
         self._cache = {}
+        self._reach = {}
 
     def _corner_nodes(self):
         """轉折點的候選：掉得了頭的區域 (離邊界 >= turn_clearance、離牆夠遠) 的外形頂點，往裡面再縮一格。
@@ -504,6 +505,22 @@ class TransitPlanner:
             self._adj = adj
         return self._adj
 
+    def _node_reach(self, p, relax):
+        """p 直線開得到哪些轉折點、多遠 (看不到 = inf)。
+
+        排順序的時候同一個點 (割草線的頭尾、沿邊的進圈點) 會跟很多點算轉場，記起來不重算
+        (2026-10-22：will 那張圖規劃一次 2 s，大部分在這裡)。
+        """
+        key = (round(float(p[0]), 3), round(float(p[1]), 3), relax)
+        d = self._reach.get(key)
+        if d is None:
+            nodes = self.nodes
+            q = np.asarray(p, dtype=float)
+            d = np.where(self._visible(q, nodes, relax_p=relax),
+                         np.hypot(nodes[:, 0] - q[0], nodes[:, 1] - q[1]), np.inf)
+            self._reach[key] = d
+        return d
+
     def _astar(self, a, b, relax):
         """直線走不過去時：起點 -> 轉折點 ... -> 終點 的最短折線 (Dijkstra，轉折點不多)。"""
         nodes = self.nodes
@@ -511,11 +528,8 @@ class TransitPlanner:
         if n == 0:
             return None
         adj = self._graph()
-        pa, pb = np.asarray(a), np.asarray(b)
-        da = np.where(self._visible(pa, nodes, relax_p=relax),
-                      np.hypot(nodes[:, 0] - pa[0], nodes[:, 1] - pa[1]), np.inf)
-        db = np.where(self._visible(pb, nodes, relax_p=relax),
-                      np.hypot(nodes[:, 0] - pb[0], nodes[:, 1] - pb[1]), np.inf)
+        da = self._node_reach(a, relax)
+        db = self._node_reach(b, relax)
         dist = da.copy()
         parent = np.full(n, -1)
         done = np.zeros(n, bool)
