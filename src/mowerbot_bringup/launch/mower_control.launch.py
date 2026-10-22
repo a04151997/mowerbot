@@ -81,6 +81,14 @@ def stop_zone_active(context):
     return (not sim) if v.strip() == '' else launch_bool(v, 'collision_monitor')
 
 
+def plan_options_file(context):
+    """網頁「割草路線」選的割草線間距、沿邊圈數存在哪 (2026-10-22)：實車存，下次開機照用；
+    模擬不存 (空)，測試照 launch 參數跑。"""
+    sim = launch_bool(LaunchConfiguration('use_sim_time', default='true').perform(context),
+                      'use_sim_time')
+    return '' if sim else os.path.expanduser('~/.ros/mowerbot_plan_options.json')
+
+
 def resolve_swath_angle(context):
     """割草線方向 (2026-10-19)：auto 或角度 (度)。留空 = 跟著 use_sim_time：實車 auto、模擬 0
     (Gazebo 的既有測試與報告數據都是沿 x 軸的割草線)。其他值拒絕啟動，不要猜。"""
@@ -398,6 +406,11 @@ def generate_launch_description():
                     LaunchConfiguration('stop_zone_length', default='0.40').perform(context)),
                 # 用存好的地圖 (2026-10-21)：定位對上 (map_session) 才讓自動割草出發
                 'saved_map': LaunchConfiguration('mowerbot_saved_map').perform(context),
+                # 停下來之後接著割 (2026-10-22)：割草進度跟著地圖 (session) 存，用同一張存好的地圖開機找得回來
+                # (session_param：session 可能被 YAML 當成整數，見 session_param)
+                'session_id': session_param('mowerbot_session_id'),
+                # 網頁選的割草線間距、沿邊圈數 (2026-10-22)：有存的話開機照用，蓋過上面的 overlap_ratio、edge_loops
+                'plan_options_file': plan_options_file(context),
             }]
         )
         return [log, manager_node]

@@ -113,6 +113,11 @@ SPEED_CHOICES = (0.10, 0.15, 0.25, 0.35, 0.50)
 NAV_SPEED_KEYS = ('max_vel_x', 'max_speed_xy', 'max_vel_theta')
 NAV_SPEED_FULL = {'max_vel_x': 0.7, 'max_speed_xy': 0.7, 'max_vel_theta': 1.2}     # 讀不到 nav2_params.yaml 時用
 SPEED_READ_PERIOD = 2.0
+# 網頁「割草路線」(2026-10-22 will：跑一趟太久)：割草線間距與沿邊圈數，改 mower_manager 的參數，下一次規劃才用。
+# 間距 = 刀盤寬 (0.5 m) x (1 - 重疊率)，0.30 是原本的 (重疊 0.4)。沿邊 = 離邊界幾公尺各繞一圈 (edge_loops)，
+# 兩圈是實車原本的 (bringup_real.launch.py)，一圈 0.85 m 夾在兩圈中間，邊上沒割到的帶多約 0.1 m。
+PLAN_SPACING_CHOICES = (0.30, 0.35, 0.40)
+PLAN_EDGE_CHOICES = (('兩圈', '1.10,0.75'), ('一圈', '0.85'), ('不繞', ''))
 
 # 網頁畫禁區 (2026-10-21 will)：總覽地圖上點幾個角圍一塊，或下載地圖圖片用紅筆畫好再上傳。
 # 寫到 keepout_server 讀的 active.yaml (跟 keepout_tool apply 同一個檔)，再叫它載入。
@@ -335,6 +340,10 @@ class HmiWeb(Node):
         self._maps_t = -SAVED_MAPS_PERIOD
         # 割草要多久 (2026-10-21 will)：mower_manager 發的 /mission_plan (每一段的幾何 + 走到第幾段)
         self.plan = None
+        # 停下來之後接著割 (2026-10-22 will)：mower_manager 發的 /mower_manager/resume_info (上一趟停在哪)
+        self.resume_info = None
+        # 割草路線的設定 (2026-10-22)：mower_manager 發的 /mower_manager/plan_options (間距、沿邊圈數)
+        self.plan_opts = None
 
         # ---- 送給網頁的 ----
         self.frame = {}
@@ -384,6 +393,7 @@ class HmiWeb(Node):
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
         self.mode_cli = self.create_client(SetDriveMode, 'change_mower_mode')
         self.preview_cli = self.create_client(Trigger, '/mower_manager/preview')
+        self.resume_cli = self.create_client(Trigger, '/mower_manager/resume')
         self.save_cli = self.create_client(Trigger, '/map_autosave/save')
         self.lawn_cli = {k: self.create_client(Trigger, '/boundary_recorder/' + k) for k in LAWN_WHAT}
         self.nav_ac = ActionClient(self, FollowPath, 'follow_path')
@@ -393,6 +403,7 @@ class HmiWeb(Node):
             'joy_set': self.create_client(SetParameters, '/mower_teleop/set_parameters'),
             'nav_get': self.create_client(GetParameters, '/controller_server/get_parameters'),
             'nav_set': self.create_client(SetParameters, '/controller_server/set_parameters'),
+            'mgr_set': self.create_client(SetParameters, '/mower_manager/set_parameters'),
         }
         self.ko_cli = {k: self.create_client(Trigger, '/keepout_server/' + k) for k in ('session', 'load', 'clear')}
         self.locate_pub = self.create_publisher(PoseWithCovarianceStamped, '/map_session/locate_request', 10)
@@ -429,6 +440,8 @@ class HmiWeb(Node):
         sub(String, '/map_session/info', self._on_map_info, LATCHED)
         sub(String, '/map_session/match', self._on_loc, LATCHED)
         sub(String, '/mission_plan', self._on_plan, LATCHED)
+        sub(String, '/mower_manager/resume_info', self._on_resume, LATCHED)
+        sub(String, '/mower_manager/plan_options', self._on_plan_opts, LATCHED)
 
         self.vehicle = self._vehicle()
         self.alarms.on_raise = lambda p, text: self.log('系統', ('警報 %d：' % p) + text)
@@ -560,6 +573,18 @@ class HmiWeb(Node):
     def _on_plan(self, msg):
         try:
             self.plan = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _on_resume(self, msg):
+        try:
+            self.resume_info = json.loads(msg.data)
+        except ValueError:
+            pass
+
+    def _on_plan_opts(self, msg):
+        try:
+            self.plan_opts = json.loads(msg.data)
         except ValueError:
             pass
 
@@ -834,6 +859,8 @@ class HmiWeb(Node):
                 'label': ms.current_label if ms else '', 'skipped_labels': list(ms.skipped_labels) if ms else [],
                 'message': message, 'swath_deg': None, 'lines': None,
                 'eta': self.eta(state) if manager_ok else None,
+                # 上一趟沒割完 (急停、切模式、關電)：可以接著割 (mower_manager/resume_info)
+                'resume': dict(self.resume_info) if (manager_ok and self.resume_info) else None,
             }
             md = re.search(r'割草線 (\d+) 條 \(方向 (-?\d+)°\)', message)
             if md:
@@ -860,6 +887,9 @@ class HmiWeb(Node):
                 'saving': self.saving_since is not None,
                 'lawn': lawn,
                 'speed': dict(self.speed, choices=list(SPEED_CHOICES)),
+                'planopts': (dict(self.plan_opts, spacing_choices=list(PLAN_SPACING_CHOICES),
+                                  edge_choices=[list(c) for c in PLAN_EDGE_CHOICES])
+                             if (manager_ok and self.plan_opts) else None),
                 'keepout': dict(self.keepout_info, undo=self._ko_undo is not None),
                 'geo': {'scan': scan_flat},
                 'vehicle': self.vehicle,
@@ -1101,6 +1131,8 @@ class HmiWeb(Node):
                 self.map_info = None
                 self.loc = None
                 self.plan = None
+                self.resume_info = None
+                self.plan_opts = None
                 self.mission = None
                 self.mower = None
                 if self.expect_down:
@@ -1613,18 +1645,9 @@ class HmiWeb(Node):
                 return False, '停止中只能先切手動（跟手把 LB + X 一樣）'
             if m == 0 and self.localization():
                 return False, '用的是存好的地圖，不用建圖（要建新地圖：關閉車上程式，重新啟動時選「建新地圖」）'
-            if m == 1 and not frame.get('map', {}).get('ready'):
-                return False, '還沒有地圖：先開始建圖，把範圍開一圈'
-            if m == 1 and self.localization():
-                loc = self.loc_state()
-                if not loc['ok']:
-                    return False, '定位還沒對上存好的地圖（%s）。按「設定車子位置」點出車子在哪' % loc['text']
-            if m == 1 and not frame.get('joy', {}).get('connected'):
-                return False, '手把沒連上：自動割草要手把連著（打開手把再按）'
-            if m == 1 and self.rec_on:
-                return False, '正在圈外框：先按「結束」或「取消這次」'
-            if m == 1 and not frame.get('nav_ready'):
-                return False, '導航 (Nav2) 還沒準備好：car-start planonly 開的，或 Nav2 沒起來（關閉再啟動一次）'
+            why = self.auto_block(frame) if m == 1 else None
+            if why:
+                return False, why
             ok, err = self.set_mode(m, who)
             if not ok:
                 self.log(who, '切到%s（沒成功：%s）' % (MODE_NAME[m], err))
@@ -1632,6 +1655,8 @@ class HmiWeb(Node):
                 # 存圖的時候車子在地圖上的位置會斷一下，manager 會等存好才出發 (2026-10-20)
                 return ok, '正在存地圖，存好就出發（大約 10～30 秒）'
             return ok, err
+        if cmd == 'resume':
+            return self.resume(frame, mode, who)
         if cmd == 'preview':
             if mode in (1, 3):
                 return False, '自動割草中不能預覽，先切手動'
@@ -1669,6 +1694,8 @@ class HmiWeb(Node):
             if not any(abs(v - c) < 1e-6 for c in SPEED_CHOICES):
                 return False, '速度只能選 %s' % '、'.join('%.2f' % c for c in SPEED_CHOICES)
             return self.set_speed(v, who)
+        if cmd == 'planopt':
+            return self.set_plan_option(arg, mode, who)
         if cmd in ('keepout', 'keepoutImage'):
             ms = frame.get('mission', {})
             if mode in (1, 3) and ms.get('state') in (MissionStatus.STATE_PLANNING, MissionStatus.STATE_EXECUTING):
@@ -1689,9 +1716,119 @@ class HmiWeb(Node):
             if err:
                 return False, err
             return True, '存地圖中（大約 10～30 秒），存好會寫在「紀錄」'
+        if cmd == 'cancelmap':
+            return self.cancel_map(frame, mode, who)
         if cmd == 'locate':
             return self.locate(arg, who, mode)
         return False, '不認得的指令'
+
+    def cancel_map(self, frame, mode, who):
+        """「取消建圖」(2026-10-22 will：不要用終端)：這次建的地圖不要了，從車子現在的位置重新建。
+        slam_toolbox 沒有「清掉重來」的服務，所以跟 car-stop 再 car-start 一樣：先關 (先切停止，輪子停了才關)，
+        再用建新地圖開起來。存過的地圖不會刪。"""
+        if self.prog['busy']:
+            return False, '車上程式正在啟動或關閉，等它好了再按'
+        if self.localization():
+            return False, '用的是存好的地圖，沒有在建圖（要建新地圖：關閉，重新啟動時選「建新地圖」）'
+        if not self.mapping:
+            return False, '還沒開始建圖，沒有要取消的'
+        ms = frame.get('mission', {})
+        if mode in (1, 3) and ms.get('state') in (MissionStatus.STATE_PLANNING,
+                                                  MissionStatus.STATE_EXECUTING):
+            return False, '自動割草中不能取消建圖，先切手動'
+        if self.saving_since is not None:
+            return False, '正在存地圖，等它存完再按'
+        if self.rec_on:
+            return False, '正在圈外框：先按「取消這次」'
+        self.expect_down = True
+        self.run_script(['stopping', 'starting'], [[self.car_stop], [self.car_start]], who,
+                        '取消建圖：關閉車上程式，再用建新地圖啟動')
+        return True, '取消建圖：先關閉（輪子停了才關），再從車子現在的位置建新地圖，大約 30～60 秒。開好了按「開始建圖」或手把 LB + A'
+
+    def auto_block(self, frame):
+        """切自動割草 (重新開始) 與接著割共用的出發條件：不能出發就回傳原因。"""
+        if not frame.get('map', {}).get('ready'):
+            return '還沒有地圖：先開始建圖，把範圍開一圈'
+        if self.localization():
+            loc = self.loc_state()
+            if not loc['ok']:
+                return '定位還沒對上存好的地圖（%s）。按「設定車子位置」點出車子在哪' % loc['text']
+        if not frame.get('joy', {}).get('connected'):
+            return '手把沒連上：自動割草要手把連著（打開手把再按）'
+        if self.rec_on:
+            return '正在圈外框：先按「結束」或「取消這次」'
+        if not frame.get('nav_ready'):
+            return '導航 (Nav2) 還沒準備好：car-start planonly 開的，或 Nav2 沒起來（關閉再啟動一次）'
+        return None
+
+    def resume(self, frame, mode, who):
+        """「接著割」(2026-10-22 will)：上一趟停下來的地方接著割，不重新規劃。
+        跟切自動割草一樣：停止中要先切手動 (解除停止一定是先切手動)，出發條件也一樣。"""
+        info = self.resume_info or {}
+        if not info.get('available'):
+            return False, '沒有上一趟沒割完的進度'
+        if mode == 4:
+            return False, '停止中：先按「手動」解除停止（跟手把 LB + X 一樣），再按接著割'
+        if mode in (1, 3):
+            return False, '自動割草中：先切手動，車停了再按'
+        if info.get('changed'):
+            what = '和'.join(info['changed'])
+            return False, '停下來之後改過%s，舊的路線可能會壓到：按「重新開始」照現在的%s重新規劃' % (what, what)
+        why = self.auto_block(frame)
+        if why:
+            return False, why
+        with self._lock:
+            self._sent_mode = (1, self._mono(), who)
+        res, err = self.call(self.resume_cli, Trigger.Request(), timeout=10.0)
+        if res is None:
+            self.log(who, '接著割（沒送到：%s）' % err)
+            return False, '接著割沒送到：' + err
+        self.log(who, '接著割' + ('：' + res.message if res.success else '（沒成功：%s）' % res.message))
+        if res.success and self.saving_since is not None:
+            return True, res.message + '正在存地圖，存好就出發。'
+        return bool(res.success), res.message
+
+    def set_plan_option(self, arg, mode, who):
+        """「割草路線」：改割草線間距 {'spacing': 0.35} 或沿邊圈數 {'edge': '0.85'}，下一次規劃才用。
+        mower_manager 檢查 (割草中、算路線中不接受)，存起來下次開機照用。"""
+        po = self.plan_opts
+        if not po:
+            return False, '讀不到割草路線的設定（車上程式還在啟動？）'
+        if mode in (1, 3):
+            return False, '自動割草中不能改，先切手動（這一趟照原本的割完；接著割也照原本的）'
+        if not isinstance(arg, dict):
+            return False, '設定不對'
+        params, what = [], []
+        if 'spacing' in arg:
+            try:
+                sp = float(arg['spacing'])
+            except (TypeError, ValueError):
+                return False, '間距不對'
+            if not any(abs(sp - c) < 1e-6 for c in PLAN_SPACING_CHOICES):
+                return False, '間距只能選 %s' % '、'.join('%.2f' % c for c in PLAN_SPACING_CHOICES)
+            blade = float(po.get('blade') or 0.0)
+            if blade <= sp:
+                return False, '讀不到刀盤寬'
+            params.append(self._double('overlap_ratio', round(1.0 - sp / blade, 4)))
+            what.append('割草線間距 %.2f m' % sp)
+        if 'edge' in arg:
+            name = next((t for t, v in PLAN_EDGE_CHOICES if v == arg['edge']), None)
+            if name is None:
+                return False, '沿邊只能選 %s' % '、'.join(t for t, _v in PLAN_EDGE_CHOICES)
+            params.append(Parameter(name='edge_loops', value=ParameterValue(
+                type=ParameterType.PARAMETER_STRING, string_value=str(arg['edge']))))
+            what.append('沿邊%s' % name)
+        if not params:
+            return False, '沒有要改的'
+        res, err = self.call(self.par_cli['mgr_set'], SetParameters.Request(parameters=params))
+        if res is None:
+            return False, '沒改成：' + err
+        bad = [r.reason for r in res.results if not r.successful]
+        if bad:
+            self.log(who, '割草路線改%s（沒成功：%s）' % ('、'.join(what), '；'.join(bad)))
+            return False, '沒改成：' + '；'.join(bad)
+        self.log(who, '割草路線改成%s' % '、'.join(what))
+        return True, '改好了：%s。下一次規劃才用，按「預覽路線」看新的路線要多久' % '、'.join(what)
 
     def locate(self, arg, who, mode):
         """「設定車子位置」：使用者在地圖上點車子在哪、朝哪，map_session 在附近用光達找準。"""
@@ -1731,21 +1868,26 @@ class HmiWeb(Node):
         return ''
 
     def run_script(self, busy, argv, who, what):
+        """在背景跑 car-start / car-stop。busy、argv 可以是 list：照順序一個一個跑 (取消建圖 = 先關再開)，
+        前一個失敗就不跑後面的。"""
+        steps = list(zip(busy, argv)) if isinstance(busy, (list, tuple)) else [(busy, argv)]
         with self._lock:
-            self.prog['busy'] = busy
+            self.prog['busy'] = steps[0][0]
             self.prog['output'] = ''
         self.log(who, what)
 
-        def work():
+        def run_one(step_busy, step_argv):
             # 輸出寫到檔案，不用管線：car-start 開的 tmux 會留在背景，用管線的話要等它結束才讀得完
             log_dir = os.path.join(self.home, 'car_logs')
-            log_path = os.path.join(log_dir, 'hmi_%s.log' % os.path.basename(argv[0]))
+            log_path = os.path.join(log_dir, 'hmi_%s.log' % os.path.basename(step_argv[0]))
+            with self._lock:
+                self.prog['busy'] = step_busy
             try:
                 os.makedirs(log_dir, exist_ok=True)
                 with open(log_path, 'w+', encoding='utf-8', errors='replace') as out:
                     try:
-                        rc = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
-                                            cwd=self.home, timeout=150).returncode
+                        rc = subprocess.run(step_argv, stdin=subprocess.DEVNULL, stdout=out,
+                                            stderr=subprocess.STDOUT, cwd=self.home, timeout=150).returncode
                         out.seek(0)
                         text = out.read().strip()
                     except subprocess.TimeoutExpired:
@@ -1753,7 +1895,19 @@ class HmiWeb(Node):
                         text, rc = out.read().strip() + '\n超過 150 秒還沒結束', -1
             except Exception as exc:
                 text, rc = '跑不起來：%s' % exc, -1
-            lines = text.splitlines()
+            return rc, text
+
+        def work():
+            rc, lines = 0, []
+            for step_busy, step_argv in steps:
+                rc, text = run_one(step_busy, step_argv)
+                lines += text.splitlines()
+                if rc != 0:
+                    break
+                if step_busy == 'stopping' and len(steps) > 1:
+                    # 關掉之後要等 check_program 看到「沒在跑」，再開新的 (不然網頁以為一直都在跑)
+                    self._prog_check_t = 0.0
+                    time.sleep(1.5)
             fail = [ln for ln in lines if '❌' in ln or '⚠' in ln]
             with self._lock:
                 self.prog['busy'] = None
