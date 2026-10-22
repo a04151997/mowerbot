@@ -39,6 +39,62 @@ def append_if_moved(track, x, y, min_step=MIN_STEP_M):
     return True
 
 
+# ---- 倒車擦掉 (2026-10-22 will：圈外框開錯了要能倒回去，不用整圈重來) ----
+# 車子移動超過這個距離才判斷是往前還是倒退 (TF 抖動比這個小)
+REVERSE_MIN_STEP_M = 0.03
+# 倒車時離軌跡這麼近才擦 (沿著原路退回去)；離開原路倒車不會擦，也不會記
+REVERSE_TOL_M = 0.40
+# 只在最後這麼長的那一段裡找 (繞完一圈回到起點附近倒車時，不會找到起點那一頭)
+REVERSE_LOOKBACK_M = 30.0
+
+
+def motion_direction(prev_xy, xy, yaw, min_step=REVERSE_MIN_STEP_M):
+    """從 prev_xy 移到 xy 是往車頭方向 (+1)、往車尾 (-1)，還是沒動夠遠或往旁邊滑 (0)。"""
+    dx, dy = xy[0] - prev_xy[0], xy[1] - prev_xy[1]
+    d = math.hypot(dx, dy)
+    if d < min_step:
+        return 0
+    c = (dx * math.cos(yaw) + dy * math.sin(yaw)) / d
+    if c > 0.5:
+        return 1
+    if c < -0.5:
+        return -1
+    return 0
+
+
+def erase_back(track, x, y, tol=REVERSE_TOL_M, lookback=REVERSE_LOOKBACK_M):
+    """倒車沿原路退回去：把軌跡上車子已經退過的那一截刪掉 (就地改 track)，回傳刪掉多長 (m)。
+
+    從軌跡的尾巴往回找，第一個離 (x, y) 在 tol 以內、而且比前後都近的點 = 車子現在退到的地方，
+    它後面的點都刪掉。從尾巴找、最多找 lookback 那麼長：開過的地方又經過一次
+    (凹口兩邊、繞完一圈回到起點附近) 只會對到最近開過的那一次。找不到 (離開原路倒車) 不刪。
+    """
+    n = len(track)
+    if n < 2:
+        return 0.0
+
+    def dist(i):
+        return math.hypot(track[i][0] - x, track[i][1] - y)
+
+    acc = 0.0
+    k = None
+    for i in range(n - 1, -1, -1):
+        if i < n - 1:
+            acc += math.hypot(track[i + 1][0] - track[i][0], track[i + 1][1] - track[i][1])
+            if acc > lookback:
+                break
+        di = dist(i)
+        if di <= tol and (i == 0 or dist(i - 1) >= di):
+            k = i
+            break
+    if k is None or k >= n - 1:
+        return 0.0
+    gone = sum(math.hypot(track[i + 1][0] - track[i][0], track[i + 1][1] - track[i][1])
+               for i in range(k, n - 1))
+    del track[k + 1:]
+    return gone
+
+
 def polygon_area(poly):
     """Shoelace 公式，回傳面積 (正值)。"""
     n = len(poly)

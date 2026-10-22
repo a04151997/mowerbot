@@ -12,6 +12,9 @@
 RViz 可以加 /boundary_recorder/track (Path) 看正在記錄的軌跡、/lawn_boundary (Polygon) 看結果。
 /boundary_recorder/recording (std_msgs/Bool，transient local)：true = 正在記錄。網頁人機介面和 car-boundary 讀它。
 
+開錯了 (2026-10-22)：用手把沿原路倒車，退過的那一截會從軌跡擦掉，退到開錯之前再往前開就接著記，
+不用整圈重來 (lawn_boundary.erase_back)。
+
 記的是 map 座標系裡 base_footprint (後輪軸中心) 的位置。邊界就是這條軌跡本身，
 不往外推半個車寬：使用者不一定剛好把輪子壓在草地邊上，往外推可能推到草地外面。
 
@@ -19,6 +22,7 @@ RViz 可以加 /boundary_recorder/track (Path) 看正在記錄的軌跡、/lawn_
 session = 哪一次建圖 (map_session.py)：用存好的地圖開機時 session 跟那一次一樣，外框自動載回來；
 建新地圖時 session 是新的，不會載到別次建圖的外框 (座標系不一樣)。
 """
+import math
 import os
 import time
 
@@ -74,6 +78,10 @@ class BoundaryRecorder(Node):
         self.track = []
         self._tf_fail_since = None
         self._last_track_pub = 0.0
+        # 倒車擦掉 (2026-10-22)：上一次判斷前進 / 倒退的位置、這一次倒車已經擦掉多長
+        self._motion_xy = None
+        self._reversing = False
+        self._erased = 0.0
 
         self.create_service(Trigger, '~/start', self.start_cb)
         self.create_service(Trigger, '~/stop', self.stop_cb)
@@ -136,8 +144,30 @@ class BoundaryRecorder(Node):
         self._tf_fail_since = None
         x = tf.transform.translation.x
         y = tf.transform.translation.y
-        lawn_boundary.append_if_moved(self.track, x, y)
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        # 倒車 = 擦掉 (2026-10-22 will：開錯了要能倒回去)。沿著原路倒車，退過的那一截從軌跡刪掉，
+        # 退到開錯之前再往前開就接著記。倒車時不記新的點 (離開原路倒車不擦也不記)。
+        # 前進還是倒退：移動夠遠才重新判斷，中間 (慢慢開、停住) 維持上一次的判斷
+        if self._motion_xy is None:
+            self._motion_xy = (x, y)
+        else:
+            step = lawn_boundary.motion_direction(self._motion_xy, (x, y), yaw)
+            if step != 0:
+                self._motion_xy = (x, y)
+                self._reversing = step < 0
         now = time.monotonic()
+        if self._reversing:
+            gone = lawn_boundary.erase_back(self.track, x, y)
+            if gone > 0.0:
+                self._erased += gone
+                self._last_track_pub = now
+                self.publish_track()
+            return
+        if self._erased > 0.0:
+            self.get_logger().info('↩️ 倒車擦掉了 %.1f m 外框，從這裡接著記' % self._erased)
+            self._erased = 0.0
+        lawn_boundary.append_if_moved(self.track, x, y)
         if now - self._last_track_pub > 1.0:
             self._last_track_pub = now
             self.publish_track()
@@ -180,9 +210,13 @@ class BoundaryRecorder(Node):
         self.track = []
         self.set_recording(True)
         self._tf_fail_since = None
+        self._motion_xy = None
+        self._reversing = False
+        self._erased = 0.0
         self.publish_track()
         resp.success = True
         resp.message = ('開始記錄。用手把沿著草地邊緣開一整圈，開回起點 %.1f m 內再按完成 (car-boundary stop)。'
+                        '開錯了就沿原路倒車，退過的線會擦掉。'
                         % lawn_boundary.MAX_CLOSE_GAP_M)
         self.get_logger().info('▶️ ' + resp.message)
         return resp

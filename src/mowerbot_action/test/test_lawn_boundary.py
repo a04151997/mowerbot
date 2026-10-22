@@ -163,3 +163,67 @@ def test_yaml_roundtrip(tmp_path):
     loaded, frame = lb.load_yaml(str(path))
     assert frame == 'map'
     assert loaded == poly
+
+
+# ---- 倒車擦掉 (2026-10-22 will：圈外框開錯了要能倒回去) ----
+def _drive(track, pts, yaw_of, state):
+    """照 boundary_recorder.sample 的邏輯一點一點開過 pts：倒車時擦、前進時記。yaw_of(i) = 車頭方向。"""
+    for i, (x, y) in enumerate(pts):
+        if state['xy'] is None:
+            state['xy'] = (x, y)
+        else:
+            step = lb.motion_direction(state['xy'], (x, y), yaw_of(i))
+            if step != 0:
+                state['xy'] = (x, y)
+                state['rev'] = step < 0
+        if state['rev']:
+            lb.erase_back(track, x, y)
+        else:
+            lb.append_if_moved(track, x, y)
+
+
+def test_motion_direction():
+    assert lb.motion_direction((0, 0), (0.1, 0.0), 0.0) == 1
+    assert lb.motion_direction((0, 0), (-0.1, 0.0), 0.0) == -1
+    assert lb.motion_direction((0, 0), (0.0, 0.1), 0.0) == 0         # 往旁邊滑
+    assert lb.motion_direction((0, 0), (-0.01, 0.0), 0.0) == 0       # 還沒動夠遠
+    assert lb.motion_direction((0, 0), (0.0, -0.1), math.pi / 2) == -1
+
+
+def test_reverse_erases_the_wrong_part_and_continues():
+    track, st = [], {'xy': None, 'rev': False}
+    # 往東開 6 m (前 4 m 對，後 2 m 開錯)
+    fwd = [(0.02 * i, 0.0) for i in range(301)]
+    _drive(track, fwd, lambda i: 0.0, st)
+    assert track[-1][0] == pytest.approx(6.0, abs=0.11)
+    # 沿原路倒車退回 x = 4 (車頭還是朝東)
+    back = [(6.0 - 0.02 * i, 0.0) for i in range(1, 101)]
+    _drive(track, back, lambda i: 0.0, st)
+    assert max(p[0] for p in track) <= 4.0 + 0.11
+    # 轉 90° 往北開 3 m：從 x = 4 接著記
+    north = [(4.0, 0.02 * i) for i in range(1, 151)]
+    _drive(track, north, lambda i: math.pi / 2, st)
+    assert max(p[0] for p in track) <= 4.0 + 0.11
+    assert track[-1] == pytest.approx((4.0, 3.0), abs=0.11)
+    steps = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(track[:-1], track[1:])]
+    assert max(steps) < 0.25                                       # 中間沒有跳接
+
+
+def test_reverse_off_the_track_erases_nothing():
+    track = [(0.1 * i, 0.0) for i in range(51)]
+    before = list(track)
+    assert lb.erase_back(track, 3.0, 1.0) == 0.0                   # 離原路 1 m 倒車
+    assert track == before
+
+
+def test_reverse_near_the_start_only_touches_the_tail():
+    # 繞一個 2 x 2 m 的方形快回到起點，在起點旁邊倒車一點點：只擦尾巴，不會對到起點那一頭
+    sq = [(0.1 * i, 0.0) for i in range(20)] + [(2.0, 0.1 * i) for i in range(20)]
+    sq += [(2.0 - 0.1 * i, 2.0) for i in range(20)] + [(0.0, 2.0 - 0.1 * i) for i in range(17)]
+    track = list(sq)                                               # 尾巴停在 (0, 0.4)
+    gone = lb.erase_back(track, 0.0, 0.55)
+    assert 0.0 < gone < 0.3
+    assert len(track) > len(sq) - 4
+    # 尾巴之前的那一段 (lookback 外) 不會被找到
+    track = list(sq)
+    assert lb.erase_back(track, 1.0, 0.0, lookback=2.0) == 0.0
