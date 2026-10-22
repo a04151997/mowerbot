@@ -66,6 +66,8 @@ from std_srvs.srv import Trigger
 from mowerbot_interfaces.msg import JoyStatus, MissionStatus, MowerStatus
 from mowerbot_interfaces.srv import SetDriveMode
 
+from mowerbot_hmi import viewer
+
 MODE_NAME = {0: '建圖', 1: '自動割草', 2: '手動', 3: '保留', 4: '停止中'}
 STATE_NAME = {0: '待命', 1: '規劃中', 2: '執行中', 3: '割完了', 4: '已中止'}
 
@@ -138,6 +140,8 @@ NODES = [
     ('/map_to_boundary', '割草範圍'), ('/keepout_server', '禁區'), ('/map_autosave', '存地圖'),
     ('/boundary_recorder', '外框 (草地邊界)'), ('/map_session', '地圖與定位'),
 ]
+# car-start 開的 foxglove_bridge (給 Lichtblick 看畫面，只能看)：節點名稱和 port 跟 foxglove.yaml 一樣
+VIEW_NODE, VIEW_PORT = '/foxglove_bridge', 8765
 # 「診斷」頁的資料更新率 (話題, 下限 Hz)
 TOPICS = [('/scan', 8.0), ('/odom', 10.0), ('/joy', 10.0), ('/joy_status', 3.0),
           ('/mower_status', 3.0), ('/cmd_vel', 5.0)]
@@ -364,6 +368,8 @@ class HmiWeb(Node):
         self._cpu_prev = None
         self._nodes_t = 0.0
         self._nodes = []
+        self.viewer = None                              # main() 設定：網頁版 Lichtblick (viewer.Viewer)
+        self._viewer = {'installed': False, 'version': '', 'bridge': False, 'port': VIEW_PORT}
 
         # ---- 上一輪的狀態，用來寫事件 ----
         self._prev_mode = None
@@ -857,6 +863,7 @@ class HmiWeb(Node):
                 'keepout': dict(self.keepout_info, undo=self._ko_undo is not None),
                 'geo': {'scan': scan_flat},
                 'vehicle': self.vehicle,
+                'viewer': dict(self._viewer),
                 'diag': {
                     'topics': [{'name': n, 'hz': round(self.rates[n].hz(mono), 2), 'min': lo} for n, lo in TOPICS],
                     'nodes': self._nodes,
@@ -1155,6 +1162,9 @@ class HmiWeb(Node):
             names = set()
         up = self.prog['running']
         self._nodes = [{'name': n, 'what': what, 'ok': up and n in names} for n, what in NODES]
+        v = self.viewer
+        self._viewer = {'installed': bool(v and v.installed()), 'port': VIEW_PORT,
+                        'bridge': up and VIEW_NODE in names, 'version': v.version() if v else ''}
 
     # ------------------------------------------------------------------
     # 速度上限 (網頁可以改)
@@ -1359,8 +1369,81 @@ class HmiWeb(Node):
                 self._templates.popitem(last=False)
         return png.tobytes(), 'keepout_%s.png' % tid
 
+    def _saved_map_frame(self, path):
+        """存好的地圖 (<名稱>.yaml + .pgm) 的格子：w h res ox oy session，讀不到回傳 None。"""
+        from mowerbot_action import keepout, map_session
+        try:
+            mm = keepout.load_map_meta(path + '.yaml')
+        except Exception:
+            return None
+        size = keepout.image_size(mm['image'])
+        if size is None:
+            return None
+        return {'w': size[0], 'h': size[1], 'res': mm['resolution'], 'ox': mm['origin_x'],
+                'oy': mm['origin_y'], 'session': map_session.session_of(path)}
+
+    def _upload_frame(self, name, iw, ih, session):
+        """上傳的圖是哪一張地圖的 (2026-10-22 will：大小不對網頁自己轉)。
+
+        回傳 (meta, 說明, None) 或 (None, None, 不能套用的原因)。meta = 那張圖原本的格子
+        (w h res ox oy session)；圖被等比例縮放過也認得 (之後 fit_mask 縮回來)。找的順序：
+        1. 檔名：這次開機「下載地圖圖片」的 keepout_<時間>.png，或存圖時給的 <地圖>_draw.png
+        2. 一樣大的圖 (下載過的、存好的地圖)，現在這張地圖的優先
+        3. 等比例縮放過、只有一張現在這張地圖的對得上
+        裁切過、比例變了、是別張地圖的圖都不轉：硬拉會把禁區放到錯的地方。
+        """
+        from mowerbot_action import keepout, map_session
+        with self._lock:
+            temps = list(self._templates.items())
+        named, others = [], []
+        mt = re.search(r'keepout_(\d{4}_\d{6})', name)
+        for tid, meta in reversed(temps):
+            item = ('這次開機下載的 keepout_%s.png' % tid, dict(meta))
+            (named if mt and mt.group(1) == tid else others).append(item)
+        maps_dir = map_session.default_maps_dir()
+        want = keepout.drawing_map_name(name)
+        if maps_dir and want and os.path.isfile(os.path.join(maps_dir, want + '.yaml')):
+            meta = self._saved_map_frame(os.path.join(maps_dir, want))
+            if meta is not None:
+                named.append(('存好的地圖 %s' % want, meta))
+        if maps_dir:
+            for m in map_session.list_saved_maps(maps_dir, SAVED_MAPS_SHOWN):
+                if m['name'] != want:
+                    meta = self._saved_map_frame(m['path'])
+                    if meta is not None:
+                        others.append(('存好的地圖 %s' % m['name'], meta))
+        for label, meta in named:
+            if not keepout.scaled_copy(iw, ih, meta['w'], meta['h']):
+                return None, None, ('這張是%s 的圖，可是被裁切過或長寬比例變了 (%d x %d，原本 %d x %d)，'
+                                    '不知道原本在地圖的哪裡。請用沒有裁切的那張畫'
+                                    % (label, iw, ih, meta['w'], meta['h']))
+            return meta, label, None
+        here = [c for c in others if c[1]['session'] == session]
+        for pool in (here, others):
+            for label, meta in pool:
+                if (meta['w'], meta['h']) == (iw, ih):
+                    return meta, label, None
+        # 同一張地圖下載兩次是同一個格子，不算兩張
+        scaled, seen = [], set()
+        for label, meta in here:
+            key = (meta['w'], meta['h'], round(meta['res'], 6),
+                   round(meta['ox'], 3), round(meta['oy'], 3))
+            if key not in seen and keepout.scaled_copy(iw, ih, meta['w'], meta['h']):
+                seen.add(key)
+                scaled.append((label, meta))
+        if len(scaled) == 1:
+            return scaled[0][1], scaled[0][0], None
+        if scaled:
+            return None, None, ('這張圖被縮放過，檔名也改了，對得上的地圖有 %d 張，認不出是哪一張。'
+                                '請用原本的檔名上傳' % len(scaled))
+        return None, None, ('認不出這張圖 (%d x %d) 是哪一張地圖的：檔名改過、也不是現在這張地圖的大小。'
+                            '請用這次「下載地圖圖片」的那張，或存圖時給的 <地圖名稱>_draw.png 畫，不要裁切' % (iw, ih))
+
     def keepout_image(self, arg, who):
-        """上傳畫好的圖：紅色 = 禁區 (整張的禁區換成圖上的紅色，跟 keepout_tool apply 一樣)。"""
+        """上傳畫好的圖：紅色 = 禁區 (整張的禁區換成圖上的紅色，跟 keepout_tool apply 一樣)。
+
+        圖的大小不對時自己轉 (等比例縮放過的縮回來、存好的地圖照它的原點放)，見 _upload_frame。
+        """
         from mowerbot_action import keepout
         if not isinstance(arg, dict) or not isinstance(arg.get('data'), str):
             return False, '沒有收到圖片'
@@ -1374,31 +1457,37 @@ class HmiWeb(Node):
         if bgr is None:
             return False, '讀不出圖片 (要 PNG 或 JPG)'
         ih, iw = bgr.shape[:2]
-        with self._lock:
-            temps = dict(self._templates)
-        mt = re.search(r'keepout_(\d{4}_\d{6})', name)
-        meta = temps.get(mt.group(1)) if mt else None
-        if meta is None:
-            same = [t for t in reversed(list(temps.values())) if (t['w'], t['h']) == (iw, ih)]
-            meta = same[0] if same else None
-        if meta is None:
-            return False, ('找不到這張圖的地圖 (%d x %d)：要用這次開機在網頁按「下載地圖圖片」的那張畫，'
-                           '不要裁切或縮放' % (iw, ih))
-        if (meta['w'], meta['h']) != (iw, ih):
-            return False, '圖片尺寸 %d x %d 跟下載的地圖 %d x %d 不一樣：不要裁切或縮放' % (iw, ih, meta['w'], meta['h'])
         res_s, err = self.call(self.ko_cli['session'], Trigger.Request())
         if res_s is None or not res_s.success:
             return False, '禁區程式 (keepout_server) ' + (err or res_s.message)
+        meta, label, why = self._upload_frame(name, iw, ih, res_s.message)
+        if meta is None:
+            self.log(who, '上傳禁區圖 %s（沒成功：%s）' % (name[:60], why))
+            return False, why
         if res_s.message != meta['session']:
-            return False, '這張圖是上一次開機的地圖，現在的地圖原點不一樣，對不上。請重新下載再畫'
-        red = keepout.red_mask(bgr)
+            if label.startswith('存好的地圖'):
+                why = ('這張是%s 的圖，現在車上用的不是這張地圖，座標對不上。要套用：先「關閉」，'
+                       '「啟動」時選 %s，再上傳一次' % (label, label.split(' ', 1)[1]))
+            else:
+                why = '這張圖是上一次開機的地圖，現在的地圖原點不一樣，對不上。請重新下載再畫'
+            self.log(who, '上傳禁區圖 %s（沒成功：%s）' % (name[:60], why))
+            return False, why
+        red = keepout.fit_mask(keepout.red_mask(bgr), meta['w'], meta['h'])
+        notes = []
+        if (iw, ih) != (meta['w'], meta['h']):
+            notes.append('圖是 %d x %d，已經等比例轉回 %d x %d' % (iw, ih, meta['w'], meta['h']))
+        if label.startswith('存好的地圖'):
+            notes.append('照%s 的位置對齊' % label)
         grid = self._map_grid()
         prev = None
         if grid is not None:
             prev = (self._current_keepout(grid),) + grid[2:]
         ok, text = self._apply_keepout(np.flipud(red), meta['res'], meta['ox'], meta['oy'],
                                        '網頁上傳 ' + name[:60], prev)
-        self.log(who, '上傳禁區圖 %s' % name[:60] + ('' if ok else '（沒成功：%s）' % text))
+        if ok and notes:
+            text += '（' + '；'.join(notes) + '）'
+        self.log(who, '上傳禁區圖 %s' % name[:60] + ('' if ok else '（沒成功：%s）' % text)
+                 + ('，' + '；'.join(notes) if ok and notes else ''))
         return ok, text
 
     # ------------------------------------------------------------------
@@ -1684,7 +1773,18 @@ class HmiWeb(Node):
 # ======================================================================
 # HTTP
 # ======================================================================
-def make_handler(node, page, allow):
+LICHTBLICK_MISSING = ('<!doctype html><meta charset="utf-8">'
+                      '<meta name="viewport" content="width=device-width">'
+                      '<title>Lichtblick 還沒裝</title>'
+                      '<body style="font:16px sans-serif;margin:24px;line-height:1.6">'
+                      '<h2>車上還沒有 Lichtblick 網頁版</h2><p>照「網頁人機介面.md」的「Lichtblick」那一節：'
+                      'Mac 有網路時下載一次，連上車子熱點後傳到 N150，'
+                      '再跑一次安裝檔。</p>'
+                      '<p>還沒裝之前，Mac 上的 Lichtblick 程式照樣可以連 ws://10.42.0.1:%d 看。</p>'
+                      % VIEW_PORT).encode('utf-8')
+
+
+def make_handler(node, page, allow, lb):
 
     class Handler(BaseHTTPRequestHandler):
         server_version = 'mowerbot-hmi'
@@ -1721,6 +1821,14 @@ def make_handler(node, page, allow):
             u = urlparse(self.path)
             if u.path in ('/', '/index.html'):
                 return self.send_bytes(200, page, 'text/html; charset=utf-8')
+            if u.path == '/lichtblick':
+                self.send_response(301)
+                self.send_header('Location', viewer.PREFIX + ('?' + u.query if u.query else ''))
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return None
+            if u.path.startswith(viewer.PREFIX):
+                return self.lichtblick(u.path)
             if u.path == '/api/stream':
                 return self.stream(parse_qs(u.query))
             if u.path == '/api/map.png':
@@ -1744,7 +1852,34 @@ def make_handler(node, page, allow):
                         else:
                             f.setdefault('geo', {})[k] = v
                 return self.send_json(f)
+            # Lichtblick 的檔案用絕對路徑 (/main.….js) 要的話也給：新版改了 publicPath 也不會整頁空白
+            if lb.installed() and u.path.count('/') == 1 and u.path not in ('/', '/index.html'):
+                return self.lichtblick(viewer.PREFIX + u.path[1:])
             return self.send_bytes(404, b'not found', 'text/plain')
+
+        def lichtblick(self, path):
+            """網頁版 Lichtblick 的檔案 (見 viewer.py)。"""
+            if not lb.installed():
+                return self.send_bytes(404, LICHTBLICK_MISSING, 'text/html; charset=utf-8')
+            r = lb.resolve(path, viewer.accepts_gzip(self.headers.get('Accept-Encoding')))
+            if r is None:
+                return self.send_bytes(404, b'not found', 'text/plain')
+            fpath, ctype, extra = r
+            try:
+                if fpath == 'index':
+                    return self.send_bytes(200, lb.index_html(), ctype)
+                size = os.path.getsize(fpath)
+                self.send_response(200)
+                self.send_header('Content-Type', ctype)
+                self.send_header('Content-Length', str(size))
+                for k, v in extra.items():
+                    self.send_header(k, v)
+                self.end_headers()
+                with open(fpath, 'rb') as fh:
+                    shutil.copyfileobj(fh, self.wfile, 262144)
+            except (BrokenPipeError, ConnectionResetError):    # 瀏覽器中途關掉，不用管
+                self.close_connection = True
+            return None
 
         def do_POST(self):
             if not self.allowed():
@@ -1856,12 +1991,17 @@ def main(argv=None):
                     help='接受哪些網段的連線，逗號分開')
     ap.add_argument('--car-start', default=os.environ.get('MOWER_CAR_START', '/usr/local/bin/car-start'))
     ap.add_argument('--car-stop', default=os.environ.get('MOWER_CAR_STOP', '/usr/local/bin/car-stop'))
+    ap.add_argument('--lichtblick-dir', default=viewer.ROOT, help='網頁版 Lichtblick 的資料夾 (安裝檔放的)')
     args, ros_args = ap.parse_known_args(argv)
     allow = [ipaddress.ip_network(a.strip(), strict=False) for a in args.allow.split(',') if a.strip()]
 
     rclpy.init(args=ros_args)
     node = HmiWeb(args.car_start, args.car_stop, os.path.expanduser('~'))
     page = load_page()
+    from ament_index_python.packages import get_package_share_directory
+    share = get_package_share_directory('mowerbot_hmi')
+    lb = viewer.Viewer(args.lichtblick_dir, os.path.join(share, 'web', 'lichtblick_layout.json'))
+    node.viewer = lb
     executor = SingleThreadedExecutor()
     executor.add_node(node)
 
@@ -1875,7 +2015,7 @@ def main(argv=None):
 
     ThreadingHTTPServer.allow_reuse_address = True
     ThreadingHTTPServer.daemon_threads = True
-    httpd = ThreadingHTTPServer((args.bind, args.port), make_handler(node, page, allow))
+    httpd = ThreadingHTTPServer((args.bind, args.port), make_handler(node, page, allow, lb))
     node.get_logger().info('網頁：http://10.42.0.1:%d （接受 %s）' % (args.port, args.allow))
 
     def stop(*_a):

@@ -23,6 +23,7 @@ row 0 在 origin 那一側，所以「圖片」與「網格」之間差一個上
 單元測試在 test/test_keepout.py。
 """
 import os
+import re
 
 import cv2
 import numpy as np
@@ -86,17 +87,69 @@ def red_mask(bgr):
 
 
 def drawing_to_keepout(drawn_bgr, template_bgr):
-    """畫好的圖 -> (紅色遮罩, 被改過但不是紅色的像素數)。尺寸不同就丟 ValueError。"""
+    """畫好的圖 -> (紅色遮罩, 被改過但不是紅色的像素數)。
+
+    等比例縮放過的圖先轉回地圖大小 (見 scaled_copy)；其他尺寸不同就丟 ValueError。
+    """
     dh, dw = drawn_bgr.shape[:2]
     th, tw = template_bgr.shape[:2]
-    if (dh, dw) != (th, tw):
+    if not scaled_copy(dw, dh, tw, th):
         raise ValueError(
             '畫好的圖是 %d x %d 像素，地圖是 %d x %d。請直接在存圖時給的那張圖上畫，'
-            '不要裁切、縮放或旋轉。' % (dw, dh, tw, th))
-    red = red_mask(drawn_bgr)
+            '不要裁切或旋轉（等比例縮放過沒關係）。' % (dw, dh, tw, th))
+    red = fit_mask(red_mask(drawn_bgr), tw, th)
+    if (dh, dw) != (th, tw):
+        shrink = dw * dh > tw * th
+        drawn_bgr = cv2.resize(drawn_bgr, (tw, th),
+                               interpolation=cv2.INTER_AREA if shrink else cv2.INTER_NEAREST)
     diff = np.abs(drawn_bgr.astype(np.int16) - template_bgr.astype(np.int16)).max(axis=2)
     other = int(np.count_nonzero((diff > OTHER_CHANGE) & ~red))
     return red, other
+
+
+# ---- 上傳的圖大小不對 (2026-10-22 will：網頁自己轉，不要叫人重畫) ----
+# 地圖一格就是真實的 resolution (0.05 m)，圖的大小跟著場地大小走，不能統一成一個尺寸。
+# 能自動轉的只有「同一張圖被等比例縮放」(Retina 截圖 2 倍、手機存圖縮小)：照寬度的比例算出來的高
+# (或反過來) 跟實際差 2 像素以內 (縮放時四捨五入)。裁切過、比例變了的圖，不知道原本在地圖哪裡，
+# 硬拉會把禁區放錯地方，一律不轉 (差 1% 就是 8 像素 = 40 cm，太多)。
+SCALE_ROUND_PX = 2
+# 縮太小 (一個像素超過 20 cm) 禁區的邊就不準了，那種圖不轉；放大最多 8 倍 (Retina 截圖是 2～3 倍)
+SCALE_MIN, SCALE_MAX = 0.25, 8.0
+# 縮小時一格裡紅色佔多少就算禁區：寧可多不要少，細細一條紅線縮成一半寬還是要留著。
+SCALE_RED_FRACTION = 0.2
+
+
+def scaled_copy(iw, ih, w, h, tol=SCALE_ROUND_PX):
+    """iw x ih 是不是 w x h 等比例縮放來的 (含一樣大)。"""
+    if min(iw, ih, w, h) <= 0 or not SCALE_MIN <= iw / float(w) <= SCALE_MAX:
+        return False
+    return abs(ih - h * iw / float(w)) <= tol or abs(iw - w * ih / float(h)) <= tol
+
+
+def fit_mask(mask, w, h):
+    """紅色遮罩 (bool，圖片方向) 換成 w x h：放大用最近的像素，縮小時一格有 20% 是紅的就算。"""
+    ih, iw = mask.shape
+    if (iw, ih) == (w, h):
+        return mask.copy()
+    if iw * ih > w * h:
+        frac = cv2.resize(mask.astype(np.float32), (w, h), interpolation=cv2.INTER_AREA)
+        return frac >= SCALE_RED_FRACTION
+    return cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
+def drawing_map_name(filename):
+    """存圖時給的 <地圖名稱>_draw.png -> 地圖名稱；Mac / 手機存第二份會加的「 2」「(1)」「-1」也認得。"""
+    base = os.path.splitext(os.path.basename(str(filename)))[0]
+    m = re.match(r'^(.+?)_draw(?:[ _-]*\(?\d+\)?)?$', base.strip())
+    return m.group(1) if m else None
+
+
+def image_size(path):
+    """圖片的 (寬, 高)，讀不到回傳 None。"""
+    img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    return img.shape[1], img.shape[0]
 
 
 def summarize(mask, resolution):

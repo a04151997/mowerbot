@@ -42,7 +42,10 @@ def test_drawing_to_keepout_reports_other_colors_and_size_mismatch(tmp_path):
     red, other = ko.drawing_to_keepout(d, t)
     assert int(red.sum()) == 24 and other == 6
     with pytest.raises(ValueError, match='不要裁切'):
-        ko.drawing_to_keepout(d[:-1], t)
+        ko.drawing_to_keepout(d[:-5], t)
+    big = cv2.resize(d, (d.shape[1] * 2, d.shape[0] * 2), interpolation=cv2.INTER_NEAREST)
+    red2, other2 = ko.drawing_to_keepout(big, t)           # 等比例放大 2 倍：轉回原本大小
+    assert red2.shape == red.shape and (red2 == red).all() and other2 == 6
 
 
 def test_mask_roundtrip_flips_image_rows_into_grid_rows(tmp_path):
@@ -91,3 +94,37 @@ def test_rotated_origin_is_rejected(tmp_path):
         yaml.safe_dump({'image': 'm.pgm', 'resolution': 0.05, 'origin': [0, 0, 0.3]}, fh)
     with pytest.raises(ValueError, match='旋轉'):
         ko.load_map_meta(str(tmp_path / 'r.yaml'))
+
+
+def test_scaled_copy_accepts_uniform_scale_only():
+    assert ko.scaled_copy(826, 574, 826, 574)
+    assert ko.scaled_copy(1652, 1148, 826, 574)          # Retina 2 倍
+    assert ko.scaled_copy(413, 287, 826, 574)            # 手機縮小一半
+    assert not ko.scaled_copy(826, 574, 510, 465)        # 別張地圖
+    assert not ko.scaled_copy(800, 574, 826, 574)        # 裁掉一邊
+    assert ko.scaled_copy(600, 417, 826, 574)            # 縮成寬 600：高 416.95 四捨五入
+    assert not ko.scaled_copy(826, 568, 826, 574)        # 裁掉 6 像素 (30 cm)，比例只差 1%
+    assert not ko.scaled_copy(1, 1, 510, 465)            # 縮成 1 像素：不是地圖
+
+
+def test_fit_mask_keeps_thin_lines_when_shrinking_and_grows_exactly():
+    big = np.zeros((40, 60), dtype=bool)
+    big[10, :] = True                                    # 1 像素寬的紅線
+    big[20:24, 30:34] = True
+    small = ko.fit_mask(big, 30, 20)                     # 縮一半
+    assert small.shape == (20, 30)
+    assert small[5, :].all()                             # 細線還在 (一格 2x2 裡 2 個紅)
+    assert small[10:12, 15:17].all() and small.sum() == 30 + 4
+    up = ko.fit_mask(small, 60, 40)
+    assert up.shape == (40, 60) and up[20:24, 30:34].all()
+    assert ko.fit_mask(big, 60, 40).sum() == big.sum()
+
+
+def test_drawing_map_name_survives_copy_suffixes():
+    assert ko.drawing_map_name('map_1020_221724_draw.png') == 'map_1020_221724'
+    assert ko.drawing_map_name('/x/y/lab1_draw.PNG') == 'lab1'
+    assert ko.drawing_map_name('map_1020_221724_draw 2.png') == 'map_1020_221724'
+    assert ko.drawing_map_name('map_1020_221724_draw (1).png') == 'map_1020_221724'
+    assert ko.drawing_map_name('map_1020_221724_draw-1.jpg') == 'map_1020_221724'
+    assert ko.drawing_map_name('keepout_1022_093000.png') is None
+    assert ko.drawing_map_name('image.png') is None

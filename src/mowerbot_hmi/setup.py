@@ -11,7 +11,7 @@ setup(
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
         # 網頁人機介面的畫面 (web.py 讀這一份)
-        ('share/' + package_name + '/web', ['web/index.html']),
+        ('share/' + package_name + '/web', ['web/index.html', 'web/lichtblick_layout.json']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
