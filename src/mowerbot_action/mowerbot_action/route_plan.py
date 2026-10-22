@@ -191,11 +191,13 @@ def plan_order(ends, angle, spacing, start_xy, dist=None, clear=None):
         return [], {'chains': 0, 'changed': False}
     coords = _row_coords(ends, angle)
     rows = _rows(coords, spacing)
-    if _is_boustrophedon(rows, coords, spacing):
-        return [(i, False) for i in range(n)], {'chains': 1, 'changed': False}
     if dist is None:
         def dist(a, b):
             return math.hypot(a[0] - b[0], a[1] - b[1])
+    if _is_boustrophedon(rows, coords, spacing):
+        order = [(i, False) for i in range(n)]
+        return order, {'chains': 1, 'changed': False,
+                       'cost': order_cost(ends, order, start_xy, dist)}
     groups = _row_groups(rows, coords, ends, clear)
     chains = build_chains(groups)
     options = [_chain_options(ch, groups, ends, coords) for ch in chains]
@@ -203,7 +205,56 @@ def plan_order(ends, angle, spacing, start_xy, dist=None, clear=None):
     order = []
     for k, o in seq:
         order.extend(options[k][o][2])
-    return order, {'chains': len(chains), 'changed': True}
+    return order, {'chains': len(chains), 'changed': True,
+                   'cost': order_cost(ends, order, start_xy, dist)}
+
+
+def order_cost(ends, order, start_xy, dist):
+    """照 order 割要空跑多遠：start_xy 開到第一條的起點，加上每一條割完到下一條開始。"""
+    here, total = start_xy, 0.0
+    for i, rev in order:
+        a, b = (ends[i][1], ends[i][0]) if rev else ends[i]
+        total += dist(here, a)
+        here = b
+    return total
+
+
+def loop_start_candidates(loop, ends, prev_xy, nearest, merge=1.0, limit=12):
+    """周邊環繞 (閉合的一圈，最後一點 = 第 0 點) 可以從哪幾點開始繞：回傳點的編號。
+
+    繞完一圈回到起點，接著要去第一條割草線，所以起點最好就在第一條割草線旁邊。
+    候選 = 離上一個位置 (車子) 最近的那一點 (nearest，以前一律從這裡開始)，加上離每一條割草線兩頭
+    最近的那幾點；彼此距離不到 merge 的只留一個，最多 limit 個 (近車子的優先)。
+    """
+    core = np.asarray(loop[:-1] if len(loop) > 1 else loop, dtype=float)
+    if len(core) == 0:
+        return []
+    out = [int(nearest)]
+    pts = [p for e in ends for p in e]
+    pts.sort(key=lambda p: math.hypot(p[0] - prev_xy[0], p[1] - prev_xy[1]))
+    for p in pts:
+        i = int(np.argmin(np.hypot(core[:, 0] - p[0], core[:, 1] - p[1])))
+        if all(math.hypot(*(core[i] - core[j])) >= merge for j in out):
+            out.append(i)
+        if len(out) >= limit:
+            break
+    return out
+
+
+class CachedDistance:
+    """dist(a, b) 算過的記起來 (轉場路線要繞障礙物時一次要算一陣子)：同一組點不重算。"""
+
+    def __init__(self, dist):
+        self.dist = dist
+        self.memo = {}
+
+    def __call__(self, a, b):
+        key = tuple(round(float(v), 3) for v in (a[0], a[1], b[0], b[1]))
+        d = self.memo.get(key)
+        if d is None:
+            d = self.dist(a, b)
+            self.memo[key] = d
+        return d
 
 
 def order_loops(loops, start_xy):
@@ -235,11 +286,16 @@ DP_MAX_CHAINS = 8
 
 
 def _best_sequence(options, start, dist):
-    """各塊的先後與割法，讓轉場總長最短。回傳 [(塊, 割法), ...]。"""
+    """各塊的先後與割法，讓轉場總長最短。回傳 [(塊, 割法), ...]。
+
+    options[k] = 第 k 塊的幾種割法 [(起點, 終點, 內容, 塊裡的空跑)]；每一塊的割法數可以不一樣
+    (割草線一塊 4 種；沿邊一整圈有好幾個進圈的地方，斷開的一截只有 1 種)。
+    """
     n = len(options)
-    m = len(options[0]) if n else 0
+    ms = [len(o) for o in options]
     # 每一種割法的成本 = 開到它的起點 + 塊裡的空跑
-    d0 = [[dist(start, options[k][o][0]) + options[k][o][3] for o in range(m)] for k in range(n)]
+    d0 = [[dist(start, options[k][o][0]) + options[k][o][3] for o in range(ms[k])]
+          for k in range(n)]
     if n > DP_MAX_CHAINS:
         left = set(range(n))
         here = start
@@ -247,7 +303,7 @@ def _best_sequence(options, start, dist):
         while left:
             best = None
             for k in left:
-                for o in range(m):
+                for o in range(ms[k]):
                     d = dist(here, options[k][o][0]) + options[k][o][3]
                     if best is None or (d, k, o) < best:
                         best = (d, k, o)
@@ -259,20 +315,20 @@ def _best_sequence(options, start, dist):
     # dd[(k, o)][(j, p)] = 割完 k (割法 o) 到開始 j (割法 p) 要開多遠
     dd = {}
     for k in range(n):
-        for o in range(m):
+        for o in range(ms[k]):
             end = options[k][o][1]
             dd[(k, o)] = {(j, p): dist(end, options[j][p][0]) + options[j][p][3]
-                          for j in range(n) if j != k for p in range(m)}
+                          for j in range(n) if j != k for p in range(ms[j])}
     INF = float('inf')
     cost = {}
     for k in range(n):
-        for o in range(m):
+        for o in range(ms[k]):
             cost[(1 << k, k, o)] = (d0[k][o], None)
     for mask in range(1, 1 << n):
         for k in range(n):
             if not mask & (1 << k):
                 continue
-            for o in range(m):
+            for o in range(ms[k]):
                 cur = cost.get((mask, k, o))
                 if cur is None or cur[0] == INF:
                     continue
@@ -284,7 +340,7 @@ def _best_sequence(options, start, dist):
                     if key not in cost or c < cost[key][0]:
                         cost[key] = (c, (mask, k, o))
     full = (1 << n) - 1
-    best = min(((cost[(full, k, o)][0], k, o) for k in range(n) for o in range(m)
+    best = min(((cost[(full, k, o)][0], k, o) for k in range(n) for o in range(ms[k])
                 if (full, k, o) in cost), default=None)
     if best is None:
         return [(k, 0) for k in range(n)]
@@ -523,6 +579,11 @@ EDGE_SEG_MAX_TURN = math.radians(120.0)
 EDGE_MIN_PIECE = 2.0        # 斷開之後剩不到這麼長的就不割
 EDGE_SMOOTH = 0.15          # 等高線的鋸齒用前後這麼長平均掉 (m)
 EDGE_MIN_LOOP = 4.0         # 比這個短的圈 (很小的一塊) 不繞
+# 一整圈可以從哪幾個地方進出 (EdgeLoops.plan 挑轉場最短的，2026-10-22)：最多這麼多個，彼此沿著圈至少隔
+# EDGE_ENTRY_GAP (圈長 / 個數比較大就用它)；最多試這麼多個點 (匝道放不放得下)
+EDGE_ENTRY_OPTIONS = 8
+EDGE_ENTRY_GAP = 1.0
+EDGE_ENTRY_TRIES = 120
 
 
 def corner_radius(d, front, half_w, margin=EDGE_MARGIN):
@@ -922,6 +983,36 @@ class EdgeLoops:
                 return np.vstack([rin, body, rout]), len(rin), len(rout)
         return None
 
+    def _full_loop_options(self, loop, yaw, off, rot_need, max_n):
+        """整圈可以從哪幾個地方進出 (2026-10-22)：夠直、放得下進出匝道的地方，彼此沿著圈至少隔
+        EDGE_ENTRY_GAP (圈長 / max_n 比較大就用它)，最多 max_n 個。匝道長的先挑 (比較平緩)，
+        長的放不下的地方再用短的 (跟 _full_loop 一樣的幾種長度、一樣的檢查)。
+        回傳 [(路線, 進圈匝道點數, 出圈匝道點數)]，第一個跟 _full_loop 挑的一樣 (最直、匝道最長)。
+        """
+        n = len(loop)
+        gap = max(EDGE_ENTRY_GAP, n * EDGE_STEP / max(max_n, 1))
+        taken, out = [], []
+        for length in self._ramp_lengths():
+            half = int(round(length / EDGE_STEP))
+            dev = self._straightness(loop, yaw, True, half)
+            tried = 0
+            for i in np.argsort(dev, kind='stable'):
+                if dev[i] > EDGE_RAMP_MAX_TURN or tried >= EDGE_ENTRY_TRIES or len(out) >= max_n:
+                    break
+                if any(min(abs(i - j), n - abs(i - j)) * EDGE_STEP < gap for j in taken):
+                    continue
+                tried += 1
+                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need)
+                if rin is None:
+                    continue
+                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need)
+                if rout is None:
+                    continue
+                body = np.vstack([loop[i:], loop[:i], loop[i:i + 1]])
+                taken.append(int(i))
+                out.append((np.vstack([rin, body, rout]), len(rin), len(rout)))
+        return out
+
     def _open_piece(self, pts, yaw, off, rot_need):
         """斷開的一段 (開放折線)：從前面找得到進圈匝道的第一點、從後面找得到出圈匝道的最後一點。"""
         n = len(pts)
@@ -946,10 +1037,10 @@ class EdgeLoops:
                         return np.vstack([rin, pts[i:j + 1], rout]), len(rin), len(rout)
         return None
 
-    def routes(self, offsets, safe_offset, rot_need):
-        """每一個離邊界距離 d 的每一圈的路線：[{'d', 'pts' (M, 2), 'ramp_in', 'ramp_out', 'full', 'length'}]。
+    def items(self, offsets, safe_offset):
+        """要繞的每一圈 (整圈走得過去) 或每一截 (走不過去的地方斷開)，還沒挑從哪裡進圈。
 
-        safe_offset：匝道從離邊界這麼遠的地方開始 (地頭寬)；rot_need：匝道兩頭要能原地轉身的淨空。
+        回傳 [{'d', 'off', 'full', 'pts', 'yaw'}]：full 的 pts 是閉合的一圈，否則是開放的一截。
         """
         out = []
         for d in offsets:
@@ -957,33 +1048,89 @@ class EdgeLoops:
             for loop in self.loops(d):
                 yaw = _headings(loop, True)
                 ok = self.poses_ok(loop, yaw)
-                got = []
                 if ok.all():
-                    r = self._full_loop(loop, yaw, off, rot_need)
-                    if r is not None:
-                        got.append((r, True))
-                else:
-                    # 走不過去的地方斷開：一段一段 (環狀) 各自進出
-                    n = len(loop)
-                    if ok.any():
-                        first = int(np.argmin(ok))           # 從一個走不過去的點後面開始數
-                        order = (np.arange(n) + first) % n
-                        run = []
-                        for i in list(order) + [order[0]]:
-                            if ok[i]:
-                                run.append(i)
-                                continue
-                            if len(run) * EDGE_STEP >= EDGE_MIN_PIECE:
-                                piece = loop[run]
-                                r = self._open_piece(piece, _headings(piece, False), off, rot_need)
-                                if r is not None:
-                                    got.append((r, False))
-                            run = []
-                for (pts, nin, nout), full in got:
-                    length = float(np.sum(np.hypot(*np.diff(pts, axis=0).T)))
-                    out.append({'d': float(d), 'pts': pts, 'ramp_in': nin, 'ramp_out': nout,
-                                'full': full, 'length': length})
+                    out.append({'d': float(d), 'off': off, 'full': True, 'pts': loop, 'yaw': yaw})
+                    continue
+                # 走不過去的地方斷開：一段一段 (環狀) 各自進出
+                n = len(loop)
+                if not ok.any():
+                    continue
+                first = int(np.argmin(ok))           # 從一個走不過去的點後面開始數
+                order = (np.arange(n) + first) % n
+                run = []
+                for i in list(order) + [order[0]]:
+                    if ok[i]:
+                        run.append(i)
+                        continue
+                    if len(run) * EDGE_STEP >= EDGE_MIN_PIECE:
+                        piece = loop[run]
+                        out.append({'d': float(d), 'off': off, 'full': False, 'pts': piece,
+                                    'yaw': _headings(piece, False)})
+                    run = []
         return out
+
+    @staticmethod
+    def _as_route(item, r):
+        pts, nin, nout = r
+        length = float(np.sum(np.hypot(*np.diff(pts, axis=0).T)))
+        return {'d': item['d'], 'pts': pts, 'ramp_in': nin, 'ramp_out': nout,
+                'full': item['full'], 'length': length}
+
+    def route_item(self, item, rot_need):
+        """items() 的一項 -> 路線 {'d', 'pts', 'ramp_in', 'ramp_out', 'full', 'length'}；放不下匝道回傳 None。
+
+        一整圈從最直的地方進出；斷開的一截只能從前面進、後面出。
+        """
+        if item['full']:
+            r = self._full_loop(item['pts'], item['yaw'], item['off'], rot_need)
+        else:
+            r = self._open_piece(item['pts'], item['yaw'], item['off'], rot_need)
+        return None if r is None else self._as_route(item, r)
+
+    def route_options(self, item, rot_need, max_n=None):
+        """items() 的一項可以怎麼繞：一整圈有好幾個進圈的地方 (_full_loop_options)，斷開的一截只有一種。"""
+        if item['full']:
+            return [self._as_route(item, r) for r in self._full_loop_options(
+                item['pts'], item['yaw'], item['off'], rot_need, max_n or EDGE_ENTRY_OPTIONS)]
+        r = self.route_item(item, rot_need)
+        return [] if r is None else [r]
+
+    def routes(self, offsets, safe_offset, rot_need):
+        """每一個離邊界距離 d 的每一圈的路線：[{'d', 'pts' (M, 2), 'ramp_in', 'ramp_out', 'full', 'length'}]。
+
+        safe_offset：匝道從離邊界這麼遠的地方開始 (地頭寬)；rot_need：匝道兩頭要能原地轉身的淨空。
+        一整圈從最直的地方進出 (不管車子在哪)；要照車子的位置排順序、挑進圈的地方用 plan()。
+        """
+        out = []
+        for item in self.items(offsets, safe_offset):
+            r = self.route_item(item, rot_need)
+            if r is not None:
+                out.append(r)
+        return out
+
+    def plan(self, offsets, safe_offset, rot_need, start, cost=None):
+        """沿邊的順序與每一圈從哪裡進 (2026-10-22 will：路線還有多餘的空跑)。回傳跟 routes() 一樣的 list，照要繞的順序。
+
+        以前 (routes + 每次挑離車子最近的那一圈) 每一圈都從最直的那個地方進出：繞完一圈出圈的地方 = 那一圈的起點，
+        下一圈的起點常常在場地另一頭，will 截圖上那幾條橫越場地的斜線就是這樣來的。
+        現在一整圈有好幾個可以進出的地方 (route_options)，先繞哪一圈、每一圈從哪裡進，
+        跟割草線的分塊一樣全部比過 (_best_sequence)，挑轉場加起來最短的；從 start (割草線割完的地方) 開始。
+        cost(a, b)：a 開到 b 要多遠 (manager 給繞過障礙物的轉場距離)；None = 直線距離。
+        """
+        if cost is None:
+            def cost(a, b):
+                return math.hypot(a[0] - b[0], a[1] - b[1])
+        options = []
+        for item in self.items(offsets, safe_offset):
+            opts = self.route_options(item, rot_need)
+            if opts:
+                options.append([((float(r['pts'][0][0]), float(r['pts'][0][1])),
+                                 (float(r['pts'][-1][0]), float(r['pts'][-1][1])), r, 0.0)
+                                for r in opts])
+        if not options:
+            return []
+        seq = _best_sequence(options, (float(start[0]), float(start[1])), cost)
+        return [options[k][o][2] for k, o in seq]
 
     def rotation_ok(self, xy, yaw0, yaw1, step=math.radians(5.0)):
         """在 xy 原地從 yaw0 轉到 yaw1 (走比較短的那一邊)，整個過程車身都在範圍裡嗎。"""

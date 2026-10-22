@@ -5,6 +5,7 @@
 import math
 
 import numpy as np
+import pytest
 
 from mowerbot_action import route_plan
 
@@ -37,6 +38,10 @@ def rows_with_hole(box=BOX):
     return ends
 
 
+def _straight(a, b):
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+
 def walk(ends, order):
     """照 order 走一遍，回傳 [(起點, 終點)]。"""
     out = []
@@ -49,7 +54,8 @@ def walk(ends, order):
 def test_good_order_is_untouched():
     ends = rows_with_hole(box=None)                    # 沒有洞：F2C 的順序就是弓字形
     order, info = route_plan.plan_order(ends, 0.0, SP, (0.0, 0.0))
-    assert info == {'chains': 1, 'changed': False}
+    assert (info['chains'], info['changed']) == (1, False)
+    assert info['cost'] == pytest.approx(route_plan.order_cost(ends, order, (0.0, 0.0), _straight))
     assert order == [(i, False) for i in range(len(ends))]
 
 
@@ -102,7 +108,8 @@ def test_rotated_field_same_blocks():
            for a, b in ends]
     o1, i1 = route_plan.plan_order(ends, 0.0, SP, (0.0, 0.0))
     o2, i2 = route_plan.plan_order(rot, ang, SP, (0.0, 0.0))
-    assert i1['changed'] and i1 == i2
+    assert i1['changed'] and (i1['chains'], i1['changed']) == (i2['chains'], i2['changed'])
+    assert i1['cost'] == pytest.approx(i2['cost'], abs=1e-6)
 
     def dead(e, order, start):     # 不在割草的直線距離總和 (同分的順序可能不同，總長要一樣)
         here, tot = start, 0.0
@@ -126,7 +133,7 @@ def test_small_gap_is_mowed_straight_through():
     outer = field_with_hole()[0]
     tp = route_plan.TransitPlanner([outer], 0.47, 1.11)
     _order, info = route_plan.plan_order(ends, 0.0, SP, (0.0, 0.0), dist=tp.length, clear=tp.clear)
-    assert info == {'chains': 1, 'changed': True}
+    assert (info['chains'], info['changed']) == (1, True)
 
 
 def seg_hits_box(a, b, box, margin):
@@ -432,3 +439,112 @@ def test_zone_sweep_clearance():
     assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), up, up, x0, x1, hw) < 0.05
     assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), down, down + 0.5, x0, x1, hw) > 1.0
     assert route_plan.zone_sweep_clearance(wc, (0.0, 0.0), down, up - 0.01, x0, x1, hw) < 0.05
+
+
+# ---- 2026-10-22 will：路線還有多餘的空跑 ----
+def test_order_cost_is_the_walk_length():
+    ends = rows_with_hole()
+    tp = route_plan.TransitPlanner(field_with_hole(), 0.47, 1.16)
+    order, info = route_plan.plan_order(ends, 0.0, SP, (-0.5, -0.5),
+                                        dist=tp.length, clear=tp.clear)
+    legs = walk(ends, order)
+    want = tp.length((-0.5, -0.5), legs[0][0]) + sum(
+        tp.length(a[1], b[0]) for a, b in zip(legs[:-1], legs[1:]))
+    assert info['cost'] == pytest.approx(want)
+
+
+def test_cached_distance_calls_once():
+    calls = []
+
+    def d(a, b):
+        calls.append((a, b))
+        return _straight(a, b)
+    c = route_plan.CachedDistance(d)
+    assert c((0, 0), (3, 4)) == 5.0 and c((0.0, 0.0), (3.0, 4.0)) == 5.0
+    assert len(calls) == 1
+
+
+def test_loop_start_candidates_near_swath_ends():
+    loop = [(x, 0.0) for x in np.arange(0.0, 10.0, 0.1)]
+    loop += [(10.0, y) for y in np.arange(0.0, 4.0, 0.1)]
+    loop += [(x, 4.0) for x in np.arange(10.0, 0.0, -0.1)]
+    loop += [(0.0, y) for y in np.arange(4.0, 0.0, -0.1)]
+    loop.append(loop[0])
+    ends = [((1.0, 1.0), (9.0, 1.0)), ((9.0, 3.0), (1.0, 3.0))]
+    c = route_plan.loop_start_candidates(loop, ends, (5.0, 2.0), nearest=50)
+    assert c[0] == 50                                  # 離車子最近的那一點一定在 (以前的做法)
+    pts = [loop[i] for i in c]
+    for e in (p for pair in ends for p in pair):        # 每一條割草線的兩頭旁邊都有一個候選
+        assert min(_straight(e, p) for p in pts) <= 1.5
+    for i, a in enumerate(pts):                         # 彼此至少隔 1 m
+        assert all(_straight(a, b) >= 1.0 - 1e-9 for b in pts[i + 1:])
+
+
+def test_best_sequence_options_can_differ_in_count():
+    # 一塊只有一種走法、一塊有三種：照轉場最短挑
+    opts = [[((5.0, 0.0), (5.0, 1.0), 'a', 0.0)],
+            [((0.0, 9.0), (0.0, 9.0), 'b0', 0.0), ((1.0, 0.0), (1.0, 0.0), 'b1', 0.0),
+             ((9.0, 9.0), (9.0, 9.0), 'b2', 0.0)]]
+    seq = route_plan._best_sequence(opts, (0.0, 0.0), _straight)
+    assert seq == [(1, 1), (0, 0)]
+
+
+def _old_edge_order(el, start, dist):
+    """2026-10-22 以前的排法：每一圈從最直的地方進，照離車子遠近一圈一圈挑。"""
+    routes = el.routes([1.10, 0.75], SAFE, ROT_NEED)
+    here, left, out = start, list(range(len(routes))), []
+    while left:
+        k = min(left, key=lambda j: dist(here, tuple(routes[j]['pts'][0])))
+        left.remove(k)
+        out.append(routes[k])
+        here = tuple(routes[k]['pts'][-1])
+    return out
+
+
+def _body_len(r):
+    """路線去掉進出圈匝道 (繞圈本身) 的長度。"""
+    body = r['pts'][r['ramp_in']:len(r['pts']) - r['ramp_out']]
+    return float(np.sum(np.hypot(*np.diff(body, axis=0).T)))
+
+
+def _transit(start, routes, dist):
+    here, total = start, 0.0
+    for r in routes:
+        total += dist(here, tuple(r['pts'][0]))
+        here = tuple(r['pts'][-1])
+    return total
+
+
+def test_edge_plan_enters_near_the_car():
+    el = route_plan.EdgeLoops([rect(10.0, 6.0)], FRONT, REAR, HALF_W)
+    for start in ((1.3, 1.3), (8.7, 4.7), (5.0, 1.3)):
+        new = el.plan([1.10, 0.75], SAFE, ROT_NEED, start)
+        old = _old_edge_order(el, start, _straight)
+        assert sorted(r['d'] for r in new) == [0.75, 1.10]
+        for r in new:
+            check_route(el, r)
+            o = next(o for o in old if o['d'] == r['d'])
+            assert r['full'] and _body_len(r) == pytest.approx(_body_len(o), rel=0.02)   # 一樣繞一整圈
+        assert _transit(start, new, _straight) <= _transit(start, old, _straight) + 1e-6
+    # 車子在右下角：從那個角附近進圈 (以前從最直的那個地方進，在左邊 6 m 外)
+    start = (8.7, 1.3)
+    new = el.plan([1.10, 0.75], SAFE, ROT_NEED, start)
+    old = _old_edge_order(el, start, _straight)
+    assert _straight(start, tuple(new[0]['pts'][0])) < 1.5
+    assert _straight(start, tuple(old[0]['pts'][0])) > 5.0
+
+
+def test_edge_plan_two_blocks_no_back_and_forth():
+    # 中間有一道牆 (內環) 把場地分成左右兩塊的 U 形：以前四圈常常左右來回
+    outer = [(0.0, 0.0), (20.0, 0.0), (20.0, 8.0), (0.0, 8.0)]
+    hole = [(8.0, -1.0), (12.0, -1.0), (12.0, 5.0), (8.0, 5.0)]
+    rings = [outer, hole]
+    el = route_plan.EdgeLoops(rings, FRONT, REAR, HALF_W)
+    tp = route_plan.TransitPlanner(rings, 0.47, 1.16)
+    start = (2.0, 2.0)
+    new = el.plan([1.10, 0.75], SAFE, ROT_NEED, start, cost=tp.length)
+    old = _old_edge_order(el, start, tp.length)
+    assert len(new) == len(old) >= 2
+    for r in new:
+        check_route(el, r)
+    assert _transit(start, new, tp.length) <= _transit(start, old, tp.length) + 1e-6

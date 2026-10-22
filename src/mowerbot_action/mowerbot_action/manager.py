@@ -1767,6 +1767,37 @@ class MowerManager(Node):
             out.poses.append(q)
         return out
 
+    def choose_loop_start(self, loop_xy, seq, ends, angle, robot_xy, dist, clear):
+        """周邊環繞最後一圈從哪一點開始繞 (2026-10-22 will：路線還有多餘的空跑)。
+
+        環繞是閉合的，繞完回到起點，接著開去第一條割草線。以前起點一律是離車子最近的那一點
+        (order_loops)，繞完常常還要斜斜開過半個場地才到第一條割草線。現在比幾個候選起點
+        (route_plan.loop_start_candidates)：「開到起點 + 割草線排好之後的空跑」最短的那個。
+        回傳 (新的 seq, 割草順序, plan_order 的 info, 割草順序是從哪一點排的)。沒有割草線時不改。
+        """
+        if not ends:
+            return seq, None, None, None
+        k, i0 = seq[-1]
+        prev = robot_xy if len(seq) == 1 else loop_xy[seq[-2][0]][seq[-2][1]]
+        best = None
+        for c in route_plan.loop_start_candidates(loop_xy[k], ends, prev, i0):
+            p = loop_xy[k][c]
+            order, oinfo = route_plan.plan_order(
+                ends, angle, self.swath_spacing, p, dist=dist, clear=clear)
+            total = dist(prev, p) + oinfo['cost']
+            if best is None or total < best[0] - 1e-6:
+                best = (total, c, order, oinfo, p)
+        total, c, order, oinfo, p = best
+        if c != i0:
+            p0 = loop_xy[k][i0]
+            _order0, info0 = route_plan.plan_order(
+                ends, angle, self.swath_spacing, p0, dist=dist, clear=clear)
+            self.get_logger().info(
+                '🧭 環繞改從 (%.1f, %.1f) 開始繞 (繞完就在第一條割草線旁邊)：空跑 %.1f m '
+                '(從最靠近車子的地方開始要 %.1f m)'
+                % (p[0], p[1], total, dist(prev, p0) + info0['cost']))
+        return seq[:-1] + [(k, c)], order, oinfo, (float(p[0]), float(p[1]))
+
     def make_transit_planner(self, rings):
         """這一次規劃的轉場路線規劃器。
 
@@ -1800,7 +1831,8 @@ class MowerManager(Node):
         """沿邊多繞幾圈 (route_plan.EdgeLoops)：回傳 ([(Path, 標籤)], 走完停在哪裡, 給 /edge_path 的航點)。
 
         沒打開、或算不出來時回傳 ([], start_xy, [])，任務跟以前一樣只有環繞與割草線。
-        先繞哪一圈：從 start_xy 找轉場最近的進圈點，一圈接一圈。每一圈切成幾段，
+        先繞哪一圈：從 start_xy 找轉場最近的那一圈，一整圈從離車子近的地方進圈 (2026-10-22，
+        EdgeLoops.plan；以前每一圈都從最直的地方進，常常要橫越場地)，一圈接一圈。每一圈切成幾段，
         第一段從匝道的起點開始 (掉得了頭，照常原地對正)，後面幾段接著前一段 (不對正，見
         check_edge_continuation)。
         """
@@ -1817,24 +1849,17 @@ class MowerManager(Node):
                 stop_len=float(self.get_parameter('stop_zone_length').value),
                 stop_side=float(self.get_parameter('stop_zone_side_margin').value),
                 turn_wall=self.turn_wall_need if walls is not None else 0.0)
-            routes = edge.routes(self.edge_offsets, self.headland_width, rot_need)
+            ordered = edge.plan(self.edge_offsets, self.headland_width, rot_need, start_xy,
+                                cost=transit.length if transit is not None else None)
         except Exception as e:     # 算不出來就不繞，不要讓任務因此開不了
             self.get_logger().error('🪢 沿邊繞圈算不出來 (%s: %s)，這一趟不繞。' % (type(e).__name__, e))
             return [], start_xy, []
         self._edge = edge
         if walls is None:
             self.get_logger().warn('🪢 還沒收到地圖：沿邊繞圈不知道哪裡是真的牆，牆邊轉角光達停止區有可能擋車')
-        here, left, ordered = start_xy, list(range(len(routes))), []
-        while left:
-            def cost(k):
-                p = routes[k]['pts'][0]
-                if transit is not None:
-                    return transit.length(here, (float(p[0]), float(p[1])))
-                return math.hypot(p[0] - here[0], p[1] - here[1])
-            k = min(left, key=cost)
-            left.remove(k)
-            ordered.append(routes[k])
-            e = routes[k]['pts'][-1]
+        here = start_xy
+        if ordered:
+            e = ordered[-1]['pts'][-1]
             here = (float(e[0]), float(e[1]))
         entries, display = [], []
         segs = [route_plan.segment_route(r['pts']) for r in ordered]
@@ -2666,9 +2691,22 @@ class MowerManager(Node):
                 #     相鄰兩條在障礙物兩邊，接起來穿過障礙物)。F2C 的順序本來就好時完全不動。
                 # (3) 轉場 (approach) 直線會穿過障礙物或禁區時繞過去 (build_approach_path)。
                 transit = self.make_transit_planner(rings)
+                # 轉場距離算過的記起來：下面挑環繞起點時同一組點會問很多次
+                dist = route_plan.CachedDistance(
+                    transit.length if transit is not None
+                    else (lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])))
+                clear = transit.clear if transit is not None else None
+                ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
+                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y))
+                        for sw in swaths]
                 loop_xy = [[(ps.pose.position.x, ps.pose.position.y) for ps in lp] for lp in loops]
-                loops = [self.rotate_loop(loops[k], i)
-                         for k, i in route_plan.order_loops(loop_xy, robot_xy)]
+                seq = route_plan.order_loops(loop_xy, robot_xy)
+                order = oinfo = planned_from = None
+                if seq:
+                    # (5) 2026-10-22：環繞最後一圈的起點挑在第一條割草線旁邊 (choose_loop_start)
+                    seq, order, oinfo, planned_from = self.choose_loop_start(
+                        loop_xy, seq, ends, angle, robot_xy, dist, clear)
+                loops = [self.rotate_loop(loops[k], i) for k, i in seq]
                 perimeter_poses = [ps for lp in loops for ps in lp]
                 perimeter_edges = self.split_perimeter_into_edges(
                     perimeter_poses, response.coverage_path.header)
@@ -2677,13 +2715,12 @@ class MowerManager(Node):
                 if perimeter_edges:
                     q = perimeter_edges[-1].poses[-1].pose.position
                     start_xy = (q.x, q.y)
-                ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
-                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y))
-                        for sw in swaths]
-                order, oinfo = route_plan.plan_order(
-                    ends, angle, self.swath_spacing, start_xy,
-                    dist=transit.length if transit is not None else None,
-                    clear=transit.clear if transit is not None else None)
+                if (order is None or planned_from is None
+                        or math.hypot(start_xy[0] - planned_from[0],
+                                      start_xy[1] - planned_from[1]) > 0.5):
+                    # 環繞實際停的地方跟挑的時候不一樣 (切段時頭尾被修掉)：從實際的地方重排
+                    order, oinfo = route_plan.plan_order(
+                        ends, angle, self.swath_spacing, start_xy, dist=dist, clear=clear)
                 if oinfo['changed']:
                     swaths = [self.reversed_path(swaths[i]) if rev else swaths[i]
                               for i, rev in order]
