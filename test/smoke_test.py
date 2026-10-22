@@ -4,7 +4,9 @@
 mowerbot workspace 自動化冒煙測試 (可重複執行)
 
 用法:
-    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/R/L/N/O/P/Q
+    python3 test/smoke_test.py              # 跑全部 Phase A/B/C/D/H/R/L/N/O/P/Q/S/M
+    python3 test/smoke_test.py --phases=S   # 只跑停車機制 (放開 LB、光達中斷、光達停止區；不需要 Gazebo)
+    python3 test/smoke_test.py --phases=M   # 只跑手把三種模式 (LB + A 才建圖、LB + B 先存圖；不需要 Gazebo)
     python3 test/smoke_test.py --phases=H   # 只跑 bridge_node (不需要 Gazebo)
     python3 test/smoke_test.py --phases=R   # 只跑硬體迴路 (假 C30D，不需要 Gazebo)
     python3 test/smoke_test.py --phases=O   # 只跑臨時障礙物容錯 (固定用 demo_lawn_obstacle.world)
@@ -205,6 +207,8 @@ PHASES = [
     ('O', '障礙物容錯'),
     ('P', '狀態發布'),
     ('Q', '真實地圖規劃'),
+    ('S', '停車機制'),
+    ('M', '手把模式'),
 ]
 RESULTS = []          # (phase, cid, name, status, detail)
 
@@ -612,6 +616,9 @@ EXECUTABLES = [
     ('mowerbot_planner', 'f2c_server'),
     ('mowerbot_action', 'mower_manager'),
     ('mowerbot_action', 'map_to_boundary'),
+    ('mowerbot_action', 'boundary_recorder'),
+    ('mowerbot_action', 'keepout_server'),
+    ('mowerbot_action', 'keepout_tool'),
     ('mowerbot_bridge', 'teleop_node'),
 ]
 
@@ -1015,6 +1022,390 @@ def b2_boundary():
         rclpy.shutdown()
 
 
+# B8 (2026-10-08)：草地邊界。map_to_boundary 收到 /lawn_boundary (boundary_recorder 記的那一圈) 之後，
+# 割草範圍只能落在它裡面；收到空的多邊形 (清除) 之後回到原本的範圍。同一個節點、同一張假地圖跑三段：
+#   ① 沒有草地邊界 (對照組)：範圍 = 自由區域腐蝕 0.10 m，跟 B2 一樣約 2.6 ~ 7.35 m
+#   ② 草地邊界 = 4.0 ~ 6.0 m 的正方形：所有頂點都要在它裡面 (容差 1 個 cell)
+#   ③ 清除：回到 ①
+# 對照組必須超出草地邊界，不然 ② 就算什麼都沒做也會過。
+B8_LAWN_LO, B8_LAWN_HI = 4.0, 6.0
+
+
+def b8_lawn_boundary():
+    hdr('B8  草地邊界 (map_to_boundary + /lawn_boundary，餵假地圖)')
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped, Point32
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    tol = RES
+
+    node_proc = bg_start('B8_map_to_boundary',
+                         ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+                          '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b8')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    lawn_pub = node.create_publisher(PolygonStamped, '/lawn_boundary', latched)
+    got = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary。"""
+        spin_for(1.0)
+        del got[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got:
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        pts = [(p.x, p.y) for p in got[-1].polygon.points]
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        return len(pts), min(xs), max(xs), min(ys), max(ys)
+
+    def publish_lawn(points):
+        msg = PolygonStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = node.get_clock().now().to_msg()
+        for x, y in points:
+            msg.polygon.points.append(Point32(x=x, y=y, z=0.0))
+        lawn_pub.publish(msg)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f' % ((tag,) + r))
+
+    try:
+        ctrl = next_boundary()
+        show('① 沒有草地邊界 (對照組)', ctrl)
+        lo, hi = B8_LAWN_LO, B8_LAWN_HI
+        publish_lawn([(lo, lo), (hi, lo), (hi, hi), (lo, hi)])
+        lawn = next_boundary()
+        show('② 草地邊界 %.1f ~ %.1f m' % (lo, hi), lawn)
+        publish_lawn([])
+        cleared = next_boundary()
+        show('③ 清除之後', cleared)
+        if ctrl is None or lawn is None or cleared is None:
+            print(node_proc.log_tail(30))
+            record('B', 'B8', '草地邊界', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        ctrl_ok = ctrl[1] < lo - 0.5 and ctrl[2] > hi + 0.5
+        lawn_ok = (lawn[0] >= 4 and lawn[1] >= lo - tol and lawn[2] <= hi + tol
+                   and lawn[3] >= lo - tol and lawn[4] <= hi + tol)
+        clear_ok = all(abs(a - b) <= tol for a, b in zip(cleared[1:], ctrl[1:]))
+        sub('對照組超出草地邊界 (代表檢查有鑑別力) = %s' % ctrl_ok)
+        sub('套用後全部落在草地邊界內 = %s；清除後回到對照組範圍 = %s' % (lawn_ok, clear_ok))
+        record('B', 'B8', '草地邊界：套用後範圍在草地多邊形內、清除後復原；對照組確實超出',
+               'PASS' if (ctrl_ok and lawn_ok and clear_ok) else 'FAIL',
+               '對照 x %.2f~%.2f ; 套用 x %.2f~%.2f y %.2f~%.2f ; 清除 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], lawn[1], lawn[2], lawn[3], lawn[4],
+                  cleared[1], cleared[2]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+# B9 (2026-10-18)：禁區。keepout_server 載入「這次開機」畫的禁區，map_to_boundary 避開它；
+# 別次開機 (session 不同) 的禁區要被拒絕；清除後復原。假地圖與 B8 相同 (自由區域 2.5 ~ 7.5 m)：
+#   ① 沒有禁區 (對照組)：範圍約 2.6 ~ 7.35 m
+#   ② 禁區 = x >= B9_CUT_X 的整條帶子 + 中間一個 1 m 見方的坑：外圈 x 上限要 <= B9_CUT_X，
+#      /f2c_obstacles 裡要有一個多邊形蓋住整個坑
+#   ③ 用別的 session 寫的禁區：~/load 必須回 success=false
+#   ④ 清除：回到 ①
+B9_CUT_X = 6.5
+B9_PIT = (4.0, 5.0)
+
+
+def b9_keepout():
+    hdr('B9  禁區 (keepout_server + map_to_boundary，餵假地圖)')
+    import numpy as np
+    import rclpy
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped
+    from std_srvs.srv import Trigger
+    from mowerbot_interfaces.msg import ObstaclePolygons
+    from mowerbot_action import keepout
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    tol = RES
+    ko_dir = os.path.join(LOGDIR, 'B9_keepout')
+    os.makedirs(ko_dir, exist_ok=True)
+
+    bg_start('B9_map_to_boundary',
+             ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+              '--ros-args', '-p', 'use_sim_time:=false'])
+    ks_proc = bg_start('B9_keepout_server',
+                       ['ros2', 'run', 'mowerbot_action', 'keepout_server',
+                        '--ros-args', '-p', 'use_sim_time:=false', '-p', 'keepout_dir:=' + ko_dir])
+    rclpy.init()
+    node = Node('smoke_b9')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    got = []
+    obst = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+    node.create_subscription(ObstaclePolygons, '/f2c_obstacles', lambda m: obst.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def call(name, timeout=15.0):
+        cli = node.create_client(Trigger, '/keepout_server/' + name)
+        if not cli.wait_for_service(timeout_sec=timeout):
+            return None
+        fut = cli.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(node, fut, timeout_sec=timeout)
+        return fut.result()
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary 與 /f2c_obstacles。"""
+        spin_for(1.0)
+        del got[:]
+        del obst[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not (got and obst):
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        xs = [p.x for p in got[-1].polygon.points]
+        ys = [p.y for p in got[-1].polygon.points]
+        holes = []
+        for poly in (obst[-1].polygons if obst else []):
+            hx = [p.x for p in poly.points]
+            hy = [p.y for p in poly.points]
+            holes.append((min(hx), max(hx), min(hy), max(hy)))
+        return len(xs), min(xs), max(xs), min(ys), max(ys), holes
+
+    def write_active(session_id):
+        # 網格方向 (row 0 = y 最小) 畫好，再翻成圖片方向交給 write_mask
+        g = np.zeros((H, W), dtype=bool)
+        g[:, int(round(B9_CUT_X / RES)):] = True
+        lo, hi = (int(round(v / RES)) for v in B9_PIT)
+        g[lo:hi, lo:hi] = True
+        keepout.write_mask(os.path.join(ko_dir, 'active'), np.flipud(g), RES, 0.0, 0.0, session_id)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f，內部障礙物 %d 個'
+                % ((tag,) + r[:5] + (len(r[5]),)))
+
+    try:
+        ctrl = next_boundary()
+        show('① 沒有禁區 (對照組)', ctrl)
+        sess = call('session')
+        if sess is None or not sess.success:
+            print(ks_proc.log_tail(30))
+            record('B', 'B9', '禁區', 'FAIL', 'keepout_server 的 ~/session 沒有回應 (見上方 log)')
+            return
+        write_active(sess.message)
+        loaded = call('load')
+        sub('② ~/load：success=%s，%s' % (loaded.success if loaded else None,
+                                          loaded.message if loaded else '沒有回應'))
+        ko = next_boundary()
+        show('② 禁區 x >= %.1f m + 坑 %.1f ~ %.1f m' % ((B9_CUT_X,) + B9_PIT), ko)
+        write_active('別次開機')
+        wrong = call('load')
+        sub('③ 別的 session：success=%s，%s' % (wrong.success if wrong else None,
+                                               wrong.message if wrong else '沒有回應'))
+        call('clear')
+        cleared = next_boundary()
+        show('④ 清除之後', cleared)
+        if ctrl is None or ko is None or cleared is None:
+            print(ks_proc.log_tail(30))
+            record('B', 'B9', '禁區', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        lo, hi = B9_PIT
+        ctrl_ok = ctrl[2] > B9_CUT_X + 0.5 and not any(
+            h[0] <= lo and h[1] >= hi and h[2] <= lo and h[3] >= hi for h in ctrl[5])
+        load_ok = bool(loaded and loaded.success)
+        cut_ok = ko[2] <= B9_CUT_X + tol
+        pit_ok = any(h[0] <= lo + tol and h[1] >= hi - tol and h[2] <= lo + tol and h[3] >= hi - tol
+                     for h in ko[5])
+        wrong_ok = wrong is not None and not wrong.success
+        clear_ok = all(abs(a - b) <= tol for a, b in zip(cleared[1:5], ctrl[1:5]))
+        sub('對照組超出禁區、沒有坑 = %s；載入成功 = %s' % (ctrl_ok, load_ok))
+        sub('外圈 x 上限 <= %.2f = %s；坑被內部障礙物蓋住 = %s' % (B9_CUT_X, cut_ok, pit_ok))
+        sub('別次開機的禁區被拒絕 = %s；清除後回到對照組範圍 = %s' % (wrong_ok, clear_ok))
+        record('B', 'B9', '禁區：只接受這次開機畫的、套用後範圍避開禁區與坑、清除後復原',
+               'PASS' if (ctrl_ok and load_ok and cut_ok and pit_ok and wrong_ok and clear_ok)
+               else 'FAIL',
+               '對照 x %.2f~%.2f ; 套用 x %.2f~%.2f ; 坑=%s ; 別次拒絕=%s ; 清除 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], ko[1], ko[2], pit_ok, wrong_ok, cleared[1], cleared[2]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+
+# B10 (2026-10-19)：割草範圍取車子所在的那一塊 (map_to_boundary 的 boundary_region = robot)。
+# 假地圖與 B8 相同 (自由區域 2.5 ~ 7.5 m)，但 x = B10_WALL_X 有一道貫穿的牆，分成左邊大塊 (約 3.5 m 寬)
+# 與右邊小塊 (約 1.4 m 寬)。同一個節點跑三段 (TF map -> base_footprint 由測試自己發 static)：
+#   ① 還沒有車子位置 (對照組)：取最大的一塊 = 左邊，x 上限 < 牆
+#   ② 車子停在右邊小塊：範圍要整個在牆的右邊
+#   ③ 車子開回左邊：回到左邊
+# 10-19 will 在 lab1 用紅線圍出中間一塊，舊程式 (取最大) 選到紅線外面更大的房間，這一項就是在擋那個情況。
+B10_WALL_X = 6.0
+B10_RIGHT = (6.8, 5.0)
+B10_LEFT = (4.0, 5.0)
+
+
+def b10_robot_region():
+    hdr('B10 割草範圍取車子所在的那一塊 (map_to_boundary + TF，餵假地圖)')
+    import rclpy
+    import tf2_ros
+    from rclpy.node import Node
+    from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+    from nav_msgs.msg import OccupancyGrid
+    from geometry_msgs.msg import PolygonStamped, TransformStamped
+
+    W = H = 200
+    RES = 0.05
+    FREE_LO, FREE_HI = 50, 149
+    wall_col = int(round(B10_WALL_X / RES))
+    tol = RES
+
+    node_proc = bg_start('B10_map_to_boundary',
+                         ['ros2', 'run', 'mowerbot_action', 'map_to_boundary',
+                          '--ros-args', '-p', 'use_sim_time:=false'])
+    rclpy.init()
+    node = Node('smoke_b10')
+    latched = QoSProfile(depth=1,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         reliability=ReliabilityPolicy.RELIABLE)
+    map_pub = node.create_publisher(OccupancyGrid, '/map', latched)
+    tf_pub = tf2_ros.StaticTransformBroadcaster(node)
+    got = []
+    node.create_subscription(PolygonStamped, '/f2c_boundary', lambda m: got.append(m), 10)
+
+    grid = OccupancyGrid()
+    grid.header.frame_id = 'map'
+    grid.info.resolution = RES
+    grid.info.width = W
+    grid.info.height = H
+    grid.info.origin.orientation.w = 1.0
+    data = [100] * (W * H)
+    for row in range(FREE_LO, FREE_HI + 1):
+        for col in range(FREE_LO, FREE_HI + 1):
+            if col != wall_col:
+                data[row * W + col] = 0
+    grid.data = data
+
+    def spin_for(sec):
+        end = time.time() + sec
+        while time.time() < end:
+            rclpy.spin_once(node, timeout_sec=0.1)
+
+    def put_car(x, y):
+        t = TransformStamped()
+        t.header.stamp = node.get_clock().now().to_msg()
+        t.header.frame_id = 'map'
+        t.child_frame_id = 'base_footprint'
+        t.transform.translation.x = x
+        t.transform.translation.y = y
+        t.transform.rotation.w = 1.0
+        tf_pub.sendTransform(t)
+        spin_for(1.0)
+
+    def next_boundary(timeout=20.0):
+        """丟掉之前收到的，重送地圖，拿下一個 /f2c_boundary。"""
+        spin_for(1.0)
+        del got[:]
+        deadline = time.time() + timeout
+        while time.time() < deadline and not got:
+            grid.header.stamp = node.get_clock().now().to_msg()
+            map_pub.publish(grid)
+            spin_for(0.8)
+        if not got:
+            return None
+        xs = [p.x for p in got[-1].polygon.points]
+        ys = [p.y for p in got[-1].polygon.points]
+        return len(xs), min(xs), max(xs), min(ys), max(ys)
+
+    def show(tag, r):
+        if r is None:
+            sub('%s：沒有收到 /f2c_boundary' % tag)
+        else:
+            sub('%s：頂點 %d，x %.3f ~ %.3f，y %.3f ~ %.3f' % ((tag,) + r))
+
+    try:
+        ctrl = next_boundary()
+        show('① 還沒有車子位置 (對照組，取最大的一塊)', ctrl)
+        put_car(*B10_RIGHT)
+        right = next_boundary()
+        show('② 車子在右邊小塊 (%.1f, %.1f)' % B10_RIGHT, right)
+        put_car(*B10_LEFT)
+        left = next_boundary()
+        show('③ 車子開回左邊 (%.1f, %.1f)' % B10_LEFT, left)
+        if ctrl is None or right is None or left is None:
+            print(node_proc.log_tail(30))
+            record('B', 'B10', '割草範圍取車子所在的那一塊', 'FAIL', '有一段沒有收到 /f2c_boundary (見上方 log)')
+            return
+        ctrl_ok = ctrl[2] < B10_WALL_X
+        right_ok = right[1] > B10_WALL_X - tol and right[1] < B10_RIGHT[0] < right[2]
+        left_ok = left[2] < B10_WALL_X and all(abs(a - b) <= tol for a, b in zip(left[1:], ctrl[1:]))
+        sub('對照組取到左邊大塊 = %s' % ctrl_ok)
+        sub('車子在右邊時範圍整個在牆右邊、而且包含車子 = %s；開回左邊後回到左邊 = %s' % (right_ok, left_ok))
+        record('B', 'B10', '割草範圍取車子所在的那一塊：右邊小塊也選得到、開回來會換回去；查不到車子時取最大',
+               'PASS' if (ctrl_ok and right_ok and left_ok) else 'FAIL',
+               '對照 x %.2f~%.2f ; 車在右 x %.2f~%.2f ; 車在左 x %.2f~%.2f'
+               % (ctrl[1], ctrl[2], right[1], right[2], left[1], left[2]))
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
 # B5 (階段 38)：周邊環繞「實際會開的長度」。
 # 以前的測試只看「周邊環繞有沒有完成」—— 整圈被切成一段、起點 = 終點時，goal checker 在送出的當下
 # 就判定到達，0 秒「完成」、邊緣一公尺都沒割，測試照樣綠。這一項用存檔地圖 (stage29_lawn，進版控)
@@ -1181,7 +1572,7 @@ def b4_obstacle_extraction():
 # --------------------------------------------------------------------------
 EXPECTED_NODES = ['robot_state_publisher', 'joint_state_publisher', 'slam_toolbox',
                   'joy_node', 'mower_teleop', 'mower_manager', 'map_to_boundary',
-                  'f2c_server']
+                  'keepout_server', 'f2c_server']
 
 # 節點名 -> 用來 pgrep 的行程特徵，C1 診斷用
 NODE_PROC_PATTERN = {
@@ -1192,6 +1583,7 @@ NODE_PROC_PATTERN = {
     'mower_teleop': 'mowerbot_bridge/teleop_node',
     'mower_manager': 'mowerbot_action/mower_manager',
     'map_to_boundary': 'mowerbot_action/map_to_boundary',
+    'keepout_server': 'mowerbot_action/keepout_server',
     'f2c_server': 'mowerbot_planner/f2c_server',
 }
 
@@ -3248,7 +3640,9 @@ def _r_launch(fake, extra_args):
            'encoder_ticks_per_rev:=%d' % R_TICKS_PER_REV,
            'serial_port:=%s' % fake.port,
            # 幾何閘門 (階段 38)：實車 launch 預設 false；這裡是假 C30D，放行暫定幾何
-           'allow_provisional:=true'] + list(extra_args)
+           'allow_provisional:=true',
+           # 沒有實體光達 (也不一定裝了 rplidar_ros)，不啟動光達驅動
+           'use_lidar:=false'] + list(extra_args)
     return cmd
 
 
@@ -4612,15 +5006,16 @@ def phase_p():
                % (connected_while, deadman_while,
                   after[1] if after else None, after[2] if after else None))
 
-        # ---- P11 手把 Y 鍵沒有繫結 ----
+        # ---- P11 手把 Y 鍵不切模式 ----
         #
         # Y 以前會呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
         # （需要 planner_server + bt_navigator）。階段 23 把那個分支拿掉了，
-        # 這一項確認它真的沒有回來，而且沒有被拿去做別的事。
+        # 這一項確認它真的沒有回來。2026-10-19 起 Y = 存圖 + 預覽割草路線 (will 要的)，
+        # 兩件事都不切模式、車子不動 (Phase M 的 M7 / M8 驗)，所以這一項照樣成立。
         #
         # mode 值 3 本身、manager 對 mode 3 的仲裁、以及 P7 / P9 / N6 那些
         # **用服務**設 mode 3 的測試全部不受影響 —— 它們本來就不經過手把。
-        hdr('P11  按下手把 Y 鍵不會改變模式（Y 未繫結）')
+        hdr('P11  按下手把 Y 鍵不會改變模式（Y = 存圖 + 預覽，不切模式）')
         # 按鈕順序 = [A, B, X, Y, LB(deadman), 急停]
         JOY_NONE = [0, 0, 0, 0, 1, 0]            # 只按住 LB
         JOY_Y    = [0, 0, 0, 1, 1, 0]            # LB + Y
@@ -5569,6 +5964,1291 @@ def phase_l():
 # --------------------------------------------------------------------------
 # 7. 總結
 # --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Phase S：停車機制 (2026-10-15 will 決定)
+#   1. 自動模式 (mode 1) 放開 LB 要停車 (mower_manager 的 auto_requires_deadman)
+#   2. 光達看到障礙物要停車 (navigation.launch.py 的光達停止區 = Nav2 collision_monitor)
+#      加上光達中斷要停車 (auto_requires_scan；Humble 的 collision_monitor 光達逾時會照常放行)
+#
+# 不需要 Gazebo，wall clock，用實車的設定 (use_sim_time:=false → 兩個放行條件與停止區都開)：
+#   robot_state_publisher (URDF 的 radar -> base_footprint)
+#   static TF odom -> base_footprint (controller_server 的 local costmap 要它才進得了 active)
+#   navigation.launch.py use_sim_time:=false (controller_server + collision_monitor + lifecycle_manager)
+#   mower_manager (放行條件用節點預設值 true) + mower_teleop
+# 測試自己扮演手把 (/joy 20 Hz)、光達 (/scan 10 Hz) 與 Nav2 控制器 (/cmd_vel_nav_raw 20 Hz，
+# linear.x = 0.3)，看 mower_manager 送到底盤的 /cmd_vel。
+#
+#   S0  launch 預設值：模擬關、實車開；bringup_real 強制開
+#   S1  對照組：mode 1、按住 LB、光達正常、前方淨空 → /cmd_vel = 0.3 (管道是通的，S2 ~ S6 才算數)
+#   S2  放開 LB → S_STOP_LATENCY 內歸零並維持；再按住 → 恢復 0.3
+#   S3  手把斷線 (/joy 停發) → 1.0 s 內歸零 (/joy_status 0.5 s 判斷斷線 + 5 Hz)
+#   S4  光達中斷 (/scan 停發) → 1.0 s 內歸零；恢復後 0.3
+#   S5  停止區：車頭前 0.20 m 有障礙物 → 0；區外 (車頭前 0.60 m、車身旁 y = 0.80) → 0.3；
+#       區內只有 3 點 (Humble 要 > max_points = 3 才停) → 0.3
+#   S6  手動模式 (mode 2) 不經過停止區：區內有障礙物，手把照樣開得動
+#
+# 2026-10-19 will：LB + B 之後不用一直按住 LB。bringup_real 改成 auto_requires_deadman:=false
+# (手把連著就好)。S7 ~ S10 換一個這樣設定的 mower_manager 再測一次 (其他節點沿用)：
+#   S7  LB 放開、手把連著、光達正常 → 照樣轉發 0.3 (車子自己跑)
+#   S8  手把斷線 → 1.0 s 內歸零；重新連上 (LB 沒按) → 維持 0 (不會自己走)；按一下 LB 放開 → 恢復 0.3
+#   S9  光達中斷 → 1.0 s 內歸零；恢復 → 0.3 (不用按 LB)
+#   S10 RB 急停 (LB 沒按) → S_STOP_LATENCY 內歸零，放開 RB 之後也維持 0 (急停鎖住)
+#
+# 2026-10-21 will：用存好的地圖時，割草中定位對不上要停。S11 ~ S13 換一個 saved_map:=smoke_s 的
+# mower_manager，測試扮演 map_session 發 /map_session/match (latched，1 Hz)：
+#   S11 對上 → 照走；對不上 → S_LOC_PAUSE 秒左右歸零 (不會更早)；對上了 → 不用按 LB 接著走
+#   S12 只對不上 1.5 秒 (有人走過光達前面) → 一直照走，一筆 0 都沒有
+#   S13 map_session 停了 (回報中斷 3 秒 + 再等 S_LOC_PAUSE 秒) → 歸零；恢復 → 接著走
+# --------------------------------------------------------------------------
+S_NAV_X = 0.3
+S_STOP_LATENCY = 0.3      # 放開 LB 到 /cmd_vel 歸零的上限 (teleop 一變化就發 /joy_status)
+S_LOSS_LATENCY = 1.0      # 手把 / 光達中斷到歸零的上限 (逾時 0.5 s + 發布週期)
+S_LOC_PAUSE = 3.0         # mower_manager loc_pause_after 的預設值
+
+
+def _load_launch_module(pkg, fname):
+    import importlib.util
+    from ament_index_python.packages import get_package_share_directory
+    path = os.path.join(get_package_share_directory(pkg), 'launch', fname)
+    spec = importlib.util.spec_from_file_location(fname.replace('.', '_'), path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod, path
+
+
+def s0_launch_defaults():
+    try:
+        _s0_launch_defaults()
+    except Exception as e:      # 靜態檢查本身出錯不要拖垮後面的實際測試
+        record('S', 'S0', 'launch 預設值：模擬關、實車開；bringup_real 不用按住 LB、手把與光達強制開、割草線方向 auto', 'FAIL',
+               '%s: %s' % (type(e).__name__, e))
+
+
+def _s0_launch_defaults():
+    from launch import LaunchContext
+    from launch.actions import OpaqueFunction
+    from ament_index_python.packages import get_package_share_directory
+
+    def ctx(**cfg):
+        c = LaunchContext()
+        for k, v in cfg.items():
+            c.launch_configurations[k] = v
+        return c
+
+    problems = []
+    # mower_control：放行條件留空時跟著 use_sim_time
+    mc, _ = _load_launch_module('mowerbot_bringup', 'mower_control.launch.py')
+    def gates(sim, lb='', joy='', scan=''):
+        return dict(use_sim_time=sim, auto_requires_deadman=lb, auto_requires_joystick=joy,
+                    auto_requires_scan=scan)
+    cases = [
+        (gates('true'), (False, False, False)),
+        (gates('false'), (True, True, True)),
+        (gates('true', lb='true'), (True, False, False)),
+        (gates('false', lb='false', scan='true'), (False, True, True)),
+        (gates('false', joy='false'), (True, False, True)),
+    ]
+    for cfg, want in cases:
+        g = mc.resolve_auto_gates(ctx(**cfg))
+        got = (g['auto_requires_deadman'], g['auto_requires_joystick'], g['auto_requires_scan'])
+        sub('mower_control %s -> (LB, 手把, scan) = %s' % (cfg, got))
+        if got != want:
+            problems.append('mower_control %s 得到 %s，應為 %s' % (cfg, got, want))
+    for bad in (gates('false', lb='yes'), gates('false', joy='on')):
+        try:
+            mc.resolve_auto_gates(ctx(**bad))
+            problems.append('%s 沒有被拒絕' % bad)
+        except RuntimeError as e:
+            sub('%s 被拒絕：%s' % ({k: v for k, v in bad.items() if v not in ('', 'false')}, e))
+    # 割草線方向 (2026-10-19)：留空 = 模擬 0、實車 auto；亂寫拒絕啟動
+    for sim, v, want in (('true', '', '0'), ('false', '', 'auto'), ('false', '30', '30'),
+                         ('true', ' AUTO ', 'auto')):
+        got = mc.resolve_swath_angle(ctx(use_sim_time=sim, swath_angle=v))
+        sub('swath_angle use_sim_time=%s 參數=%r -> %r' % (sim, v, got))
+        if got != want:
+            problems.append('swath_angle use_sim_time=%s 參數=%r 得到 %r，應為 %r' % (sim, v, got, want))
+    for bad in ('abc', 'nan'):
+        try:
+            mc.resolve_swath_angle(ctx(use_sim_time='false', swath_angle=bad))
+            problems.append('swath_angle:=%s 沒有被拒絕' % bad)
+        except RuntimeError as e:
+            sub('swath_angle:=%s 被拒絕：%s' % (bad, e))
+
+    # navigation：停止區留空時跟著 use_sim_time
+    nav, _ = _load_launch_module('mowerbot_bringup', 'navigation.launch.py')
+    params = os.path.join(get_package_share_directory('mowerbot_bringup'), 'config',
+                          'nav2_params.yaml')
+    ld = nav.generate_launch_description()
+    fn = [e for e in ld.entities if isinstance(e, OpaqueFunction)]
+    if len(fn) != 1:
+        problems.append('navigation.launch.py 應該只有一個 OpaqueFunction，找到 %d 個' % len(fn))
+    else:
+        for sim, cm, want in (('true', '', False), ('false', '', True), ('true', 'true', True),
+                              ('false', 'false', False)):
+            acts = fn[0].execute(ctx(use_sim_time=sim, params_file=params, collision_monitor=cm,
+                                     stop_zone_length=str(nav.STOP_ZONE_LENGTH)))
+            names = [getattr(a, 'node_executable', None) for a in acts]
+            got = 'collision_monitor' in names
+            sub('navigation use_sim_time=%s collision_monitor=%r -> 停止區 %s' % (sim, cm, got))
+            if got != want:
+                problems.append('navigation use_sim_time=%s collision_monitor=%r 停止區 %s，應為 %s'
+                                % (sim, cm, got, want))
+    # bringup_real 強制開 (在 RegisterEventHandler 的 lambda 裡，只能看原始碼)
+    _, real_path = _load_launch_module('mowerbot_bringup', 'bringup_real.launch.py')
+    with open(real_path, encoding='utf-8') as fh:
+        src = fh.read()
+    # 2026-10-19 will：LB + B 之後不用按住 LB → deadman 關、手把連線開；光達照舊開；割草線方向 auto
+    for k, v in (('auto_requires_deadman', 'false'), ('auto_requires_joystick', 'true'),
+                 ('auto_requires_scan', 'true'), ('swath_angle', 'auto')):
+        if not re.search(r"'%s':\s*'%s'" % (k, v), src):
+            problems.append('bringup_real.launch.py 沒有把 %s 固定成 %s' % (k, v))
+    record('S', 'S0', 'launch 預設值：模擬關、實車開；bringup_real 不用按住 LB、手把與光達強制開、割草線方向 auto',
+           'FAIL' if problems else 'PASS', '; '.join(problems))
+
+
+class SRig(object):
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import Joy, LaserScan
+        from geometry_msgs.msg import Twist
+        from mowerbot_interfaces.srv import SetDriveMode
+
+        yaml_path = os.path.join(WS, 'install', 'mowerbot_bridge', 'share',
+                                 'mowerbot_bridge', 'config', 'joystick.yaml')
+        self.rsp = bg_start('S_robot_state_publisher',
+                            ['ros2', 'launch', 'mowerbot_description',
+                             'robot_state_publisher.launch.py', 'use_sim_time:=false'])
+        self.tf = bg_start('S_static_odom',
+                           ['ros2', 'run', 'tf2_ros', 'static_transform_publisher',
+                            '--frame-id', 'odom', '--child-frame-id', 'base_footprint'])
+        self.nav = bg_start('S_navigation',
+                            ['ros2', 'launch', 'mowerbot_bringup', 'navigation.launch.py',
+                             'use_sim_time:=false'])
+        # 放行條件不帶參數：用 mower_manager 節點自己的預設值 (true)
+        self.manager = bg_start('S_mower_manager',
+                                ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                                 '--ros-args', '-p', 'use_sim_time:=false']
+                                + _manager_geometry_args())
+        self.teleop = bg_start('S_mower_teleop',
+                               ['ros2', 'run', 'mowerbot_bridge', 'teleop_node',
+                                '--ros-args', '--params-file', yaml_path,
+                                '-p', 'use_sim_time:=false'])
+        rclpy.init()
+        self.node = Node('smoke_s')
+        self.Joy, self.LaserScan, self.Twist = Joy, LaserScan, Twist
+        self.SetDriveMode = SetDriveMode
+        self.joy_pub = self.node.create_publisher(Joy, '/joy', 10)
+        self.scan_pub = self.node.create_publisher(LaserScan, '/scan', qos_profile_sensor_data)
+        self.nav_pub = self.node.create_publisher(Twist, '/cmd_vel_nav_raw', 10)
+        self.cmd = []                     # (wall_t, linear.x)
+        self.node.create_subscription(
+            Twist, '/cmd_vel', lambda m: self.cmd.append((time.time(), m.linear.x)), 100)
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        # 測試扮演的三個來源，各自可以開關
+        self.send_joy = True
+        self.lb = True
+        self.rb = False
+        self.stick = 0.0                  # 搖桿 axis_linear (手動模式用)
+        self.send_scan = True
+        self.obstacle = []                # base_footprint 座標 [(x, y)]
+        self.send_nav = True
+        self.node.create_timer(0.05, self._tick_joy)
+        self.node.create_timer(0.1, self._tick_scan)
+        self.node.create_timer(0.05, self._tick_nav)
+        # S11 ~ S13：測試扮演 map_session (latched，跟 mower_manager 訂的 QoS 一樣)；None = 不發
+        from std_msgs.msg import String
+        from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+        self.String = String
+        self.match_pub = self.node.create_publisher(
+            String, '/map_session/match',
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self.match = None
+        self.match_pub_t = None     # 最後一次發 /map_session/match 的時間 (S13 從這裡算)
+        self.node.create_timer(1.0, self._tick_match)
+
+    def _tick_joy(self):
+        if not self.send_joy:
+            return
+        m = self.Joy()
+        m.header.stamp = self.node.get_clock().now().to_msg()
+        m.axes = [0.0, float(self.stick), 0.0, 0.0]
+        m.buttons = [0, 0, 0, 0, 1 if self.lb else 0, 1 if self.rb else 0]
+        self.joy_pub.publish(m)
+
+    def _tick_scan(self):
+        if not self.send_scan:
+            return
+        n = 1440
+        m = self.LaserScan()
+        m.header.stamp = self.node.get_clock().now().to_msg()
+        m.header.frame_id = 'radar'
+        m.angle_min = -math.pi
+        m.angle_increment = 2.0 * math.pi / n
+        m.angle_max = m.angle_min + (n - 1) * m.angle_increment
+        m.range_min = 0.05
+        m.range_max = 40.0
+        ranges = [float('inf')] * n
+        # radar 與 base_link 同向，原點在 (lidar_x, 0) (car_radar.xacro)
+        for bx, by in self.obstacle:
+            rx, ry = bx - GEOM.lidar_x, by
+            i = int(round((math.atan2(ry, rx) - m.angle_min) / m.angle_increment)) % n
+            ranges[i] = min(ranges[i], math.hypot(rx, ry))
+        m.ranges = ranges
+        self.scan_pub.publish(m)
+
+    def _tick_match(self):
+        if self.match is not None:
+            import json
+            self.match_pub.publish(self.String(data=json.dumps(self.match, ensure_ascii=False)))
+            self.match_pub_t = time.time()
+
+    def set_match(self, ok, score, text):
+        """換定位結果，馬上發一筆 (之後 1 Hz)"""
+        self.match = {'mode': 'localization', 'state': 'ok', 'ok': ok, 'score': score, 'n': 200,
+                      'text': text, 't': round(time.time(), 1)}
+        self._tick_match()
+
+    def _tick_nav(self):
+        if not self.send_nav:
+            return
+        t = self.Twist()
+        t.linear.x = S_NAV_X
+        self.nav_pub.publish(t)
+
+    def spin(self, seconds):
+        import rclpy
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            rclpy.spin_once(self.node, timeout_sec=0.01)
+
+    def set_mode(self, mode):
+        import rclpy
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def since(self, t0):
+        return [(t, x) for t, x in self.cmd if t >= t0]
+
+    def wait_forwarding(self, timeout):
+        """等到 /cmd_vel 連續 1 秒都是 S_NAV_X (Nav2 lifecycle 起來要幾秒)"""
+        t_end = time.time() + timeout
+        while time.time() < t_end:
+            t0 = time.time()
+            self.spin(1.0)
+            w = self.since(t0)
+            if len(w) >= 10 and all(abs(x - S_NAV_X) < 1e-6 for _t, x in w):
+                return True
+        return False
+
+    def stop_after(self, t0, seconds):
+        """t0 之後 seconds 秒內的 (歸零延遲, 歸零後非零筆數, 全部筆數)。歸零 = 最後一筆非零之後。"""
+        self.spin(seconds)
+        w = self.since(t0)
+        nz = [t for t, x in w if abs(x) > 1e-9]
+        if not w or (nz and nz[-1] >= w[-1][0]):
+            return None, len(nz), len(w)
+        latency = (nz[-1] - t0) if nz else 0.0
+        return latency, 0, len(w)
+
+    def steady(self, seconds, value):
+        t0 = time.time()
+        self.spin(seconds)
+        w = [x for t, x in self.since(t0) if t >= t0 + 0.5]   # 前 0.5 s 是過渡
+        return bool(w) and all(abs(x - value) < 1e-6 for x in w), len(w)
+
+    def close(self):
+        import rclpy
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+
+def _front_block(x_ahead, y_lo=-0.15, y_hi=0.15, step=0.01):
+    """車頭前緣往前 x_ahead 公尺、y 從 y_lo 到 y_hi 的一排點 (base_footprint 座標)"""
+    x = GEOM.front_extent + x_ahead
+    n = int(round((y_hi - y_lo) / step)) + 1
+    return [(x, y_lo + i * step) for i in range(n)]
+
+
+def phase_s():
+    hdr('Phase S  停車機制 (自動模式放開 LB、光達中斷、光達停止區；不需要 Gazebo)')
+    s0_launch_defaults()
+    rig = SRig()
+    later = [('S2', '放開 LB 停車'), ('S3', '手把斷線停車'), ('S4', '光達中斷停車'),
+             ('S5', '光達停止區'), ('S6', '手動模式不受停止區影響')] + S_NOHOLD + S_LOC
+    try:
+        if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
+            print(rig.manager.log_tail(30))
+            record('S', 'S1', '對照組：按住 LB 時轉發導航指令', 'FIXTURE', 'mower_manager 沒起來')
+            for cid, name in later:
+                record('S', cid, name, 'FIXTURE', '管道沒有驗證 (S1 沒過)')
+            return
+        sub('change_mode(1) = %s' % rig.set_mode(1))
+
+        # ---- S1 對照組 ----
+        hdr('S1  對照組：mode 1、按住 LB、光達正常、前方淨空 → /cmd_vel = %.1f' % S_NAV_X)
+        ok = rig.wait_forwarding(40.0)
+        sub('等待 Nav2 lifecycle 與轉發：%s' % ok)
+        if not ok:
+            print(rig.nav.log_tail(40))
+            print(rig.manager.log_tail(20))
+        record('S', 'S1', '對照組：按住 LB、光達正常時轉發導航指令',
+               'PASS' if ok else 'FIXTURE',
+               '' if ok else '/cmd_vel 沒有穩定在 %.1f，後面的結果不算數' % S_NAV_X)
+        if not ok:
+            for cid, name in later:
+                record('S', cid, name, 'FIXTURE', '管道沒有驗證 (S1 沒過)')
+            return
+
+        # ---- S2 放開 LB ----
+        hdr('S2  放開 LB → %.1f s 內歸零；再按住 → 恢復' % S_STOP_LATENCY)
+        t0 = time.time()
+        rig.lb = False
+        lat, after_nz, n = rig.stop_after(t0, 2.0)
+        sub('放開 LB：歸零延遲 %s，之後非零 %d 筆 (共 %d 筆)'
+            % (('%.3f s' % lat) if lat is not None else '沒有歸零', after_nz, n))
+        paused_log = rig.manager.log_grep(r'自動模式暫停', 3)
+        for h in paused_log:
+            sub('    %s' % h.strip())
+        rig.lb = True
+        resumed, m = rig.steady(1.5, S_NAV_X)
+        sub('再按住 LB：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+        ok = lat is not None and lat <= S_STOP_LATENCY and resumed
+        record('S', 'S2', '放開 LB 停車、按住恢復', 'PASS' if ok else 'FAIL',
+               '歸零延遲 %s (上限 %.1f s)；恢復 %s'
+               % (('%.3f s' % lat) if lat is not None else '沒有歸零', S_STOP_LATENCY, resumed))
+
+        # ---- S3 手把斷線 ----
+        hdr('S3  手把斷線 (/joy 停發) → %.1f s 內歸零' % S_LOSS_LATENCY)
+        t0 = time.time()
+        rig.send_joy = False
+        lat, after_nz, n = rig.stop_after(t0, 2.5)
+        sub('/joy 停發：歸零延遲 %s (共 %d 筆)'
+            % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+        rig.send_joy = True
+        resumed, m = rig.steady(1.5, S_NAV_X)
+        sub('/joy 恢復 (LB 按住)：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+        ok = lat is not None and lat <= S_LOSS_LATENCY and resumed
+        record('S', 'S3', '手把斷線停車', 'PASS' if ok else 'FAIL',
+               '歸零延遲 %s (上限 %.1f s)；恢復 %s'
+               % (('%.3f s' % lat) if lat is not None else '沒有歸零', S_LOSS_LATENCY, resumed))
+
+        # ---- S4 光達中斷 ----
+        hdr('S4  光達中斷 (/scan 停發) → %.1f s 內歸零' % S_LOSS_LATENCY)
+        t0 = time.time()
+        rig.send_scan = False
+        lat, after_nz, n = rig.stop_after(t0, 2.5)
+        sub('/scan 停發：歸零延遲 %s (共 %d 筆)'
+            % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+        rig.send_scan = True
+        resumed, m = rig.steady(1.5, S_NAV_X)
+        sub('/scan 恢復：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+        ok = lat is not None and lat <= S_LOSS_LATENCY and resumed
+        record('S', 'S4', '光達中斷停車', 'PASS' if ok else 'FAIL',
+               '歸零延遲 %s (上限 %.1f s)；恢復 %s'
+               % (('%.3f s' % lat) if lat is not None else '沒有歸零', S_LOSS_LATENCY, resumed))
+
+        # ---- S5 停止區 ----
+        hdr('S5  光達停止區 (車頭前 0 ~ %.2f m、半寬 lateral_half_extent + 0.05)'
+            % _load_launch_module('mowerbot_bringup', 'navigation.launch.py')[0].STOP_ZONE_LENGTH)
+        res = {}
+        t0 = time.time()
+        rig.obstacle = _front_block(0.20)
+        lat, after_nz, n = rig.stop_after(t0, 1.5)
+        res['in'] = lat
+        sub('車頭前 0.20 m 一排 %d 點：歸零延遲 %s'
+            % (len(rig.obstacle), ('%.3f s' % lat) if lat is not None else '沒有歸零'))
+        hits = rig.nav.log_grep(r'collision_monitor.*(stop|Robot to stop)', 2)
+        for h in hits:
+            sub('    %s' % h.strip())
+        for key, pts, label in (
+                ('far', _front_block(0.60), '車頭前 0.60 m (區外)'),
+                ('side', [(GEOM.front_extent - 0.30, 0.80 + 0.01 * i) for i in range(20)],
+                 '車身旁 y = 0.80 m (區外)'),
+                ('few', [(GEOM.front_extent + 0.20, y) for y in (-0.05, 0.0, 0.05)],
+                 '車頭前 0.20 m 只有 3 點')):
+            rig.obstacle = pts
+            ok_, m = rig.steady(1.5, S_NAV_X)
+            res[key] = ok_
+            sub('%s：最後 1 秒 %d 筆全為 %.1f = %s' % (label, m, S_NAV_X, ok_))
+        rig.obstacle = []
+        ok = (res['in'] is not None and res['in'] <= S_LOSS_LATENCY
+              and res['far'] and res['side'] and res['few'])
+        record('S', 'S5', '光達停止區：區內停、區外與 3 點以下不停', 'PASS' if ok else 'FAIL',
+               '區內歸零 %s；區外前方 %s、側邊 %s、3 點 %s'
+               % (('%.3f s' % res['in']) if res['in'] is not None else '沒有',
+                  res['far'], res['side'], res['few']))
+
+        # ---- S6 手動模式不經過停止區 ----
+        hdr('S6  手動模式 (mode 2)：停止區裡有障礙物，手把照樣開得動')
+        rig.send_nav = False
+        sub('change_mode(2) = %s' % rig.set_mode(2))
+        rig.obstacle = _front_block(0.20)
+        rig.stick = 0.5
+        want = 0.5 * 0.7          # joystick.yaml scale_linear
+        ok, m = rig.steady(2.0, want)
+        rig.stick = 0.0
+        rig.obstacle = []
+        sub('區內有障礙物、LB + 搖桿 0.5：最後 1.5 秒 %d 筆全為 %.2f = %s' % (m, want, ok))
+        record('S', 'S6', '手動模式不受停止區影響', 'PASS' if ok else 'FAIL',
+               '%d 筆全為 %.2f = %s' % (m, want, ok))
+        s_nohold(rig)
+        s_localization(rig)
+    finally:
+        rig.close()
+
+
+S_NOHOLD = [('S7', '不用按住 LB：手把連著就照走'), ('S8', '手把斷線停車、重新連上要按一下 LB'),
+            ('S9', '不用按住 LB 時光達中斷停車'), ('S10', '不用按住 LB 時 RB 急停')]
+
+
+def s_nohold(rig):
+    """S7 ~ S10：bringup_real 的設定 (auto_requires_deadman:=false)，LB + B 之後不用按住 LB。"""
+    later = S_NOHOLD
+    hdr('S7  換成 auto_requires_deadman:=false 的 mower_manager：LB 放開、手把連著 → 照樣轉發 %.1f'
+        % S_NAV_X)
+    rig.manager.stop()
+    rig.spin(2.0)
+    rig.manager = bg_start('S_mower_manager_nohold',
+                           ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                            '--ros-args', '-p', 'use_sim_time:=false',
+                            '-p', 'auto_requires_deadman:=false']
+                           + _manager_geometry_args())
+    rig.send_nav, rig.send_joy, rig.send_scan = True, True, True
+    rig.lb, rig.rb, rig.stick, rig.obstacle = False, False, 0.0, []
+    up = False
+    t_end = time.time() + 20.0
+    while time.time() < t_end and not up:
+        rig.spin(1.0)
+        up = bool(rig.manager.log_grep(r'自動模式放行條件', 1)) and rig.set_mode(1) is True
+    sub('新的 mower_manager 起來、change_mode(1) = %s' % up)
+    for h in rig.manager.log_grep(r'自動模式放行條件', 1):
+        sub('    %s' % h.strip()[:160])
+    ok = up and rig.wait_forwarding(20.0)
+    record('S', 'S7', '不用按住 LB：LB 放開、手把連著、光達正常時照樣轉發導航指令',
+           'PASS' if ok else 'FAIL', '' if ok else '/cmd_vel 沒有穩定在 %.1f' % S_NAV_X)
+    if not ok:
+        print(rig.manager.log_tail(30))
+        for cid, name in later[1:]:
+            record('S', cid, name, 'FIXTURE', '管道沒有驗證 (S7 沒過)')
+        return
+
+    hdr('S8  手把斷線 → 停；重新連上 (LB 沒按) → 還是停；按一下 LB → 走')
+    t0 = time.time()
+    rig.send_joy = False
+    lat, after_nz, n = rig.stop_after(t0, 2.5)
+    sub('/joy 停發：歸零延遲 %s (共 %d 筆)' % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    rig.send_joy = True
+    held, m = rig.steady(2.5, 0.0)
+    sub('/joy 恢復、LB 沒按：最後 2 秒 %d 筆全為 0 = %s' % (m, held))
+    latched = rig.manager.log_grep(r'按一下 LB', 2)
+    for h in latched:
+        sub('    %s' % h.strip()[:160])
+    rig.lb = True
+    rig.spin(0.4)
+    rig.lb = False
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('按一下 LB 再放開：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = lat is not None and lat <= S_LOSS_LATENCY and held and bool(latched) and resumed
+    record('S', 'S8', '手把斷線停車、重新連上不會自己走、按一下 LB 才繼續', 'PASS' if ok else 'FAIL',
+           '歸零延遲 %s；重連後維持 0 %s；按 LB 後恢復 %s'
+           % (('%.3f s' % lat) if lat is not None else '沒有歸零', held, resumed))
+
+    hdr('S9  光達中斷 → %.1f s 內歸零；恢復 → 不用按 LB 照走' % S_LOSS_LATENCY)
+    t0 = time.time()
+    rig.send_scan = False
+    lat, after_nz, n = rig.stop_after(t0, 2.5)
+    sub('/scan 停發：歸零延遲 %s (共 %d 筆)' % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    rig.send_scan = True
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('/scan 恢復 (LB 沒按)：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = lat is not None and lat <= S_LOSS_LATENCY and resumed
+    record('S', 'S9', '不用按住 LB 時光達中斷停車、恢復照走', 'PASS' if ok else 'FAIL',
+           '歸零延遲 %s；恢復 %s' % (('%.3f s' % lat) if lat is not None else '沒有歸零', resumed))
+
+    hdr('S10  RB 急停 (LB 沒按) → %.1f s 內歸零，放開 RB 也維持 0' % S_STOP_LATENCY)
+    t0 = time.time()
+    rig.rb = True
+    lat, after_nz, n = rig.stop_after(t0, 1.0)
+    rig.rb = False
+    held, m = rig.steady(2.0, 0.0)
+    sub('按 RB：歸零延遲 %s；放開 RB 之後最後 1.5 秒 %d 筆全為 0 = %s'
+        % (('%.3f s' % lat) if lat is not None else '沒有歸零', m, held))
+    ok = lat is not None and lat <= S_STOP_LATENCY and held
+    record('S', 'S10', '不用按住 LB 時 RB 急停：馬上停、放開 RB 也不會再走', 'PASS' if ok else 'FAIL',
+           '歸零延遲 %s；放開後維持 0 %s' % (('%.3f s' % lat) if lat is not None else '沒有歸零', held))
+
+
+S_LOC = [('S11', '用存好的地圖：割草中定位對不上暫停、對上了接著走'), ('S12', '定位短暫變差不停'),
+         ('S13', '定位回報中斷也停')]
+
+
+def s_localization(rig):
+    """S11 ~ S13：用存好的地圖 (saved_map) 時，割草中定位對不上要停 (2026-10-21 will)。"""
+    hdr('S11  saved_map:=smoke_s 的 mower_manager：對上 → 走；對不上 %.0f 秒 → 停；對上 → 接著走'
+        % S_LOC_PAUSE)
+    rig.manager.stop()
+    rig.spin(2.0)
+    rig.set_match(True, 0.85, '對上了：光達 85% 落在地圖的牆上')
+    rig.manager = bg_start('S_mower_manager_loc',
+                           ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                            '--ros-args', '-p', 'use_sim_time:=false',
+                            '-p', 'auto_requires_deadman:=false', '-p', 'saved_map:=smoke_s']
+                           + _manager_geometry_args())
+    rig.send_nav, rig.send_joy, rig.send_scan = True, True, True
+    rig.lb, rig.rb, rig.stick, rig.obstacle = False, False, 0.0, []
+    up = False
+    t_end = time.time() + 20.0
+    while time.time() < t_end and not up:
+        rig.spin(1.0)
+        up = bool(rig.manager.log_grep(r'割草中對不上超過', 1)) and rig.set_mode(1) is True
+    sub('新的 mower_manager 起來、change_mode(1) = %s' % up)
+    for h in rig.manager.log_grep(r'用存好的地圖', 1):
+        sub('    %s' % h.strip()[:160])
+    fwd = up and rig.wait_forwarding(20.0)
+    sub('定位對上：/cmd_vel 穩定在 %.1f = %s' % (S_NAV_X, fwd))
+    if not fwd:
+        print(rig.manager.log_tail(30))
+        for cid, name in S_LOC:
+            record('S', cid, name, 'FIXTURE', '定位對上時 /cmd_vel 沒有穩定在 %.1f' % S_NAV_X)
+        return
+    t0 = time.time()
+    rig.set_match(False, 0.21, '光達只有 21% 落在地圖的牆上 (要 50%)：有人或東西擋住光達？')
+    lat, after_nz, n = rig.stop_after(t0, S_LOC_PAUSE + 2.0)
+    sub('定位對不上：歸零延遲 %s (共 %d 筆)' % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    paused = rig.manager.log_grep(r'定位對不上存好的地圖超過', 1)
+    for h in paused:
+        sub('    %s' % h.strip()[:160])
+    held, m = rig.steady(2.0, 0.0)
+    sub('還是對不上：最後 1.5 秒 %d 筆全為 0 = %s' % (m, held))
+    rig.set_match(True, 0.86, '對上了：光達 86% 落在地圖的牆上')
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('對上了 (LB 沒按)：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = (lat is not None and S_LOC_PAUSE - 0.3 <= lat <= S_LOC_PAUSE + 1.0 and bool(paused)
+          and held and resumed)
+    record('S', 'S11', '用存好的地圖：割草中定位對不上暫停、對上了接著走', 'PASS' if ok else 'FAIL',
+           '歸零延遲 %s (要 %.1f ~ %.1f s)；維持 0 %s；對上後恢復 %s'
+           % (('%.3f s' % lat) if lat is not None else '沒有歸零', S_LOC_PAUSE - 0.3,
+              S_LOC_PAUSE + 1.0, held, resumed))
+
+    hdr('S12  只對不上 1.5 秒 (有人走過光達前面) → 一直照走')
+    t0 = time.time()
+    rig.set_match(False, 0.30, '光達只有 30% 落在地圖的牆上 (要 50%)')
+    rig.spin(1.5)
+    rig.set_match(True, 0.84, '對上了：光達 84% 落在地圖的牆上')
+    rig.spin(S_LOC_PAUSE + 1.0)
+    w = rig.since(t0)
+    zeros = sum(1 for _t, x in w if abs(x) < 1e-9)
+    ok = len(w) >= 50 and zeros == 0
+    sub('%.1f 秒內 %d 筆，0 的有 %d 筆' % (2.5 + S_LOC_PAUSE, len(w), zeros))
+    record('S', 'S12', '定位短暫變差 (1.5 秒) 不停', 'PASS' if ok else 'FAIL',
+           '%d 筆裡 %d 筆是 0' % (len(w), zeros))
+
+    hdr('S13  map_session 停了 → 回報中斷 3 秒再等 %.0f 秒 → 停；恢復 → 接著走' % S_LOC_PAUSE)
+    # 回報中斷的 3 秒從最後收到的那一筆算 (1 Hz，最多比停發早 1 秒)，所以延遲也從最後一筆算
+    t0 = time.time()
+    rig.match = None
+    t_last = rig.match_pub_t
+    lat, after_nz, n = rig.stop_after(t0, 3.0 + S_LOC_PAUSE + 2.0)
+    if lat is not None:
+        lat += t0 - t_last
+    sub('定位回報停發：從最後一筆算的歸零延遲 %s (共 %d 筆)'
+        % (('%.3f s' % lat) if lat is not None else '沒有歸零', n))
+    rig.set_match(True, 0.85, '對上了：光達 85% 落在地圖的牆上')
+    resumed, m = rig.steady(1.5, S_NAV_X)
+    sub('定位回報恢復：最後 1 秒 %d 筆全為 %.1f = %s' % (m, S_NAV_X, resumed))
+    ok = lat is not None and 3.0 + S_LOC_PAUSE - 0.3 <= lat <= 3.0 + S_LOC_PAUSE + 1.0 and resumed
+    record('S', 'S13', '定位回報中斷也停、恢復接著走', 'PASS' if ok else 'FAIL',
+           '從最後一筆回報算的歸零延遲 %s (要 %.1f ~ %.1f s)；恢復 %s'
+           % (('%.3f s' % lat) if lat is not None else '沒有歸零', 3.0 + S_LOC_PAUSE - 0.3,
+              3.0 + S_LOC_PAUSE + 1.0, resumed))
+
+
+# --------------------------------------------------------------------------
+# Phase M  手把三種模式 (2026-10-18 will)：LB + X 手動、LB + A 才開始建圖、LB + B 先存圖再規劃。
+# 不需要 Gazebo。mower_manager、slam_scan_gate 是真的；存圖服務 (map_autosave) 與
+# F2C (generate_coverage_path) 由測試扮演，F2C 只計次數、回傳失敗。
+#
+#   M0  launch 預設值：模擬關、實車開；bringup_real 強制開，而且一起開 Nav2
+#   M1  slam_scan_gate：切到建圖 (mode 0) 之前 /scan_slam 一筆都沒有；之後轉送；切回手動照樣轉送
+#   M2  對照組：存圖成功 → 呼叫 F2C (管道是通的，M3 ~ M5 的「沒呼叫」才算數)
+#   M3  存圖失敗 → 不呼叫 F2C、任務 ABORTED、訊息寫存圖失敗
+#   M4  存圖服務沒開 → 不呼叫 F2C、任務 ABORTED
+#   M5  存圖中途切回手動 → 存好之後也不呼叫 F2C
+#   M6  規劃好了先停著 (2026-10-19 will)：沒按住 LB 不送路線給 Nav2 (FollowPath 0 個 goal)，
+#       按住 LB 才送。以前算好就送，放開 LB 等超過 15 s 那一段就被 progress checker 判失敗跳過。
+#   M7  手把 Y = 存圖 (2026-10-19 will)：真的 teleop，手動模式按 Y (沒按 LB) 呼叫存圖服務一次；
+#       自動割草 (mode 1) 按 Y 不呼叫
+#   M8  手把 Y = 存圖 + 預覽路線 (2026-10-19 will)：只算路線、發 /f2c_path，LB 按著也不出發；之後 LB + B 照常割
+#   M9  不用按住 LB (2026-10-19 will，bringup_real 的 auto_requires_deadman:=false)：LB 放開也一規劃好就出發；
+#       手把沒連上時規劃好先等，連上了也等 (斷線過要按一下 LB)，按一下 LB 才出發
+#   M10 割草線方向 auto (2026-10-19 will：順著長邊跑直線)：45° 斜放的 20 x 5 m 長方形，送給 F2C 的邊界
+#       要轉正 (長邊沿 x)，拿回來的路線要轉回 45°、全部在原本的長方形裡、周邊環繞照樣認得出來
+#       (F2C 由測試扮演：跟 f2c_server 一樣沿 x 擺割草線、最後一點 = 第 0 點的周邊環繞)
+# --------------------------------------------------------------------------
+M_FAKE_AUTOSAVE = r"""
+import sys, time, rclpy
+from rclpy.node import Node
+from std_srvs.srv import Trigger
+mode, delay = sys.argv[1], float(sys.argv[2])
+rclpy.init()
+n = Node('map_autosave')
+def cb(_req, resp):
+    print('CALL', flush=True)
+    time.sleep(delay)
+    resp.success = (mode == 'ok')
+    resp.message = '/tmp/smoke_m_map' if resp.success else 'save_map.sh 回傳 1 (測試)'
+    return resp
+n.create_service(Trigger, '~/save', cb)
+rclpy.spin(n)
+"""
+
+
+def m0_launch_defaults():
+    try:
+        _m0_launch_defaults()
+    except Exception as e:
+        record('M', 'M0', 'launch 預設值：模擬關、實車開；bringup_real 強制開、一起開 Nav2', 'FAIL',
+               '%s: %s' % (type(e).__name__, e))
+
+
+def _m0_launch_defaults():
+    from launch import LaunchContext
+    from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction,
+                                SetLaunchConfiguration)
+    from launch.utilities import perform_substitutions
+
+    def txt(c, x):
+        if isinstance(x, str):
+            return x
+        if isinstance(x, (list, tuple)):
+            return perform_substitutions(c, list(x))
+        return x.perform(c)
+
+    def ctx(**cfg):
+        c = LaunchContext()
+        base = dict(use_sim_time='true', auto_requires_deadman='', auto_requires_joystick='',
+                    auto_requires_scan='', swath_angle='',
+                    mapping_on_button='', save_map_before_f2c='', lead_in_length='0.5',
+                    overlap_ratio='0.4')
+        base.update(cfg)
+        for k, v in base.items():
+            c.launch_configurations[k] = v
+        # 其他宣告過的參數用 launch 檔自己的預設值 (跟真的 ros2 launch 一樣；10-21 起有 saved_map 等)
+        for d in declared:
+            if d.name not in c.launch_configurations and d.default_value is not None:
+                c.launch_configurations[d.name] = perform_substitutions(c, d.default_value)
+        return c
+
+    problems = []
+    mc, _ = _load_launch_module('mowerbot_bringup', 'mower_control.launch.py')
+    ld = mc.generate_launch_description()
+    declared = [e for e in ld.entities if isinstance(e, DeclareLaunchArgument)]
+    fns = [e for e in ld.entities if isinstance(e, OpaqueFunction)]
+    # (use_sim_time, mapping_on_button, save_map_before_f2c) -> (閘門 + SLAM 讀 /scan_slam, 存圖節點, manager 先存圖)
+    # 10-19 起 save_map_before_f2c 留空 = false (不跟 use_sim_time)；存圖節點跟著 mapping_on_button (給 Y 存圖)
+    for sim, opt, save, want in (('true', '', '', (False, False, False)),
+                                 ('false', '', '', (True, True, False)),
+                                 ('true', 'true', '', (True, True, False)),
+                                 ('false', 'false', '', (False, False, False)),
+                                 ('true', '', 'true', (False, True, True))):
+        c = ctx(use_sim_time=sim, mapping_on_button=opt, save_map_before_f2c=save)
+        execs, scan_topic, manager_save = [], None, None
+        for fn in fns:
+            for a in fn.execute(c) or []:
+                if isinstance(a, SetLaunchConfiguration):    # resolve_map_session 算好的 session 給後面用
+                    a.execute(c)
+                    continue
+                ex = getattr(a, 'node_executable', None)
+                if ex:
+                    execs.append(ex)
+                if isinstance(a, IncludeLaunchDescription):
+                    for k, v in a.launch_arguments:
+                        if txt(c, k) == 'scan_topic':
+                            scan_topic = txt(c, v)
+                if ex == 'mower_manager':
+                    for pdict in a._Node__parameters:
+                        if isinstance(pdict, dict):
+                            for k, v in pdict.items():
+                                if txt(c, k) == 'save_map_before_f2c':
+                                    manager_save = v
+        gate = 'slam_scan_gate' in execs and scan_topic == '/scan_slam'
+        got = (gate, 'map_autosave' in execs, manager_save is True)
+        sub('mower_control use_sim_time=%s 建圖選項=%r 先存圖選項=%r -> 閘門 %s (SLAM 讀 %s)、存圖節點 %s、'
+            'manager 先存圖 %s' % (sim, opt, save, got[0], scan_topic, got[1], manager_save))
+        if got != want:
+            problems.append('use_sim_time=%s 選項=%r/%r 得到 %s，應為 %s' % (sim, opt, save, got, want))
+    try:
+        mc.resolve_mode_options(ctx(use_sim_time='false', mapping_on_button='yes'))
+        problems.append('mapping_on_button:=yes 沒有被拒絕')
+    except RuntimeError as e:
+        sub('mapping_on_button:=yes 被拒絕：%s' % e)
+    _, real_path = _load_launch_module('mowerbot_bringup', 'bringup_real.launch.py')
+    with open(real_path, encoding='utf-8') as fh:
+        src = fh.read()
+    for k in MODE_KEYS:
+        if not re.search(r"'%s':\s*'true'" % k, src):
+            problems.append('bringup_real.launch.py 沒有把 %s 固定成 true' % k)
+    if re.search(r"'save_map_before_f2c':\s*'true'", src):
+        problems.append('bringup_real.launch.py 還把 save_map_before_f2c 開著 (10-19 起 LB + B 直接規劃)')
+    if not re.search(r"navigation\.launch\.py", src) or 'condition=IfCondition(use_nav)' not in src:
+        problems.append('bringup_real.launch.py 沒有 (依 use_nav) include navigation.launch.py')
+    record('M', 'M0', 'launch 預設值：模擬關、實車開；bringup_real 強制開、一起開 Nav2',
+           'FAIL' if problems else 'PASS', '; '.join(problems))
+
+
+MODE_KEYS = ('mapping_on_button',)
+
+
+class MRig(object):
+    def __init__(self):
+        import rclpy
+        from rclpy.node import Node
+        from rclpy.qos import qos_profile_sensor_data
+        from sensor_msgs.msg import LaserScan
+        from geometry_msgs.msg import PolygonStamped, Point32
+        from mowerbot_interfaces.msg import MissionStatus, JoyStatus
+        from mowerbot_interfaces.srv import SetDriveMode, GenerateCoveragePath
+        from nav2_msgs.action import FollowPath
+        from rclpy.action import ActionServer
+
+        self.manager = bg_start('M_mower_manager',
+                                ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                                 '--ros-args', '-p', 'use_sim_time:=false',
+                                 '-p', 'save_map_before_f2c:=true']
+                                + _manager_geometry_args())
+        self.gate = bg_start('M_slam_scan_gate',
+                             ['ros2', 'run', 'mowerbot_action', 'slam_scan_gate'])
+        self.autosave = None
+        rclpy.init()
+        self.node = Node('smoke_m')
+        self.LaserScan, self.MissionStatus, self.SetDriveMode = LaserScan, MissionStatus, SetDriveMode
+        self.scan_pub = self.node.create_publisher(LaserScan, '/scan', qos_profile_sensor_data)
+        self.slam_scans = 0
+        self.node.create_subscription(LaserScan, '/scan_slam', self._slam_cb,
+                                      qos_profile_sensor_data)
+        self.mission = None
+        self.node.create_subscription(MissionStatus, '/mission_status',
+                                      lambda m: setattr(self, 'mission', m), 10)
+        self.planner_calls = 0
+        self.node.create_service(GenerateCoveragePath, 'generate_coverage_path', self._plan_cb)
+        self.boundary_pub = self.node.create_publisher(PolygonStamped, '/f2c_boundary', 10)
+        poly = PolygonStamped()
+        poly.header.frame_id = 'map'
+        poly.polygon.points = [Point32(x=float(x), y=float(y))
+                               for x, y in ((0, 0), (10, 0), (10, 8), (0, 8))]
+        self.poly = poly
+        self.mode_cli = self.node.create_client(SetDriveMode, 'change_mower_mode')
+        # M6：F2C 回一條路線、假 Nav2 只數 FollowPath goal 的個數 (收到就回成功)
+        self.plan_ok = False
+        self.plan_style = 'line'          # 'f2c' = _plan_f2c_like (M10)
+        self.last_req_xy = []
+        self.last_perimeter_n = 0
+        self.follow_goals = 0
+        self.FollowPath = FollowPath
+        self._follow_srv = ActionServer(self.node, FollowPath, 'follow_path', self._follow_exec,
+                                        goal_callback=self._follow_goal)
+        # None = 不發 /joy_status (M1 ~ M5)；True / False = 手把連著、LB 按住 / 放開
+        self.JoyStatus = JoyStatus
+        self.deadman = None
+        self.joy_pub = self.node.create_publisher(JoyStatus, '/joy_status', 10)
+        self.node.create_timer(0.1, self._tick)
+
+    def _slam_cb(self, _m):
+        self.slam_scans += 1
+
+    def _plan_cb(self, req, resp):
+        self.planner_calls += 1
+        self.last_req_xy = [(p.x, p.y) for p in req.boundary.points]
+        resp.success = False
+        if self.plan_ok and self.plan_style == 'f2c':
+            return self._plan_f2c_like(req, resp)
+        if self.plan_ok:
+            from geometry_msgs.msg import PoseStamped
+            resp.coverage_path.header.frame_id = 'map'
+            for k in range(61):
+                p = PoseStamped()
+                p.header.frame_id = 'map'
+                p.pose.position.x, p.pose.position.y = 2.0 + 0.1 * k, 4.0
+                p.pose.orientation.w = 1.0
+                resp.coverage_path.poses.append(p)
+            resp.success = True
+        return resp
+
+    def _plan_f2c_like(self, req, resp):
+        """跟 f2c_server 一樣：周邊環繞 (最後一點 = 第 0 點) + 沿 x 軸的弓字形割草線 (地頭 headland、間距 0.3)。"""
+        from geometry_msgs.msg import PoseStamped
+        xs = [x for x, _y in self.last_req_xy]
+        ys = [y for _x, y in self.last_req_xy]
+        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        hl, w = GEOM.headland_width, 0.3
+        poses = []
+
+        def pose(x, y, yaw):
+            p = PoseStamped()
+            p.header.frame_id = 'map'
+            p.pose.position.x, p.pose.position.y = x, y
+            p.pose.orientation.z, p.pose.orientation.w = math.sin(yaw / 2), math.cos(yaw / 2)
+            return p
+        m = hl + w / 2
+        corners = [(x0 + m, y0 + m), (x1 - m, y0 + m), (x1 - m, y1 - m), (x0 + m, y1 - m),
+                   (x0 + m, y0 + m)]
+        yaw = 0.0
+        for (ax, ay), (bx, by) in zip(corners[:-1], corners[1:]):
+            n = max(1, int(round(math.hypot(bx - ax, by - ay) / 0.1)))
+            yaw = math.atan2(by - ay, bx - ax)
+            for k in range(n):
+                poses.append(pose(ax + (bx - ax) * k / n, ay + (by - ay) * k / n, yaw))
+        closing = pose(0.0, 0.0, yaw)
+        closing.pose.position = poses[0].pose.position     # 完全相同的 double (f2c_server 的規則)
+        poses.append(closing)
+        self.last_perimeter_n = len(poses)
+        y, rev = y0 + hl + w / 2, False
+        while y < y1 - hl - w / 2 + 1e-9:
+            a, b = (x1 - hl, x0 + hl) if rev else (x0 + hl, x1 - hl)
+            n = int(round(abs(b - a) / 0.1))
+            for k in range(n + 1):
+                poses.append(pose(a + (b - a) * k / n, y, math.pi if rev else 0.0))
+            y += w
+            rev = not rev
+        resp.coverage_path.header.frame_id = 'map'
+        resp.coverage_path.poses = poses
+        resp.success = True
+        return resp
+
+    def _follow_goal(self, _goal):
+        from rclpy.action import GoalResponse
+        self.follow_goals += 1
+        return GoalResponse.ACCEPT
+
+    def _follow_exec(self, handle):
+        handle.succeed()
+        return self.FollowPath.Result()
+
+    def _tick(self):
+        m = self.LaserScan()
+        m.header.stamp = self.node.get_clock().now().to_msg()
+        m.header.frame_id = 'radar'
+        m.angle_min, m.angle_increment = -math.pi, math.pi / 180.0
+        m.angle_max = m.angle_min + 359 * m.angle_increment
+        m.range_min, m.range_max = 0.05, 40.0
+        m.ranges = [5.0] * 360
+        self.scan_pub.publish(m)
+        self.boundary_pub.publish(self.poly)
+        if self.deadman is not None:
+            js = self.JoyStatus()
+            js.header.stamp = m.header.stamp
+            js.connected = True
+            js.deadman_held = bool(self.deadman)
+            self.joy_pub.publish(js)
+
+    def start_autosave(self, mode, delay=0.0):
+        self.stop_autosave()
+        self.autosave = bg_start('M_fake_autosave_%s' % mode,
+                                 ['python3', '-c', M_FAKE_AUTOSAVE, mode, str(delay)])
+        cli = self.node.create_client(__import__('std_srvs.srv', fromlist=['Trigger']).Trigger,
+                                      'map_autosave/save')
+        ok = cli.wait_for_service(timeout_sec=20.0)
+        self.node.destroy_client(cli)
+        # 這裡看到了，manager 不一定已經看到 (它只等 1 s)：多等一下讓 discovery 傳過去
+        self.spin(2.0)
+        return ok
+
+    def stop_autosave(self):
+        if self.autosave is not None:
+            self.autosave.stop()
+            self.autosave = None
+            # 等舊的服務從 ROS graph 消失再往下：不然下一個 start_autosave 會把還沒消失的舊服務
+            # 當成新的已經就緒，manager 卻剛好兩個都看不到 (10-19 M3 偶發「存圖服務沒有開」)
+            t0 = time.time()
+            while time.time() - t0 < 10.0 and any(
+                    n == '/map_autosave/save' for n, _ in self.node.get_service_names_and_types()):
+                self.spin(0.2)
+            self.spin(1.0)
+
+    def spin(self, seconds):
+        import rclpy
+        t0 = time.time()
+        while time.time() - t0 < seconds:
+            rclpy.spin_once(self.node, timeout_sec=0.02)
+
+    def set_mode(self, mode):
+        import rclpy
+        req = self.SetDriveMode.Request()
+        req.mode = mode
+        fut = self.mode_cli.call_async(req)
+        rclpy.spin_until_future_complete(self.node, fut, timeout_sec=10.0)
+        return fut.result().success if fut.done() and fut.result() is not None else None
+
+    def close(self):
+        import rclpy
+        self.stop_autosave()
+        self.node.destroy_node()
+        rclpy.shutdown()
+
+
+def phase_m():
+    hdr('Phase M  手把三種模式 (LB + A 才開始建圖、LB + B 先存圖再規劃；不需要 Gazebo)')
+    m0_launch_defaults()
+    rig = MRig()
+    try:
+        if not rig.mode_cli.wait_for_service(timeout_sec=20.0):
+            print(rig.manager.log_tail(30))
+            for cid, name in (('M1', '建圖開關'), ('M2', '對照組'), ('M3', '存圖失敗'),
+                              ('M4', '存圖服務沒開'), ('M5', '存圖中途切走'), ('M6', '規劃好先停著'),
+                              ('M7', '手把 Y 存圖'), ('M8', '手把 Y 預覽路線'),
+                              ('M9', '不用按住 LB'), ('M10', '割草線方向 auto')):
+                record('M', cid, name, 'FIXTURE', 'mower_manager 沒起來')
+            return
+
+        # ---- M1 建圖開關 ----
+        hdr('M1  切到建圖之前 /scan_slam 沒有資料；mode 0 之後轉送；切回手動照樣轉送')
+        rig.spin(3.0)
+        before = rig.slam_scans
+        sub('change_mode(2) = %s' % rig.set_mode(2))
+        rig.spin(2.0)
+        manual = rig.slam_scans
+        sub('change_mode(0) = %s' % rig.set_mode(0))
+        rig.spin(2.0)
+        mapping = rig.slam_scans
+        sub('change_mode(2) = %s' % rig.set_mode(2))
+        rig.spin(2.0)
+        after = rig.slam_scans
+        sub('/scan_slam 累計：開機 3 s = %d，手動 2 s = %d，建圖 2 s = %d，切回手動 2 s = %d'
+            % (before, manual, mapping, after))
+        for h in rig.gate.log_grep(r'開始建圖', 2):
+            sub('    %s' % h.strip()[:120])
+        ok = before == 0 and manual == 0 and mapping - manual >= 10 and after - mapping >= 10
+        record('M', 'M1', '建圖開關：切到建圖才轉送光達給 SLAM、之後一直轉送',
+               'PASS' if ok else 'FAIL',
+               '%d / %d / %d / %d' % (before, manual, mapping, after))
+
+        # ---- M2 對照組 ----
+        hdr('M2  對照組：存圖成功 → 呼叫 F2C')
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        n0 = rig.planner_calls
+        sub('change_mode(1) = %s' % rig.set_mode(1))
+        rig.spin(8.0)
+        called = rig.planner_calls - n0
+        sub('F2C 被呼叫 %d 次' % called)
+        rig.set_mode(2)
+        control_ok = called == 1
+        record('M', 'M2', '對照組：存圖成功就呼叫 F2C', 'PASS' if control_ok else 'FIXTURE',
+               '' if control_ok else 'F2C 被呼叫 %d 次 (應為 1)，M3 ~ M5 不算數' % called)
+        later = (('M3', '存圖失敗：不規劃、任務中止'), ('M4', '存圖服務沒開：不規劃、任務中止'),
+                 ('M5', '存圖中途切回手動：存好也不規劃'),
+                 ('M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送'),
+                 ('M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫'),
+                 ('M8', '手把 Y 預覽路線：只算路線不出發 (LB 按著也不動)、之後 LB + B 照常割'),
+                 ('M9', '不用按住 LB：一規劃好就出發；手把沒連上先等、連上後按一下 LB 才出發'),
+                 ('M10', '割草線方向 auto：斜放的長方形順著長邊擺割草線'))
+        if not control_ok:
+            for cid, name in later:
+                record('M', cid, name, 'FIXTURE', '管道沒有驗證 (M2 沒過)')
+            return
+
+        def refused(case, mode, delay, then_manual=False):
+            ready = rig.start_autosave(mode, delay) if mode else (rig.stop_autosave() or True)
+            n0 = rig.planner_calls
+            rig.set_mode(1)
+            if then_manual:
+                rig.spin(1.0)
+                rig.set_mode(2)
+            rig.spin(max(6.0, delay + 4.0))
+            ms = rig.mission
+            sub('%s：服務就緒 %s，F2C 呼叫 %d 次，任務 state %s，訊息 %r'
+                % (case, ready, rig.planner_calls - n0, ms.state if ms else None,
+                   ms.message[:80] if ms else None))
+            res = (rig.planner_calls - n0, ms.state if ms else None, ms.message if ms else '')
+            rig.set_mode(2)
+            rig.spin(0.5)
+            return res
+
+        hdr('M3  存圖失敗 → 不規劃')
+        calls, state, msg = refused('存圖失敗', 'fail', 0.0)
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and '存圖失敗' in msg
+        record('M', 'M3', '存圖失敗：不規劃、任務中止', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s' % (calls, state))
+
+        hdr('M4  存圖服務沒開 → 不規劃')
+        calls, state, msg = refused('存圖服務沒開', None, 0.0)
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and '存圖服務' in msg
+        record('M', 'M4', '存圖服務沒開：不規劃、任務中止', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s' % (calls, state))
+
+        hdr('M5  存圖中途 (存圖要 4 s) 切回手動 → 存好也不規劃')
+        calls, state, msg = refused('存圖中途切走', 'ok', 4.0, then_manual=True)
+        stale = rig.manager.log_grep(r'模式已經切換過', 2)
+        for h in stale:
+            sub('    %s' % h.strip()[:120])
+        ok = calls == 0 and state == rig.MissionStatus.STATE_ABORTED and bool(stale)
+        record('M', 'M5', '存圖中途切回手動：存好也不規劃', 'PASS' if ok else 'FAIL',
+               'F2C 呼叫 %d 次、state %s、log %s' % (calls, state, bool(stale)))
+
+        hdr('M6  規劃好了先停著：沒按住 LB 不送路線，按住才送')
+        rig.plan_ok = True
+        # manager 不知道車子在哪裡就不啟動任務：車子放在邊界 (0~10, 0~8) 中間
+        import tf2_ros
+        from geometry_msgs.msg import TransformStamped
+        tf_pub = tf2_ros.StaticTransformBroadcaster(rig.node)
+        t = TransformStamped()
+        t.header.stamp = rig.node.get_clock().now().to_msg()
+        t.header.frame_id, t.child_frame_id = 'map', 'base_footprint'
+        t.transform.translation.x, t.transform.translation.y = 5.0, 4.0
+        t.transform.rotation.w = 1.0
+        tf_pub.sendTransform(t)
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        rig.deadman = False
+        rig.spin(1.0)
+        g0 = rig.follow_goals
+        rig.set_mode(1)
+        t_end = time.time() + 20.0
+        while time.time() < t_end and not (
+                rig.mission and rig.mission.state == rig.MissionStatus.STATE_EXECUTING):
+            rig.spin(0.2)
+        executing = bool(rig.mission and rig.mission.state == rig.MissionStatus.STATE_EXECUTING)
+        rig.spin(5.0)
+        before = rig.follow_goals - g0
+        msg = rig.mission.message if rig.mission else ''
+        sub('LB 放開：任務 EXECUTING = %s，5 s 內 FollowPath goal %d 個，訊息 %r'
+            % (executing, before, msg[:80]))
+        rig.deadman = True
+        rig.spin(3.0)
+        after = rig.follow_goals - g0
+        sub('按住 LB 3 s：FollowPath goal 累計 %d 個' % after)
+        for h in rig.manager.log_grep(r'等按住 LB|按住 LB 了', 3):
+            sub('    %s' % h.strip()[:120])
+        rig.deadman = False
+        rig.set_mode(2)
+        rig.plan_ok = False
+        ok = executing and before == 0 and '按住 LB' in msg and after >= 1
+        record('M', 'M6', '規劃好先停著：沒按住 LB 不送路線給 Nav2、按住才送', 'PASS' if ok else 'FAIL',
+               'LB 放開 goal %d 個、按住後 %d 個' % (before, after))
+
+        hdr('M7  手把 Y = 存圖：手動模式按 Y 存一次，自動割草中按 Y 不存')
+        from sensor_msgs.msg import Joy
+        joy_pub = rig.node.create_publisher(Joy, '/joy', 10)
+
+        def joy_frames(y, n=4):
+            for _ in range(n):
+                m = Joy()
+                m.header.stamp = rig.node.get_clock().now().to_msg()
+                m.axes = [0.0] * 6
+                m.buttons = [0] * 11
+                m.buttons[3] = 1 if y else 0
+                joy_pub.publish(m)
+                rig.spin(0.05)
+
+        def press_y():
+            joy_frames(False)
+            joy_frames(True)
+            joy_frames(False)
+
+        def calls():
+            return len(rig.autosave.log_grep(r'^CALL', 1000))
+
+        sub('假存圖服務 (成功) 就緒 = %s' % rig.start_autosave('ok'))
+        teleop = bg_start('M_teleop', ['ros2', 'run', 'mowerbot_bridge', 'teleop_node'])
+        rig.spin(4.0)
+        rig.set_mode(2)
+        rig.spin(1.0)
+        n0 = calls()
+        press_y()
+        rig.spin(2.0)
+        manual = calls() - n0
+        rig.set_mode(1)
+        rig.spin(8.0)              # mower_manager 自己 (save_map_before_f2c) 也會呼叫一次，先等它結束
+        n1 = calls()
+        press_y()
+        rig.spin(2.0)
+        auto = calls() - n1
+        rig.set_mode(2)
+        refused = teleop.log_grep(r'自動割草中不存圖', 2)
+        sub('手動模式按 Y (沒按 LB)：存圖服務被呼叫 %d 次' % manual)
+        sub('自動割草 (mode 1) 按 Y：存圖服務被呼叫 %d 次；teleop log %s' % (auto, bool(refused)))
+        ok = manual == 1 and auto == 0 and bool(refused)
+        record('M', 'M7', '手把 Y 存圖：手動模式呼叫存圖、自動割草中不呼叫', 'PASS' if ok else 'FAIL',
+               '手動 %d 次、自動割草 %d 次' % (manual, auto))
+
+        hdr('M8  手把 Y = 存圖 + 預覽路線：只算路線、發 /f2c_path，LB 按著車子也不動；之後 LB + B 照常割')
+        from nav_msgs.msg import Path
+        paths = []
+        rig.node.create_subscription(Path, '/f2c_path', paths.append, 10)
+        rig.plan_ok = True
+        rig.spin(1.0)
+        n0, g0, p0, c0 = rig.planner_calls, rig.follow_goals, len(paths), calls()
+        press_y()
+        rig.spin(3.0)
+        # 換成「LB 一直按著」：teleop 關掉，改由 rig 發 /joy_status (兩邊一起發會互相蓋掉)
+        teleop.stop()
+        rig.deadman = True
+        rig.spin(5.0)
+        ms = rig.mission
+        msg = ms.message if ms else ''
+        plans, goals, got_path, saves = (rig.planner_calls - n0, rig.follow_goals - g0,
+                                         len(paths) - p0, calls() - c0)
+        sub('手動模式按 Y：F2C 呼叫 %d 次、/f2c_path %d 則、存圖 %d 次；之後 LB 按住 5 s：'
+            'FollowPath goal %d 個，任務 state %s，訊息 %r'
+            % (plans, got_path, saves, goals, ms.state if ms else None, msg[:80]))
+        preview_ok = (plans == 1 and got_path >= 1 and saves == 1 and goals == 0
+                      and ms is not None and ms.state == rig.MissionStatus.STATE_IDLE
+                      and '路線預覽' in msg)
+        rig.set_mode(1)
+        t_end = time.time() + 15.0
+        while time.time() < t_end and rig.follow_goals - g0 < 1:
+            rig.spin(0.2)
+        mow = rig.follow_goals - g0
+        sub('預覽完 LB + B (LB 按著)：FollowPath goal %d 個' % mow)
+        rig.deadman = False
+        rig.set_mode(2)
+        rig.plan_ok = False
+        ok = preview_ok and mow >= 1
+        record('M', 'M8', '手把 Y 預覽路線：只算路線不出發 (LB 按著也不動)、之後 LB + B 照常割',
+               'PASS' if ok else 'FAIL',
+               'F2C %d 次、路線 %d 則、存圖 %d 次、預覽時 goal %d 個、LB + B 後 %d 個'
+               % (plans, got_path, saves, goals, mow))
+        m9_m10(rig, paths)
+    finally:
+        rig.close()
+
+
+def m9_m10(rig, paths):
+    import rclpy
+    from std_srvs.srv import Trigger
+    hdr('M9  不用按住 LB (auto_requires_deadman:=false)：一規劃好就出發；手把沒連上先等，連上後按一下 LB 才出發')
+    # 換成 bringup_real 的設定 (不用按住 LB、割草線方向 auto)，M10 也用這一個
+    rig.manager.stop()
+    rig.spin(2.0)
+    rig.manager = bg_start('M_mower_manager_nohold',
+                           ['ros2', 'run', 'mowerbot_action', 'mower_manager',
+                            '--ros-args', '-p', 'use_sim_time:=false',
+                            '-p', 'auto_requires_deadman:=false',
+                            '-p', 'swath_angle:=auto',
+                            '-p', 'headland_width:=%r' % GEOM.headland_width]
+                           + _manager_geometry_args())
+    rig.deadman = False
+    up = False
+    t_end = time.time() + 20.0
+    while time.time() < t_end and not up:
+        rig.spin(1.0)
+        up = bool(rig.manager.log_grep(r'自動模式放行條件', 1)) and rig.set_mode(2) is True
+    sub('新的 mower_manager 起來 = %s' % up)
+    for h in rig.manager.log_grep(r'自動模式放行條件|割草線方向', 2):
+        sub('    %s' % h.strip()[:160])
+
+    def wait_goals(g0, seconds):
+        t_end = time.time() + seconds
+        while time.time() < t_end and rig.follow_goals - g0 < 1:
+            rig.spin(0.2)
+        return rig.follow_goals - g0
+
+    rig.plan_ok = True
+    rig.spin(1.0)
+    g0 = rig.follow_goals
+    rig.set_mode(1)
+    alone = wait_goals(g0, 15.0)
+    sub('手把連著、LB 放開，LB + B (change_mode 1)：FollowPath goal %d 個' % alone)
+    rig.set_mode(2)
+    rig.deadman = None              # 不發 /joy_status = 手把沒連上
+    rig.spin(1.5)
+    g1 = rig.follow_goals
+    rig.set_mode(1)
+    t_end = time.time() + 15.0
+    while time.time() < t_end and not (
+            rig.mission and rig.mission.state == rig.MissionStatus.STATE_EXECUTING):
+        rig.spin(0.2)
+    rig.spin(3.0)
+    no_joy = rig.follow_goals - g1
+    msg = rig.mission.message if rig.mission else ''
+    sub('手把沒連上：3 s 內 goal %d 個，訊息 %r' % (no_joy, msg[:80]))
+    rig.deadman = False
+    rig.spin(3.0)
+    reconnected = rig.follow_goals - g1
+    sub('手把連上 (LB 沒按) 3 s：goal %d 個' % reconnected)
+    rig.deadman = True
+    rig.spin(0.5)
+    rig.deadman = False
+    tapped = wait_goals(g1, 5.0)
+    sub('按一下 LB：goal %d 個' % tapped)
+    for h in rig.manager.log_grep(r'等放行條件|放行條件成立', 4):
+        sub('    %s' % h.strip()[:160])
+    rig.set_mode(2)
+    ok = up and alone >= 1 and no_joy == 0 and '還不能出發' in msg and reconnected == 0 and tapped >= 1
+    record('M', 'M9', '不用按住 LB：一規劃好就出發；手把沒連上先等、連上後按一下 LB 才出發',
+           'PASS' if ok else 'FAIL',
+           '手把連著 %d 個；沒連上 %d 個；連上 %d 個；按 LB 後 %d 個' % (alone, no_joy, reconnected, tapped))
+
+    hdr('M10  割草線方向 auto：45° 斜放的 20 x 5 m 長方形 → 給 F2C 的邊界轉正、路線轉回 45°')
+    from geometry_msgs.msg import Point32
+    ang = math.radians(45.0)
+    cx, cy = 5.0, 4.0              # M6 的 TF 把車子放在 (5, 4)
+    rect = [(-10.0, -2.5), (10.0, -2.5), (10.0, 2.5), (-10.0, 2.5)]
+    rig.poly.polygon.points = [
+        Point32(x=cx + math.cos(ang) * u - math.sin(ang) * v,
+                y=cy + math.sin(ang) * u + math.cos(ang) * v) for u, v in rect]
+    rig.plan_style = 'f2c'
+    rig.spin(1.5)
+    cli = rig.node.create_client(Trigger, 'mower_manager/preview')
+    p0 = len(paths)
+    called = cli.wait_for_service(timeout_sec=10.0)
+    if called:
+        fut = cli.call_async(Trigger.Request())
+        rclpy.spin_until_future_complete(rig.node, fut, timeout_sec=10.0)
+    t_end = time.time() + 15.0
+    while time.time() < t_end and not (len(paths) > p0 and rig.mission
+                                        and '路線預覽' in rig.mission.message):
+        rig.spin(0.2)
+    msg = rig.mission.message if rig.mission else ''
+    sub('預覽訊息 %r' % msg[:100])
+    for h in rig.manager.log_grep(r'🧭', 2):
+        sub('    %s' % h.strip()[:160])
+    problems = []
+    if not rig.last_req_xy:
+        problems.append('F2C 沒有被呼叫')
+    else:
+        xs = [x for x, _y in rig.last_req_xy]
+        ys = [y for _x, y in rig.last_req_xy]
+        ex, ey = max(xs) - min(xs), max(ys) - min(ys)
+        sub('送給 F2C 的邊界：x 方向 %.3f m、y 方向 %.3f m' % (ex, ey))
+        if abs(ex - 20.0) > 0.05 or abs(ey - 5.0) > 0.05:
+            problems.append('邊界沒有轉正 (x %.2f、y %.2f，應為 20 x 5)' % (ex, ey))
+    if len(paths) <= p0:
+        problems.append('沒有收到 /f2c_path')
+    else:
+        poses = paths[-1].poses
+        worst = -float('inf')
+        yaw_err = 0.0
+        for i, ps in enumerate(poses):
+            dx, dy = ps.pose.position.x - cx, ps.pose.position.y - cy
+            u = math.cos(ang) * dx + math.sin(ang) * dy
+            v = -math.sin(ang) * dx + math.cos(ang) * dy
+            worst = max(worst, abs(u) - 10.0, abs(v) - 2.5)
+            if i >= rig.last_perimeter_n:
+                q = ps.pose.orientation
+                yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+                d = (yaw - ang) % math.pi
+                yaw_err = max(yaw_err, min(d, math.pi - d))
+        sub('/f2c_path %d 個航點：超出原本長方形最多 %.3f m；割草線朝向離 45° 最多 %.2f°'
+            % (len(poses), worst, math.degrees(yaw_err)))
+        if worst > -1.0:
+            problems.append('路線離長方形邊緣不到地頭寬 (%.2f m)' % worst)
+        if math.degrees(yaw_err) > 0.5:
+            problems.append('割草線沒有轉回 45° (差 %.2f°)' % math.degrees(yaw_err))
+    if '方向 45°' not in msg:
+        problems.append('預覽訊息沒有寫方向 45°')
+    if '周邊環繞' not in msg:
+        problems.append('轉回來之後認不出周邊環繞 (最後一點 = 第 0 點)')
+    rig.plan_ok = False
+    rig.plan_style = 'line'
+    record('M', 'M10', '割草線方向 auto：斜放的長方形順著長邊擺割草線',
+           'FAIL' if problems else 'PASS', '; '.join(problems))
+
+
 def summary():
     hdr('總結報告')
     # 輸出蓋章 (階段 38)：vehicle.yaml 還有暫定值時，摘要第一行標出來、摘要檔名加 _PROVISIONAL。
@@ -5626,10 +7306,10 @@ def summary():
 
 
 def main():
-    phases = 'ABCDHRLNOPQ'
+    phases = 'ABCDHRLNOPQSM'
     for arg in sys.argv[1:]:
         if arg.startswith('--phases'):
-            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHRLNOPQ'
+            phases = arg.split('=', 1)[1] if '=' in arg else 'ABCDHRLNOPQSM'
         elif arg.startswith(('--lead-in', '--overlap', '--world')):
             pass          # 已在模組載入時解析成 LEAD_IN / OVERLAP / WORLD
         elif arg in ('-h', '--help'):
@@ -5682,6 +7362,18 @@ def main():
                 bg_stop_all()
             try:
                 b4_obstacle_extraction()
+            finally:
+                bg_stop_all()
+            try:
+                b8_lawn_boundary()
+            finally:
+                bg_stop_all()
+            try:
+                b9_keepout()
+            finally:
+                bg_stop_all()
+            try:
+                b10_robot_region()
             finally:
                 bg_stop_all()
             b5_perimeter_effective_length()
@@ -5747,6 +7439,18 @@ def main():
             finally:
                 bg_stop_all()
                 sweep()
+
+        if 'S' in phases:
+            try:
+                phase_s()
+            finally:
+                bg_stop_all()
+
+        if 'M' in phases:
+            try:
+                phase_m()
+            finally:
+                bg_stop_all()
     except KeyboardInterrupt:
         print('\n[中斷] 使用者按下 Ctrl-C，正在收拾背景行程...')
     finally:

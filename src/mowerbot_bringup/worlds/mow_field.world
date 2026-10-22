@@ -16,6 +16,8 @@
       <max_step_size>0.001</max_step_size>
       <real_time_factor>1.0</real_time_factor>
       <real_time_update_rate>1000</real_time_update_rate>
+      <!-- ODE 求解器疊代次數：預設 50 時零指令 45 s 會自己滑 0.433 m，200 剩 0.015 m (2026-10-05 新電腦實測) -->
+      <ode><solver><iters>200</iters></solver></ode>
     </physics>
 
     <!--

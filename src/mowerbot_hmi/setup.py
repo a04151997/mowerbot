@@ -10,12 +10,14 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        # 網頁人機介面的畫面 (web.py 讀這一份)
+        ('share/' + package_name + '/web', ['web/index.html', 'web/lichtblick_layout.json']),
     ],
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='a',
     maintainer_email='a0987747836@gmail.com',
-    description='mowerbot 的人機介面 (HMI)：模式切換與系統狀態顯示',
+    description='mowerbot 的人機介面 (HMI)：模擬用的 PyQt 視窗 (hmi_node) 與實車用的網頁 (web)',
     license='TODO: License declaration',
     extras_require={
         'test': ['pytest'],
@@ -23,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'hmi_node = mowerbot_hmi.hmi_node:main',
+            'web = mowerbot_hmi.web:main',
         ],
     },
 )

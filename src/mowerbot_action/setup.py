@@ -23,6 +23,12 @@ setup(
             # 關鍵點：'執行檔名稱 = 套件名.檔名:函數名'
             'mower_manager = mowerbot_action.manager:main',
             'map_to_boundary = mowerbot_action.map_to_boundary:main',
+            'boundary_recorder = mowerbot_action.boundary_recorder:main',
+            'keepout_server = mowerbot_action.keepout_server:main',
+            'keepout_tool = mowerbot_action.keepout_tool:main',
+            'slam_scan_gate = mowerbot_action.slam_scan_gate:main',
+            'map_autosave = mowerbot_action.map_autosave:main',
+            'map_session = mowerbot_action.map_session:main',
         ],
     },
 )

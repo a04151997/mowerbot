@@ -4,6 +4,7 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, GroupAction, OpaqueFunction,
                             IncludeLaunchDescription, LogInfo, RegisterEventHandler)
+from launch.conditions import IfCondition
 from launch.event_handlers import OnProcessExit
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -30,9 +31,7 @@ def generate_launch_description():
       3. use_sim_time 預設 false，start_rsp 預設 true
          (模擬時 robot_state_publisher 是 gazebo.launch.py 起的，實車沒有那一支)。
 
-    【還沒有接雷達】實體雷達的驅動節點在下面留了註解佔位。
-    不先填是因為現在還不知道會用哪一顆雷達，猜一個套件名稱寫進去，
-    之後只會變成「看起來已經處理好、實際上是錯的」。
+    雷達是 Slamtec RPLIDAR S3 (2026-10-07 確認，見下面「2. 實體雷達」)。
     """
     pkg_bringup = get_package_share_directory('mowerbot_bringup')
 
@@ -44,8 +43,15 @@ def generate_launch_description():
     driver_type = LaunchConfiguration('driver_type')
     serial_port = LaunchConfiguration('serial_port')
     max_vel_scale = LaunchConfiguration('max_vel_scale')
+    speed_scale = LaunchConfiguration('speed_scale', default='1.0')
+    edge_loops = LaunchConfiguration('edge_loops', default='1.10,0.75')
+    saved_map = LaunchConfiguration('saved_map', default='')
+    map_start_pose = LaunchConfiguration('map_start_pose', default='')
     allow_provisional = LaunchConfiguration('allow_provisional')
     override_reason = LaunchConfiguration('provisional_override_reason')
+    use_lidar = LaunchConfiguration('use_lidar')
+    use_nav = LaunchConfiguration('use_nav')
+    lidar_port = LaunchConfiguration('lidar_port')
 
     # ---- 0. 幾何閘門 (階段 38) -------------------------------------------
     # 整個 launch 的第一個節點。vehicle.yaml 還有 provisional 值而 allow_provisional=false
@@ -109,28 +115,36 @@ def generate_launch_description():
         }]
     )
 
-    # ---- 2. 實體雷達 (待填) ---------------------------------------------
-    # TODO: 型號待現場跑 deploy/hw_probe.sh 確認（第 3 節 VID:PID、第 4 節原始位元組）。
-    # 拿到雷達之後在這裡啟動它的驅動節點。需要先確認的事:
-    #   - 雷達型號與對應的 ROS 2 套件
-    #   - 裝置路徑固定成 /dev/mowerbot_lidar (在 deploy/99-mowerbot.rules 加一行)，
-    #     不要用 /dev/ttyUSB0
-    #   - 鮑率
-    #   - frame_id 必須是 "radar" (car.xacro 裡雷達的 link 名稱)，
-    #     否則 TF 對不起來、scan matching 會拿到錯的外參
-    #   - 掃描頻率與角解析度，要與 mapper_params.yaml 的設定相容
-    # lidar_node = Node(
-    #     package='<雷達套件>',
-    #     executable='<驅動節點>',
-    #     name='lidar',
-    #     output='screen',
-    #     parameters=[{
-    #         'use_sim_time': use_sim_time,
-    #         'frame_id': 'radar',
-    #         'serial_port': '/dev/mowerbot_lidar',
-    #         'serial_baudrate': 0,
-    #     }]
-    # )
+    # ---- 2. 實體雷達：Slamtec RPLIDAR S3 (2026-10-07 確認) -------------
+    # 型號來源：學長 ROS 1 的 mapping.launch / navigation.launch 載入 rplidar_ros 的
+    # rplidar_s3.launch。光達底部原廠貼紙被財產標籤蓋住，接上後看驅動啟動時印出的
+    # 型號與韌體版本再確認一次。
+    # 驅動：apt 的 ros-humble-rplidar-ros (Slamtec 官方 ros2 分支，2.1.4 有 S3)。
+    # 參數照學長的 rplidar_s3.launch：1 Mbps、每秒 10 圈、angle_compensate 開。
+    #   - frame_id 必須是 "radar" (car_radar.xacro 裡雷達的 link 名稱)，
+    #     不能用驅動預設的 laser_frame，否則 TF 對不起來、scan matching 會拿到錯的外參
+    #   - scan_mode 留空 = 用光達自己的典型模式 (學長的設定也沒有指定)
+    #   - 裝置路徑固定成 /dev/mowerbot_lidar (deploy/99-mowerbot.rules，比對轉接板序號)；
+    #     規則還沒裝的機器用 lidar_port:=/dev/ttyUSB0
+    #   - 供電：S3 啟動瞬間約 1.2 A，轉接板的 DC 孔接車上 5.1 V 降壓模組
+    #   - 0° 方向、安裝位置 (lidar_x / lidar_z_ground) 照 docs/hardware_bringup.md 的 M5 確認
+    lidar_node = Node(
+        package='rplidar_ros',
+        executable='rplidar_node',
+        name='lidar',
+        output='screen',
+        condition=IfCondition(use_lidar),
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'channel_type': 'serial',
+            'serial_port': lidar_port,
+            'serial_baudrate': 1000000,
+            'frame_id': 'radar',
+            'inverted': False,
+            'angle_compensate': True,
+            'scan_frequency': 10.0,
+        }]
+    )
 
     # ---- 3. 其餘節點照舊 -------------------------------------------------
     # SLAM / teleop / manager / map_to_boundary / f2c_server 與模擬時完全相同，
@@ -144,9 +158,38 @@ def generate_launch_description():
                 'use_sim_time': use_sim_time,
                 # 實車沒有 gazebo.launch.py 幫忙起 robot_state_publisher
                 'start_rsp': 'true',
+                # 自動模式的放行條件 (2026-10-15 will 決定)：實車一律開，不開放從命令列關掉。
+                # 手把斷線、光達中斷，mower_manager 都送零速度 (說明見 manager.py)。
+                # 2026-10-19 will：LB + B 之後車子自己跑，不用一直按住 LB —— 按住 LB (deadman) 改成
+                # 「手把連著」(joystick)。手把斷線過要重新連上再按一下 LB 才繼續；RB 急停、LB + X 回手動照舊。
+                'auto_requires_deadman': 'false',
+                'auto_requires_joystick': 'true',
+                'auto_requires_scan': 'true',
+                # 割草線方向 (2026-10-19 will：順著長邊跑直線)：每次規劃挑掉頭最少的方向
+                'swath_angle': 'auto',
+                # 手把模式 (2026-10-18)：LB + A 才開始建圖。10-19 will：LB + B 直接規劃割草
+                # (不再先存圖)，存圖改按 Y
+                'mapping_on_button': 'true',
+                'save_map_before_f2c': 'false',
+                'speed_scale': speed_scale,
+                # 沿邊多繞兩圈 (2026-10-21 will 同意)：離邊界 1.10 m、0.75 m，地頭裡以前不割的那一圈
+                'edge_loops': edge_loops,
+                # 用存好的地圖開機 (2026-10-21 will)：car-start map 傳進來，空 = 建新地圖
+                'saved_map': saved_map,
+                'map_start_pose': map_start_pose,
             }.items()
         )
     ])
+
+    # Nav2 (controller_server + 光達停止區) 也一起開，LB + B 規劃完才走得動 (2026-10-18)。
+    # 以前要另外開 navigation.launch.py (hardware_bringup.md 7-3)，沒開的話 LB + B 只會規劃、
+    # 車子不會走 —— use_nav:=false 保留這個用法 (car-start planonly)。
+    # Nav2 的速度指令一律經過 collision_monitor 與 mower_manager，只有 mode 1 而且手把連著才會到底盤。
+    navigation = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(pkg_bringup, 'launch', 'navigation.launch.py')),
+        launch_arguments={'use_sim_time': use_sim_time, 'speed_scale': speed_scale}.items(),
+        condition=IfCondition(use_nav))
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -180,13 +223,34 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'max_vel_scale',
             default_value='1.0',
-            description='/cmd_vel 的等比例縮放 (乘在 linear.x 與 angular.z 上)。'
-                        '實機階段 2 用 0.2 之類的值。急停永遠是零。'),
+            description='/cmd_vel 的等比例縮放 (乘在 linear.x 與 angular.z 上)。急停永遠是零。'
+                        '2026-10-20 起 car-start 不用它 (用 speed_scale)：在這裡縮放 Nav2 不知道，'
+                        '快轉到位的減速又被乘一次，慢速時原地對正轉不完。'),
+
+        DeclareLaunchArgument(
+            'speed_scale',
+            default_value='1.0',
+            description='速度上限比例 (0.05 ~ 1.0，2026-10-20 D1)：手把 (joystick.yaml 的 scale) 和 '
+                        'Nav2 (FollowPath 的 max_vel_x / max_speed_xy / max_vel_theta) 各自乘上它，'
+                        'bridge 不縮放。car-start 的速度上限就是這個。'),
+        DeclareLaunchArgument(
+            'saved_map',
+            default_value='',
+            description='用存好的地圖開機 (2026-10-21)：save_map.sh 存的地圖，完整路徑、不含副檔名。'
+                        '空 = 建新地圖。car-start map 會挑最新的一張傳進來。'),
+        DeclareLaunchArgument(
+            'map_start_pose',
+            default_value='',
+            description='用存好的地圖時車子在地圖上的哪裡 "x,y,朝向(度)"。空 = 上次關機前記下的位置。'),
+        DeclareLaunchArgument(
+            'edge_loops',
+            default_value='1.10,0.75',
+            description='沿邊多繞幾圈 (2026-10-21 will 同意)：離邊界幾公尺各繞一圈，逗號分開；空 = 不繞。'),
 
         LogInfo(msg=['[bringup_real] 啟動實車節點 (driver_type=', driver_type,
                      ', encoder_ticks_per_rev=', ticks_per_rev,
                      ', serial_port=', serial_port,
-                     ', max_vel_scale=', max_vel_scale, ')']),
+                     ', max_vel_scale=', max_vel_scale, ', speed_scale=', speed_scale, ')']),
         DeclareLaunchArgument(
             'allow_provisional',
             default_value='false',
@@ -198,15 +262,36 @@ def generate_launch_description():
             default_value='',
             description='allow_provisional:=false 但仍要強制通行時的理由 (非空字串，寫進 log)。'),
 
-        LogInfo(msg='[bringup_real] 注意：雷達驅動尚未填入，SLAM 不會收到 /scan。'),
+        DeclareLaunchArgument(
+            'use_lidar',
+            default_value='true',
+            description='是否啟動 RPLIDAR S3 驅動。沒接光達、只測底盤時設 false '
+                        '(SLAM 就不會收到 /scan)。'),
+
+        DeclareLaunchArgument(
+            'lidar_port',
+            default_value='/dev/mowerbot_lidar',
+            description='光達轉接板的序列埠。udev 規則寫好之前用 /dev/ttyUSB0。'),
+
+        LogInfo(msg=['[bringup_real] 光達 RPLIDAR S3：use_lidar=', use_lidar,
+                     ', lidar_port=', lidar_port]),
+
+        DeclareLaunchArgument(
+            'use_nav',
+            default_value='true',
+            description='是否一起啟動 Nav2 (navigation.launch.py)。false = 按 LB + B 只規劃路線、'
+                        '車子不會走 (只看規劃)。'),
+
+        LogInfo(msg=['[bringup_real] Nav2：use_nav=', use_nav]),
 
         geometry_guard,
         RegisterEventHandler(OnProcessExit(
             target_action=geometry_guard,
             on_exit=lambda event, _ctx: (
                 [bridge_node,
-                 # lidar_node,          # TODO: 見上面的說明
-                 mower_control]
+                 lidar_node,
+                 mower_control,
+                 navigation]
                 if event.returncode == 0 else
                 [OpaqueFunction(function=_geometry_gate_failed)]))),
     ])

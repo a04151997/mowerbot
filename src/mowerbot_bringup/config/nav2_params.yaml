@@ -24,9 +24,13 @@ controller_server:
     controller_plugins: ["FollowPath", "AlignController"]
 
     # 割草機速度慢，進度檢查的時間給寬一點，避免正常慢速前進被誤判成卡住
+    # 2026-10-20 will 同意 (D1)：SimpleProgressChecker 只看平移，原地對正一律要 15 s 內轉完，
+    # 慢速時 180° 很容易超過。PoseProgressChecker 轉了 required_movement_angle 也算在動；
+    # 真的卡住 (位置、角度都不動，包括停止區 / 手把斷線的暫停) 照樣 15 s 判失敗。
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.5
+      required_movement_angle: 0.5
       movement_time_allowance: 15.0
 
     # 覆蓋作業不在意最終朝向，yaw 容忍放寬
@@ -187,7 +191,24 @@ local_costmap:
       # costmap 從它自動算出內接半徑 0.155 (inflation 的 inscribed 帶) 與外接半徑 1.06。
       # 不要改用 robot_radius。
 
-      plugins: ["obstacle_layer", "inflation_layer"]
+      # keepout_layer (2026-10-18)：使用者在地圖上用紅色畫的禁區 (keepout_server 發布的
+      # /keepout_mask，map 座標系)。光達看不到的玻璃、坑洞，Nav2 也當成牆 —— 主要是擋
+      # approach 那種直線路徑。排在第一個：obstacle_layer 取最大值疊上去，inflation_layer
+      # 也會把禁區膨脹，跟真的牆一樣。沒畫禁區時 keepout_server 發的是 1 x 1、值 0 的遮罩，
+      # 等於沒有這一層 (放在 odom 座標系：實車按 LB + A 之前沒有 map，見 keepout_server.py)。
+      # 不用 Nav2 的 KeepoutFilter：Humble 的 filter 不會擴大更新範圍，遮罩只在其他圖層
+      # 剛好更新到的格子裡生效。實測 (只有 inflation_layer 時) 開機後才載入的禁區一格都沒標上。
+      # 推論 (沒有實測)：戶外光達前方沒東西、obstacle_layer 的更新範圍很小時也會這樣。
+      # StaticLayer 在 rolling window 下每次都更新整個視窗，而且會把 map 座標系的遮罩換算到
+      # odom (實測 map->odom 旋轉 0.5 rad 時位置完全吻合)。
+      plugins: ["keepout_layer", "obstacle_layer", "inflation_layer"]
+
+      keepout_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /keepout_mask
+        map_subscribe_transient_local: true
+        subscribe_to_updates: false
+        transform_tolerance: 0.5
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"

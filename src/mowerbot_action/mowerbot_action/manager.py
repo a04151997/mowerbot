@@ -1,22 +1,34 @@
 #!/usr/bin/env python3
+import copy
+import json
 import math
+import time
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
 import tf2_ros
 from action_msgs.msg import GoalStatus
 from rclpy.duration import Duration
 from rclpy.time import Time
-from geometry_msgs.msg import PolygonStamped, PoseStamped
+from geometry_msgs.msg import Point32, Polygon, PolygonStamped, PoseStamped
 from nav_msgs.msg import OccupancyGrid
 from nav_msgs.msg import Path
 from mowerbot_interfaces.srv import GenerateCoveragePath
-from mowerbot_interfaces.msg import ObstaclePolygons, MowerStatus, MissionStatus
+from mowerbot_interfaces.msg import ObstaclePolygons, MowerStatus, MissionStatus, JoyStatus
 from rclpy.action import ActionClient
-from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy
+from rclpy.qos import QoSProfile, QoSDurabilityPolicy, QoSReliabilityPolicy, qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
 from nav2_msgs.action import FollowPath
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from geometry_msgs.msg import Twist
 from mowerbot_interfaces.srv import SetDriveMode
+from std_msgs.msg import Bool, String
+from std_srvs.srv import Trigger
+from rcl_interfaces.msg import ParameterDescriptor
+from mowerbot_action import mission_time
+from mowerbot_action import route_plan
+from mowerbot_action import swath_angle
 
 # ---- 跨檔共用的預設值：單一來源 (階段 38 修正 3 原則 7) ----
 # 以前 launch 檔、HMI、smoke_test 各寫一份並註明「要一致」；現在它們都 import 這裡。
@@ -26,6 +38,17 @@ DEFAULT_OVERLAP_RATIO = 0.4
 DEFAULT_MIN_BOUNDARY_AREA = 4.0
 # 航點間距：割草線、周邊環繞 (f2c_server 由 launch 傳入)、approach、跑道共用
 WAYPOINT_SPACING = 0.1
+# 存地圖最多多久 (map_autosave 的 timeout 120 s 再加餘裕)：/map_autosave/busy 一直是 true 超過這個時間，
+# 當成 map_autosave 存到一半掛掉，不再等它
+MAP_SAVE_MAX = 150.0
+# F2C 規劃多久沒回來就算失敗 (正常 1 秒內)
+F2C_TIMEOUT = 20.0
+# 「任務中止」訊息裡每一種失敗的白話說明 (原始的 status 名稱留在 log)
+FAIL_TEXT = {
+    'ALIGN_TIMEOUT': '原地轉卡住（15 秒轉不到 30°）',
+    'ABORTED': '導航判失敗 (卡住或被擋)',
+    'CANCELED': '被取消',
+}
 
 
 def perimeter_corner_cuts(xy, window, angle):
@@ -83,6 +106,18 @@ class MowerManager(Node):
         # 發布者：將 F2C 算出的全局路徑發布給 RViz2 顯示
         qos_profile = QoSProfile(depth=10, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.path_pub = self.create_publisher(Path, '/f2c_path', qos_profile)
+        # 沿邊多繞幾圈的路線 (2026-10-21) 另外發一個話題：/f2c_path 的內容維持「環繞 + 割草線」
+        # (smoke M10 用它檢查割草線的方向與地頭)，網頁和 Lichtblick 另外畫這一條。沒有沿邊時發空的。
+        self.edge_path_pub = self.create_publisher(Path, '/edge_path', qos_profile)
+        # 割草要多久 (2026-10-21 will 要的)：規劃好時每一段的幾何 (mission_time.plan_geometry) 與現在走到
+        # 第幾段，網頁照當下的速度上限換算成分鐘 (速度改了跟著變)。latched：網頁晚開也拿得到。
+        self.plan_pub = self.create_publisher(
+            String, '/mission_plan',
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=QoSReliabilityPolicy.RELIABLE))
+        self._plan = None           # 最後發出去的那一份 (dict)
+        self._plan_ids = {}         # 割草的佇列裡原本那幾段：id(Path) -> 第幾段 (執行中插的轉場不在裡面)
+        self._plan_paths = []       # 留著那幾個 Path，id 才不會被之後新建的 Path 重複用到
         self.current_mode = 2
         # 保存 Nav2 FollowPath 的 goal handle，急停時用來取消任務
         self._goal_handle = None
@@ -96,6 +131,7 @@ class MowerManager(Node):
         self._swath_total = 0           # 割草線總數 (不含 approach)
         # 失敗處理的狀態 (詳見 follow_path_result_callback 的說明)
         self._consecutive_failures = 0  # 連續失敗次數，任一段成功就歸零
+        self._fail_streak = []          # 連續失敗的那幾段 [(label, (x, y) 或 None, 原因)]，跟上面一起歸零
         self._skipped = []              # [(label, (x, y) 或 None, 失敗原因)]
         self._succeeded = 0             # 成功完成的段數 (含 approach / 環繞)
         # 【安全關鍵】「這次的結束是我們主動取消的」旗標。
@@ -205,6 +241,36 @@ class MowerManager(Node):
                 f'割草線間距 {self.swath_spacing:.3f} m —— 相鄰割草線之間永遠不會插入 approach，'
                 f'每一條割草線都會帶著約 {self.swath_spacing:.2f} m 的側向差起步')
 
+        # ---- 割草線方向 (2026-10-19 will：割草線要順著長邊跑直線、到底再掉頭) ----
+        # f2c_server 固定沿 map 的 x 軸擺割草線；這裡先把邊界轉一個角度再交給它，路線拿回來再轉回去，
+        # 原理與挑法見 swath_angle.py。
+        #   swath_angle     'auto' = 每次規劃挑掉頭最少的方向；數字 = 固定角度 (度，從 map 的 x 軸逆時針量)。
+        #                   節點預設 '0' (= 以前的行為，不轉)；mower_control.launch.py 依 use_sim_time 決定：
+        #                   實車 auto、模擬 0 (Gazebo 的既有測試與報告數據都是沿 x 軸的割草線)。
+        #   headland_width  f2c_server 的地頭寬 (vehicle_geometry，由 launch 傳入)：auto 跟 F2C 一樣
+        #                   在內縮後的區域上數段數。沒傳就用 0 (不內縮)，只影響挑方向的準確度。
+        # auto 在 N150 上要算幾百毫秒，放到另一條執行緒，不要卡住 mower_manager (手動模式的搖桿轉發、
+        # 看門狗都在同一條執行緒上)；算完由 poll_angle_job 接著送給 F2C。
+        self.declare_parameter('swath_angle', '0', ParameterDescriptor(dynamic_typing=True))
+        self.declare_parameter('headland_width', 0.0)
+        self.swath_angle_fixed = swath_angle.parse_angle(self.get_parameter('swath_angle').value)
+        self.headland_width = float(self.get_parameter('headland_width').value)
+        self._angle_executor = None
+        self._angle_job = None
+        self.create_timer(0.05, self.poll_angle_job)
+        # 送給 F2C 的請求 (編號, 送出時間)：F2C_TIMEOUT 內沒回來就中止，晚到的結果不用
+        self._f2c_seq = 0
+        # 這一趟任務的轉場路線規劃器 (2026-10-21，route_plan)：approach 直線會穿過障礙物時改成繞過去
+        self._transit = None
+        self._f2c_pending = None
+        # 給人看的短提示 (文字, 到期時間)：附在任務訊息後面，例如「已經在割了」
+        self._note = None
+        if self.swath_angle_fixed is None:
+            self.get_logger().info('🧭 割草線方向：自動 (掉頭最少)')
+        else:
+            self.get_logger().info(
+                '🧭 割草線方向：固定 %.1f°' % math.degrees(self.swath_angle_fixed))
+
         # 淨空門檻：來自 mowerbot_description/vehicle_geometry.py (由 mower_control.launch.py
         # 傳入)，不給預設值，理由同 blade_width。manager 不自己算幾何 (階段 38)。
         # 說明見 lead_in_point_unsafe() 上方。
@@ -231,6 +297,44 @@ class MowerManager(Node):
             f'🚙 直線通過門檻 (lateral_half_extent) = {self.LEAD_IN_BOUNDARY_CLEARANCE!r} m，'
             f'掉頭門檻 (rotation_swept_radius) = {self.ROTATION_CLEARANCE!r} m，'
             f'跑道離障礙物門檻 (soft_inflation_radius) = {self.LEAD_IN_OBSTACLE_CLEARANCE!r} m')
+        # 沿邊多繞幾圈 (2026-10-21 will 同意，route_plan.EdgeLoops)：割草線與環繞都離邊界地頭寬 (1.2 m)
+        # 以上，這一圈以前從來不割。edge_loops = 離邊界幾公尺各繞一圈 (逗號分開，實車 "1.10,0.75")；
+        # 空字串 = 不繞 (模擬預設，行為與以前完全相同)。轉角邊走邊轉 (圓弧大小由車身算)，
+        # 只在進出圈的匝道兩頭原地轉身 (那兩點離邊界 >= 地頭寬)。
+        # front_extent / rear_extent 來自 vehicle_geometry (mower_control.launch.py)，只在打開時才需要。
+        self.declare_parameter('edge_loops', '')
+        self.declare_parameter('front_extent', Parameter.Type.DOUBLE)
+        self.declare_parameter('rear_extent', Parameter.Type.DOUBLE)
+        # 光達停止區 (navigation.launch.py 的 STOP_ZONE_LENGTH / STOP_ZONE_SIDE_MARGIN，要一致)：
+        # 沿邊那幾圈在牆邊轉彎時，停止區不能掃到地圖上的牆 (掃到車子就停，那一段 15 s 後判失敗)
+        self.declare_parameter('stop_zone_length', 0.40)
+        self.declare_parameter('stop_zone_side_margin', 0.05)
+        # 光達停止區有沒有開 (mower_control.launch.py 照 navigation.launch.py 的規則傳進來：實車開、模擬關)。
+        # 開著的時候，要原地轉身的地方 (割草線兩頭、跑道起點、轉場轉折點、環繞的轉角、沿邊的匝道)
+        # 離地圖上的牆要夠遠，停止區轉一圈才掃不到牆 (route_plan 第 4 節，2026-10-21)。
+        self.declare_parameter('stop_zone_active', False)
+        self.stop_zone_active = bool(self.get_parameter('stop_zone_active').value)
+        self.edge_offsets = self.parse_edge_loops(str(self.get_parameter('edge_loops').value))
+        self._edge = None               # 這一趟的 route_plan.EdgeLoops (執行中失敗時算退出路線)
+        self._edge_cont = set()         # 沿邊路線「接著上一段」的那幾段 (id(Path))：不原地對正
+        self.map_msg = None
+        if self.edge_offsets or self.stop_zone_active:
+            self.FRONT_EXTENT = float(self.get_parameter('front_extent').value)
+            self.REAR_EXTENT = float(self.get_parameter('rear_extent').value)
+        if self.edge_offsets:
+            self.get_logger().info(
+                '🪢 沿邊多繞 %d 圈：離邊界 %s m (轉角邊走邊轉)'
+                % (len(self.edge_offsets), '、'.join('%.2f' % d for d in self.edge_offsets)))
+        self.turn_wall_need = 0.0       # 要原地轉身的點離牆至少多遠 (0 = 不查)
+        self._wall_turn_cache = None    # (地圖的 stamp 與大小, route_plan.WallClearance)
+        if self.stop_zone_active:
+            self.turn_wall_need = route_plan.TURN_WALL_MARGIN + route_plan.stop_zone_turn_radius(
+                self.FRONT_EXTENT, self.LEAD_IN_BOUNDARY_CLEARANCE,
+                float(self.get_parameter('stop_zone_length').value),
+                float(self.get_parameter('stop_zone_side_margin').value))
+            self.get_logger().info(
+                '🧱 光達停止區開著：要原地轉身的地方離地圖上的牆至少 %.2f m (停止區轉一圈掃不到牆)'
+                % self.turn_wall_need)
         # mode 3 是**保留值，沒有實作**(階段 23)。
         #
         # 【為什麼不重新編號】
@@ -257,6 +361,102 @@ class MowerManager(Node):
         # 安全計時器 如果0.5秒內沒收到任何速度指令則停止馬達
         self.last_cmd_time = self.get_clock().now()
         self.watchdog_timeout = 0.5
+
+        # ---- 自動模式 (1 / 3) 的放行條件 (2026-10-15 will 決定) ----
+        # 自動模式以前完全不看手把：放開 LB 車子照跑，只有急停鍵 (RB) 停得下來。
+        # 現在 Nav2 的速度指令要同時滿足下面兩個條件才轉發，任何一個不成立就送零速度 (暫停)：
+        #   auto_requires_deadman  手把連線中而且 LB 按住 (看 teleop 發的 /joy_status，
+        #                          button index 只有 teleop 知道，理由見 JoyStatus.msg)
+        #   auto_requires_scan     光達 /scan 沒有中斷。Nav2 Humble 的 collision_monitor 在
+        #                          光達資料逾時的時候會「忽略這個來源、照常放行」(fail-open，
+        #                          nav2_collision_monitor source.cpp sourceValid)，所以光達斷掉
+        #                          要由這裡擋。沒有光達 SLAM 也定不了位，本來就不該自動走。
+        # 暫停不會取消 Nav2 的 goal、也不動佇列：重新按住 LB (或光達恢復) 就從原地接著走。
+        # 暫停超過 progress_checker 的 movement_time_allowance (15 s)，那一段會被 Nav2 判
+        # ABORTED，走既有的「跳過這一段」邏輯；連續 max_consecutive_failures 段就整個任務停止。
+        # 預設都是 true (安全的方向)。mower_control.launch.py 依 use_sim_time 決定：
+        # 實車 (use_sim_time:=false) 開、模擬關 (模擬沒有手把，Gazebo 的既有測試也不按 LB)。
+        #
+        # 2026-10-19 will：LB + B 之後讓車子自己跑，不要一直捏著 LB。所以多一個比較鬆的條件：
+        #   auto_requires_joystick 手把連線中就好，不用按住 LB (auto_requires_deadman 開著時沒有作用)
+        # bringup_real 改成 deadman 關、joystick 開、scan 開。還停得下來的方式：RB 急停、LB + X 回手動、
+        # 關手把 / 手把斷線、光達中斷、光達停止區。手把斷線過一次就「鎖住」：重新連上之後車子不會自己走，
+        # 要按一下 LB 才繼續 (重新連上不代表有人要它走)，見 _joy_lost_latched。
+        self.declare_parameter('auto_requires_deadman', True)
+        self.declare_parameter('auto_requires_joystick', True)
+        self.declare_parameter('auto_requires_scan', True)
+        self.auto_requires_deadman = bool(self.get_parameter('auto_requires_deadman').value)
+        self.auto_requires_joystick = bool(self.get_parameter('auto_requires_joystick').value)
+        self.auto_requires_scan = bool(self.get_parameter('auto_requires_scan').value)
+        self._joy_lost_latched = False
+        # /joy_status 5 Hz (LB 一變化 teleop 立刻多發一筆)、/scan 10 Hz：0.5 s 內沒有新資料就算中斷
+        self.auto_input_timeout = 0.5
+        self._joy_status = None
+        self._joy_status_time = None
+        self._scan_time = None
+        self._auto_block_prev = None    # 上一次的暫停原因，只在變化時印 log
+        # 規劃好之後先等放行條件成立才送第一段 (2026-10-19 will)。
+        # 以前算好就送，沒按住 LB 時車子雖然不動，但 Nav2 的 progress checker 15 s 一到就把那一段
+        # 判失敗跳過，連續 max_consecutive_failures 段整個任務停止，所以沒辦法「先慢慢看路線再出發」。
+        # 還沒送任何一段之前沒有 goal、不會逾時；一成立就送，之後放開 LB 一樣是暫停 (行為不變)。
+        # 不用按住 LB (auto_requires_deadman 關) 時通常一規劃好就成立，等的是手把沒連上之類的情況。
+        self._wait_deadman_start = False
+        self.create_timer(0.1, self.maybe_start_waiting)
+        # 存地圖中不出發 (2026-10-20 will)：存圖時 slam_toolbox 序列化地圖，map -> odom 會斷一下。
+        # 這時候送出第一段，對正與路線會連續被判失敗、整趟中止 (10-20 sandbox 整套 bringup_real 實測：
+        # 按 Y 之後馬上 LB + B)。map_autosave 存圖期間 /map_autosave/busy = true；
+        # 只擋「第一段送出之前」(start_wait_reason)：自動割草中 teleop 與網頁都不存圖。
+        self._map_saving_since = None
+        busy_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+                              reliability=QoSReliabilityPolicy.RELIABLE)
+        self.create_subscription(Bool, '/map_autosave/busy', self.map_busy_cb, busy_qos)
+        # 用存好的地圖開機 (2026-10-21，map_session.py)：光達跟地圖對上了才讓自動割草出發。
+        # 對錯位置的話割草範圍、禁區、外框整片跟著偏，而且畫面上看起來一切正常。手把 Y 的預覽不擋。
+        # 割草中對不上 (2026-10-21 will 選「要停」)：連續 loc_pause_after 秒對不上就暫停 (跟手把斷線、
+        # 光達中斷一樣每個 tick 送零，不取消任務)，對上了就從原地接著走，不用按 LB。
+        # 短暫擋一下 (有人走過光達前面) 不停：map_session 自己取最近 3 秒最好的分數，這裡再等 3 秒。
+        # 暫停超過 15 s 那一段照樣被 Nav2 判失敗跳過 (跟其他暫停一樣)。建新地圖時不看 (SLAM 自己就是地圖)。
+        self.declare_parameter('saved_map', '')
+        self.declare_parameter('auto_requires_localization', True)
+        self.declare_parameter('loc_pause_after', 3.0)
+        self.saved_map = str(self.get_parameter('saved_map').value)
+        self.auto_requires_localization = bool(
+            self.get_parameter('auto_requires_localization').value)
+        self.loc_pause_after = float(self.get_parameter('loc_pause_after').value)
+        self._loc_match = None
+        self._loc_match_time = None
+        self._loc_bad_since = None
+        self._loc_pause_why = None      # 開始暫停那時候的原因 (暫停中文字不變，log 才不會一直印)
+        if self.saved_map:
+            self.create_subscription(String, '/map_session/match', self.loc_match_cb, busy_qos)
+            self.get_logger().info(
+                f'🗺️ 用存好的地圖 {self.saved_map}：定位對上才讓自動割草出發'
+                + (f'；割草中對不上超過 {self.loc_pause_after:.0f} 秒就暫停'
+                   if self.auto_requires_localization else '；割草中對不上只警告、不停車'))
+            if self.auto_requires_localization:
+                self.create_timer(0.2, self.loc_watch)
+        self.joy_status_sub = self.create_subscription(
+            JoyStatus, '/joy_status', self.joy_status_cb, 10)
+        if self.auto_requires_scan:
+            self.scan_sub = self.create_subscription(
+                LaserScan, '/scan', self.scan_cb, qos_profile_sensor_data)
+        self.get_logger().info(
+            f'自動模式放行條件：按住 LB = {self.auto_requires_deadman}，'
+            f'手把連線 = {self.auto_requires_joystick}，'
+            f'光達 /scan 不中斷 = {self.auto_requires_scan}')
+
+        # ---- 切到自動割草時先存圖 (2026-10-18 will 要的手把三種模式) ----
+        # true：切進 mode 1 先呼叫 map_autosave 存一份地圖 (save_map.sh)，存成功才呼叫 F2C 規劃；
+        # 存失敗就不規劃、任務 ABORTED，車子不動。存圖要 10 ~ 30 秒 (N150)，這段時間任務是
+        # PLANNING、message 寫「存圖中」。存圖中途離開 mode 1 (或再按一次 LB + B)，舊的存圖結果
+        # 回來時不會規劃 (_mode_epoch 對不上)。
+        # 速度指令的仲裁完全沒變：存圖、規劃都還沒有路徑，Nav2 沒有東西可送。
+        # 節點預設 false；mower_control.launch.py 依 use_sim_time 決定 (實車開、模擬關)。
+        self.declare_parameter('save_map_before_f2c', False)
+        self.save_map_before_f2c = bool(self.get_parameter('save_map_before_f2c').value)
+        self.autosave_client = self.create_client(Trigger, 'map_autosave/save')
+        self._mode_epoch = 0           # 每次 change_mode 加一，用來丟掉過期的存圖結果
+        self.get_logger().info(f'切到自動割草時先存圖 = {self.save_map_before_f2c}')
         # 發布者：發給真正的底盤驅動
         self.real_vel_pub = self.create_publisher(Twist, '/cmd_vel' ,10)
 
@@ -265,6 +465,8 @@ class MowerManager(Node):
         self.nav_sub = self.create_subscription(Twist, '/cmd_vel_nav', self.nav_vel_cb,10)
         
         self.srv = self.create_service(SetDriveMode,'change_mower_mode',self.change_mode_callback)
+        # 手把 Y 預覽路線 (2026-10-19 will)：照 LB + B 的流程算一次，發到 /f2c_path 給人看，不執行
+        self.preview_srv = self.create_service(Trigger, '~/preview', self.preview_cb)
 
         self.timer = self.create_timer(0.05,self.safety_check)
         # 訂閱最新算出的綠色邊界
@@ -291,6 +493,9 @@ class MowerManager(Node):
         self.costmap_sub = self.create_subscription(
             OccupancyGrid, '/local_costmap/costmap',
             self.costmap_cb, costmap_qos)
+        # 沿邊繞圈、原地轉身的地方要知道哪裡是真的牆 (光達看得到、停止區會停)：地圖上的佔據格
+        if self.edge_offsets or self.stop_zone_active:
+            self.create_subscription(OccupancyGrid, '/map', self.map_cb, costmap_qos)
 
         self.obstacles_sub = self.create_subscription(
             ObstaclePolygons, '/f2c_obstacles', self.obstacles_cb, 10)
@@ -321,9 +526,125 @@ class MowerManager(Node):
     """
     def nav_vel_cb(self,msg):
         if self.current_mode == 1 or self.current_mode == 3:
-            self.publish_and_update(msg)
+            # 放行條件不成立 (沒按住 LB / 手把斷線 / 光達中斷) 就送零速度，不轉發
+            if self.auto_block_reason() is None:
+                self.publish_and_update(msg)
+            else:
+                self.stop_robot()
         elif self.current_mode == 4:
             self.handle_estop_violation('導航系統 (Nav2)')
+
+    def joy_status_cb(self, msg):
+        self._joy_status = msg
+        self._joy_status_time = self.get_clock().now()
+        # LB 一按下 teleop 就立刻發一筆，這裡馬上判斷，不等 0.1 s 的定時器
+        self.maybe_start_waiting()
+
+    def scan_cb(self, _msg):
+        # 用收到的時間，不用 header.stamp：只要判斷「光達還有沒有在送」，不受光達時間戳影響
+        self._scan_time = self.get_clock().now()
+
+    def _age(self, t):
+        return (self.get_clock().now() - t).nanoseconds / 1e9
+
+    def auto_block_reason(self):
+        """自動模式 (1 / 3) 現在不能動的原因；可以動時回傳 None。
+
+        失效方向是安全的：沒收過、收不到、逾時一律當成不能動。
+        """
+        if self.auto_requires_deadman or self.auto_requires_joystick:
+            joy = None
+            if self._joy_status_time is None:
+                joy = '還沒收到 /joy_status (teleop 沒在跑？)'
+            elif self._age(self._joy_status_time) > self.auto_input_timeout:
+                joy = '/joy_status 中斷 %.1f s (teleop 沒在跑？)' % self._age(self._joy_status_time)
+            elif not self._joy_status.connected:
+                joy = '手把斷線'
+            if joy is not None:
+                # 不用按住 LB 的時候，手把斷線過一次就鎖住 (自動模式中才算，見 __init__ 的說明)
+                if not self.auto_requires_deadman and self.current_mode in (1, 3):
+                    self._joy_lost_latched = True
+                return joy
+            if self.auto_requires_deadman:
+                if not self._joy_status.deadman_held:
+                    return '沒有按住 LB'
+            elif self._joy_lost_latched:
+                if not self._joy_status.deadman_held:
+                    return '手把斷線過，重新連上了，按一下 LB 才繼續走'
+                self._joy_lost_latched = False
+        if self.auto_requires_scan:
+            if self._scan_time is None:
+                return '還沒收到光達 /scan'
+            if self._age(self._scan_time) > self.auto_input_timeout:
+                return '光達 /scan 中斷 %.1f s' % self._age(self._scan_time)
+        return self.localization_pause_reason()
+
+    def loc_watch(self):
+        """0.2 s 一次記下定位從什麼時候開始對不上 (auto_block_reason 會提早 return，不能在那裡記)。"""
+        if self.localization_block_reason() is None:
+            self._loc_bad_since = None
+            self._loc_pause_why = None
+        elif self._loc_bad_since is None:
+            self._loc_bad_since = self.get_clock().now()
+
+    def localization_pause_reason(self):
+        """用存好的地圖、連續 loc_pause_after 秒對不上：暫停的原因；其他情況 None。"""
+        if not (self.saved_map and self.auto_requires_localization) or self._loc_bad_since is None:
+            return None
+        if self._age(self._loc_bad_since) < self.loc_pause_after:
+            return None
+        if self._loc_pause_why is None:
+            why = self.localization_block_reason()
+            if why is None:
+                return None
+            self._loc_pause_why = why
+        return '定位對不上存好的地圖超過 %.0f 秒 (%s)，對上了就接著走' % (
+            self.loc_pause_after, self._loc_pause_why)
+
+    def loc_match_cb(self, msg):
+        try:
+            self._loc_match = json.loads(msg.data)
+        except ValueError:
+            return
+        self._loc_match_time = self.get_clock().now()
+
+    def localization_block_reason(self):
+        """用存好的地圖時，定位還沒對上的原因 (給人看)；對上了、或是建新地圖回傳 None。"""
+        if not self.saved_map:
+            return None
+        m = self._loc_match
+        if m is None or self._loc_match_time is None:
+            return '還不知道定位對上了沒 (map_session 沒有回報)'
+        if (self.get_clock().now() - self._loc_match_time).nanoseconds > 3e9:
+            return '定位的回報停了 3 秒以上 (map_session)'
+        if m.get('ok'):
+            return None
+        score = m.get('score')
+        pct = '' if score is None else '，光達 %d%% 落在地圖的牆上' % round(100 * score)
+        return '%s%s' % (m.get('text') or m.get('state') or '定位還沒對上', pct)
+
+    def map_busy_cb(self, msg):
+        if msg.data:
+            if self._map_saving_since is None:
+                self._map_saving_since = self.get_clock().now()
+        else:
+            self._map_saving_since = None
+            self.maybe_start_waiting()
+
+    def map_saving(self):
+        return (self._map_saving_since is not None
+                and self._age(self._map_saving_since) < MAP_SAVE_MAX)
+
+    def start_wait_reason(self):
+        """第一段送出之前要等的原因：放行條件 (auto_block_reason) 加上「正在存地圖」。可以出發時回傳 None。"""
+        reason = self.auto_block_reason()
+        if reason is None and self.map_saving():
+            reason = '正在存地圖，存好就出發 (約 10 ~ 30 秒)'
+        return reason
+
+    def set_note(self, text, seconds=10.0):
+        """附在任務訊息後面的短提示，seconds 秒後自己消失 (car-status 與網頁看得到)。"""
+        self._note = (text, self.get_clock().now() + Duration(seconds=seconds))
 
     def publish_and_update(self,msg):
         self.real_vel_pub.publish(msg)
@@ -398,6 +719,137 @@ class MowerManager(Node):
     def costmap_cb(self, msg):
         self.local_costmap = msg
 
+    def map_cb(self, msg):
+        self.map_msg = msg
+
+    def parse_edge_loops(self, text):
+        """edge_loops 參數 ("1.10,0.75") -> [1.10, 0.75]。不合理的值 (塞不下車身、超過地頭) 印 ERROR 不用。"""
+        out = []
+        for part in text.replace(' ', '').split(','):
+            if not part:
+                continue
+            try:
+                d = float(part)
+            except ValueError:
+                self.get_logger().error('⚠️ edge_loops 裡的 %r 不是數字，不用' % part)
+                continue
+            low = self.LEAD_IN_BOUNDARY_CLEARANCE + route_plan.EDGE_MARGIN
+            if not low < d < self.headland_width:
+                self.get_logger().error(
+                    '⚠️ edge_loops 的 %.2f m 不合理 (要大於車身半寬 + 餘裕 %.2f、小於地頭 %.2f)，不用'
+                    % (d, low, self.headland_width))
+                continue
+            out.append(d)
+        return sorted(set(out), reverse=True)
+
+    def map_walls(self):
+        """地圖上的牆 (佔據格) 給 route_plan.EdgeLoops：(bool 網格, 解析度, origin_x, origin_y)；沒有地圖回傳 None。"""
+        m = self.map_msg
+        if m is None or m.info.width == 0 or m.info.height == 0:
+            return None
+        grid = np.asarray(m.data, dtype=np.int8).reshape((m.info.height, m.info.width)) > 50
+        o = m.info.origin.position
+        return grid, float(m.info.resolution), float(o.x), float(o.y)
+
+    def wall_turn(self):
+        """原地轉身時光達停止區掃不掃得到地圖上的牆：回傳 route_plan.WallClearance (離牆多遠)。
+
+        光達停止區沒開、或還沒有地圖時回傳 None (不查)。地圖換了 (建圖中每幾秒一張) 才重算。
+        """
+        if not self.stop_zone_active:
+            return None
+        m = self.map_msg
+        if m is None or m.info.width == 0 or m.info.height == 0:
+            return None
+        key = (m.header.stamp.sec, m.header.stamp.nanosec, m.info.width, m.info.height)
+        if self._wall_turn_cache is None or self._wall_turn_cache[0] != key:
+            self._wall_turn_cache = (key, route_plan.WallClearance(self.map_walls()))
+        return self._wall_turn_cache[1]
+
+    def check_perimeter_corners(self, edges):
+        """周邊環繞每一個轉角原地轉身 (轉比較短的那一邊) 時，光達停止區離牆很近的印 WARN。
+
+        環繞那一圈離牆大約 1.4 ~ 1.7 m，比停止區轉一整圈要的距離近，但轉角只轉 90° 左右、而且轉向裡面，
+        所以不像割草線兩頭那樣縮短，只照實際轉的角度查。這是估計：車子到轉角時的方向跟這一邊的方向會差
+        幾度 (半徑 1.45 m，差 5° 就差 0.13 m)。lab1 紅線當牆的模擬印了 6 個，車子實際轉的時候停止區
+        離牆 0.07 ~ 0.18 m，都轉過去了；實車定位再差一點就可能停在那裡。
+        第一段由 approach 開過去 (方向不一定)，那裡由 approach_target 查。
+        """
+        wc = self.wall_turn()
+        if wc is None or len(edges) < 2:
+            return
+        x0 = self.FRONT_EXTENT
+        x1 = x0 + float(self.get_parameter('stop_zone_length').value)
+        hw = (self.LEAD_IN_BOUNDARY_CLEARANCE
+              + float(self.get_parameter('stop_zone_side_margin').value))
+
+        def heading(poses, from_end):
+            # 這一邊在轉角那一頭的方向：取離轉角 0.3 m 以上的點 (F2C 在轉角常有重複或很密的點)
+            seq = poses[::-1] if from_end else poses
+            p0 = seq[0].pose.position
+            for ps in seq[1:]:
+                q = ps.pose.position
+                if math.hypot(q.x - p0.x, q.y - p0.y) >= 0.3:
+                    return (math.atan2(p0.y - q.y, p0.x - q.x) if from_end
+                            else math.atan2(q.y - p0.y, q.x - p0.x))
+            return None
+
+        bad = []
+        for prev, nxt in zip(edges[:-1], edges[1:]):
+            if len(prev.poses) < 2 or len(nxt.poses) < 2:
+                continue
+            b, c = prev.poses[-1].pose.position, nxt.poses[0].pose.position
+            if math.hypot(c.x - b.x, c.y - b.y) > 0.5:
+                continue        # 不是同一圈接著的 (換下一圈要先開過去，那裡由 approach_target 查)
+            h_in, h_out = heading(prev.poses, True), heading(nxt.poses, False)
+            if h_in is None or h_out is None:
+                continue
+            gap = route_plan.zone_sweep_clearance(wc, (c.x, c.y), h_in, h_out, x0, x1, hw)
+            if gap < route_plan.EDGE_ZONE_MARGIN:
+                bad.append('(%.2f, %.2f) %.0f°->%.0f° 離牆 %.2f m'
+                           % (c.x, c.y, math.degrees(h_in), math.degrees(h_out), gap))
+        if bad:
+            self.get_logger().warn(
+                '🧱 周邊環繞有 %d 個轉角原地轉身時光達停止區離牆不到 %.2f m (估計)，'
+                '車子可能停在那裡：%s' % (len(bad), route_plan.EDGE_ZONE_MARGIN, '、'.join(bad)))
+
+    def trim_for_wall_turns(self, paths, what):
+        """割草線 / 環繞的直邊兩頭要原地轉身：離牆不夠遠的那一頭往裡面縮短，剩太短的不割。
+
+        光達停止區轉身會掃到牆的話車子就停在那裡 (route_plan 第 4 節)。停止區沒開、
+        或還沒有地圖時原樣回傳。
+        """
+        wc = self.wall_turn()
+        if wc is None or not paths:
+            return paths
+        out, cut, dropped, lost = [], 0, 0, 0.0
+        for p in paths:
+            xy = np.array([(ps.pose.position.x, ps.pose.position.y) for ps in p.poses])
+            if len(xy) < 2:
+                out.append(p)
+                continue
+            full = float(np.sum(np.hypot(*np.diff(xy, axis=0).T)))
+            r = route_plan.trim_ends(xy, wc.at(xy) >= self.turn_wall_need)
+            if r is None:
+                dropped += 1
+                lost += full
+                continue
+            i0, i1 = r
+            if (i0, i1) != (0, len(xy) - 1):
+                q = Path()
+                q.header = p.header
+                q.poses = list(p.poses[i0:i1 + 1])
+                cut += 1
+                lost += full - float(np.sum(np.hypot(*np.diff(xy[i0:i1 + 1], axis=0).T)))
+                p = q
+            out.append(p)
+        if cut or dropped:
+            self.get_logger().info(
+                '🧱 %s兩頭離牆不到 %.2f m (原地轉身時光達停止區會掃到牆)：'
+                '%d 條往裡面縮短、%d 條太短不割，少割 %.1f m'
+                % (what, self.turn_wall_need, cut, dropped, lost))
+        return out
+
     def costmap_cost_at(self, x, y):
         """回傳 (x, y) 在 local costmap 上的值，拿不到就回傳 None。
 
@@ -434,34 +886,58 @@ class MowerManager(Node):
         """隨時更新作業區內部的障礙物輪廓"""
         self.latest_obstacles = list(msg.polygons)
 
-    def call_f2c_planner(self):
-        """打包邊界並發送給 C++ 伺服器"""
+    def preview_cb(self, _req, resp):
+        """手把 Y：預覽割草路線。規劃與 LB + B 完全相同 (同一張圖、同一個禁區、同樣的檢查)，
+        只是最後不送給 Nav2：任務回到 IDLE，訊息寫路線摘要。車子不會動。"""
+        if self.current_mode in (1, 3):
+            resp.success, resp.message = False, '自動割草中不預覽'
+        elif self._mission_state == MissionStatus.STATE_PLANNING:
+            resp.success, resp.message = False, '正在規劃，等它算完'
+        else:
+            self.get_logger().info('👀 預覽路線 (手把 Y)：照 LB + B 的流程規劃，不執行。')
+            self.call_f2c_planner(preview=True)
+            resp.success, resp.message = True, '開始規劃預覽'
+        return resp
+
+    def call_f2c_planner(self, preview=False):
+        """打包邊界並發送給 C++ 伺服器。preview = 只算出路線給人看 (手把 Y)，不執行"""
         if self.latest_boundary is None:
             if self._boundary_seen > 0:
-                self.get_logger().error(
-                    f'⚠️ 收過 {self._boundary_seen} 個邊界但都沒通過檢查'
-                    f'（面積至少要 {self.min_boundary_area:.2f} m²、頂點至少 4 個）。'
-                    f'請繼續在建圖模式下把場地繞完，地圖夠大之後邊界才會合理。')
+                text = (f'收過 {self._boundary_seen} 個邊界但都沒通過檢查'
+                        f'（面積至少要 {self.min_boundary_area:.2f} m²、頂點至少 4 個）。'
+                        f'請繼續在建圖模式下把場地繞完，地圖夠大之後邊界才會合理。')
             else:
-                self.get_logger().error(
-                    '⚠️ 尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+                text = '尚未接收到草地邊界！請先在建圖模式下遙控車輛探索。'
+            self.get_logger().error('⚠️ ' + text)
+            # 原因也寫進任務訊息：car-status 看得到，不用翻 log
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+
+        # 用存好的地圖：定位對上了才出發 (預覽不擋：路線本身跟車子在哪無關，只有「車子在哪一塊」會差)
+        loc = None if preview else self.localization_block_reason()
+        if loc is not None:
+            text = ('定位還沒對上存好的地圖：%s。車子停著等它對上；對不上就在網頁上點出車子在哪、朝哪，'
+                    '換了場地就重新開始、選建新地圖。' % loc)
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             return
 
         # 規劃之前先看車子自己站得下站不下。這一項擋的是「車子當下停的位置」，
         # 與階段 21 那些針對「規劃出來的段落」的檢查互補 —— 見 start_pose_blocked()。
         blocked = self.start_pose_blocked()
         if blocked is not None:
-            text = ('無法開始：%s，不足以原地掉頭。'
-                    '請先用手動模式(模式 0)把車輛移到開闊處，再切回自動割草。'
-                    % blocked)
+            text = ('車子現在的位置沒辦法開始：%s，不足以原地掉頭。'
+                    '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m%s以上的開闊處，再按一次。'
+                    % (blocked, '、離牆 %.1f m ' % self.turn_wall_need
+                       if self.wall_turn() is not None else ' '))
             self.get_logger().error('🚫 ' + text)
             self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             return
 
         if not self.f2c_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error('⚠️ F2C 伺服器未上線，請確認 f2c_server 已經啟動！')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED,
+                                   message='算路線的程式 (f2c_server) 沒有開：car-stop 再 car-start')
             return
 
         # 建立請求
@@ -482,13 +958,142 @@ class MowerManager(Node):
         self.get_logger().info(
             f'🚀 正在將邊界發送給 F2C 伺服器進行運算...'
             f' (內部障礙物 {len(req.obstacles)} 個)')
+        # 記下送出時的模式 epoch：規劃結果回來時模式已經切換過就丟掉，不要拿舊的結果開始任務
+        epoch = self._mode_epoch
+        if self.swath_angle_fixed is None:
+            rings = [[(p.x, p.y) for p in req.boundary.points]]
+            rings += [[(p.x, p.y) for p in o.points] for o in req.obstacles]
+            if self._angle_executor is None:
+                self._angle_executor = ThreadPoolExecutor(max_workers=1)
+            # 只留最新的一個：算到一半又來一次 (預覽中按 LB + B) 時，舊的結果直接不用
+            self._angle_job = (self._angle_executor.submit(
+                swath_angle.choose_angle, rings, self.swath_spacing, self.headland_width),
+                req, preview, epoch)
+            return
+        self.send_f2c_request(req, self.swath_angle_fixed, None, preview, epoch)
+
+    def poll_angle_job(self):
+        """auto 割草線方向算好了就接著送給 F2C (定時器，在 mower_manager 自己的執行緒上)。"""
+        self.check_f2c_timeout()
+        if self._angle_job is None or not self._angle_job[0].done():
+            return
+        job, req, preview, epoch = self._angle_job
+        self._angle_job = None
+        # 與 f2c_response_callback 同樣的檢查：這中間模式切換過就不規劃
+        if preview and self.current_mode in (1, 3):
+            self.get_logger().warn('👀 預覽的割草線方向算好了，但已經切到自動割草，丟掉不用。')
+            return
+        if not preview and epoch != self._mode_epoch:
+            self.get_logger().warn('🧭 割草線方向算好了，但這中間模式已經切換過，不規劃。')
+            return
+        try:
+            angle, info = job.result()
+        except Exception as e:      # 挑不出來就照以前沿 x 軸，不要讓任務因此開不了
+            self.get_logger().error('🧭 自動挑割草線方向失敗 (%s: %s)，這次沿 x 軸 (0°)。'
+                                    % (type(e).__name__, e))
+            angle, info = 0.0, None
+        self.send_f2c_request(req, angle, info, preview, epoch)
+
+    def check_f2c_timeout(self):
+        """F2C 超過 F2C_TIMEOUT 沒回來：中止，晚到的結果不用 (以前任務會永遠停在「規劃中」，之後按 Y 都被拒絕)。"""
+        if self._f2c_pending is None or self._age(self._f2c_pending[1]) < F2C_TIMEOUT:
+            return
+        self._f2c_pending = None
+        if self._mission_state != MissionStatus.STATE_PLANNING:
+            return
+        text = '算路線的程式 (f2c_server) %.0f 秒沒有回應，可能當掉了：car-stop 再 car-start' % F2C_TIMEOUT
+        self.get_logger().error('⏱️ ' + text)
+        self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+
+    def send_f2c_request(self, req, angle, info, preview, epoch):
+        """邊界與障礙物轉 -angle 之後送給 F2C (它沿 x 軸擺割草線)，路線回來在 f2c_response_callback 轉回 +angle。"""
+        # 轉之前的割草範圍 (map 座標)：路線回來時排割草順序、規劃繞過障礙物的轉場用
+        rings = [[(p.x, p.y) for p in req.boundary.points]]
+        rings += [[(p.x, p.y) for p in o.points] for o in req.obstacles if len(o.points) >= 3]
+        if angle != 0.0:
+            req.boundary = self.rotated_polygon(req.boundary, -angle)
+            req.obstacles = [self.rotated_polygon(o, -angle) for o in req.obstacles]
+        if info is not None:
+            self.get_logger().info(
+                '🧭 割草線方向 %.0f° (自動：%d 段、%d 條線；沿 x 軸 (0°) 要 %d 段)'
+                % (info['deg'], info['segments'], info['lines'], info['segments_at_0']))
+        else:
+            self.get_logger().info('🧭 割草線方向 %.1f°' % math.degrees(angle))
+        self._f2c_seq += 1
+        seq = self._f2c_seq
+        self._f2c_pending = (seq, self.get_clock().now())
         future = self.f2c_client.call_async(req)
-        future.add_done_callback(self.f2c_response_callback)
+        future.add_done_callback(
+            lambda f: self.f2c_response_callback(f, preview, epoch, angle, seq, rings))
+
+    @staticmethod
+    def rotated_polygon(poly, angle):
+        out = Polygon()
+        xy = swath_angle.rotate_xy([(p.x, p.y) for p in poly.points], angle)
+        out.points = [Point32(x=float(x), y=float(y), z=float(p.z))
+                      for (x, y), p in zip(xy, poly.points)]
+        return out
+
+    @staticmethod
+    def rotate_path(path, angle):
+        """路線 (位置與朝向) 繞原點轉 angle。同樣的輸入得到同樣的輸出，周邊環繞「最後一點 = 第 0 點」照樣成立。"""
+        c, s = math.cos(angle), math.sin(angle)
+        for ps in path.poses:
+            p, q = ps.pose.position, ps.pose.orientation
+            p.x, p.y = c * p.x - s * p.y, s * p.x + c * p.y
+            q.x, q.y, q.z, q.w = swath_angle.rotate_quat(q.x, q.y, q.z, q.w, angle)
 
     # 模式切換服務
     # 模式切換服務
+    def start_f2c(self):
+        """切進 mode 1：需要的話先存圖 (save_map_before_f2c)，再呼叫 F2C 規劃。"""
+        # 還沒有任何邊界 (還沒建圖) 時不必先花時間存圖：call_f2c_planner 會直接說「請先建圖」
+        if not self.save_map_before_f2c or self.latest_boundary is None:
+            self.call_f2c_planner()
+            return
+        if not self.autosave_client.wait_for_service(timeout_sec=1.0):
+            text = '無法開始：存圖服務 (map_autosave) 沒有開，沒有存圖就不規劃。'
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+        epoch = self._mode_epoch
+        self.set_mission_state(MissionStatus.STATE_PLANNING,
+                               message='存圖中，存好才規劃路線 (約 10 ~ 30 秒)。')
+        self.get_logger().info('💾 切到自動割草：先存圖，存好才規劃路線...')
+        future = self.autosave_client.call_async(Trigger.Request())
+        future.add_done_callback(lambda f: self.autosave_done(f, epoch))
+
+    def autosave_done(self, future, epoch):
+        if epoch != self._mode_epoch or self.current_mode != 1:
+            self.get_logger().warn('💾 存圖結束了，但這中間模式已經切換過，不規劃。')
+            return
+        result = future.result() if future.done() else None
+        if result is None or not result.success:
+            reason = result.message if result is not None else '存圖服務沒有回應'
+            text = '無法開始：存圖失敗 (%s)，沒有規劃，車子不會動。' % reason
+            self.get_logger().error('🚫 ' + text)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+            return
+        self.get_logger().info(f'💾 地圖已存：{result.message}，開始規劃。')
+        self.call_f2c_planner()
+
     def change_mode_callback(self,request,response):
         if request.mode in self.mode_map:
+            # 自動割草中 (規劃中 / 執行中) 再按一次 LB + B 不理它 (2026-10-20 will)。
+            # 以前會重新規劃：舊的 Nav2 goal 沒取消、佇列沒清，舊 goal 的結果被算到新任務頭上，
+            # 新任務連鎖誤判「對正超時」而中止，最後送出的 goal 還可能在轉。要重來先 LB + X。
+            # 放在 epoch 與手把斷線鎖之前：被擋下的這一按不能解掉斷線鎖。
+            if (request.mode == 1 and self.current_mode == 1
+                    and self._mission_state in (MissionStatus.STATE_PLANNING,
+                                                MissionStatus.STATE_EXECUTING)):
+                text = '已經在割了，再按 LB + B 不會重來；要重來先 LB + X 回手動，車停了再 LB + B'
+                self.get_logger().warn('🚫 ' + text)
+                self.set_note(text)
+                response.success = False
+                return response
+            self._mode_epoch += 1
+            # 手把斷線的鎖只管這一次自動模式 (見 auto_block_reason)
+            self._joy_lost_latched = False
             previous_mode = self.current_mode
             self.current_mode = request.mode
             mode_name = self.mode_map[self.current_mode]
@@ -504,7 +1109,7 @@ class MowerManager(Node):
                 # 混在一起的話，任務跑完之後按急停會把那份完成紀錄蓋掉
                 # (而 total_segments 不歸零正是為了保住那份紀錄)，
                 # 待命中按急停也會顯示「任務已中止」，但使用者根本沒啟動過任務。
-                self.abort_mission_if_running()
+                self.abort_mission_if_running('按了停止 (RB 或網頁的停止鍵)，這一趟取消了')
                 # 取消 Nav2 正在執行的 FollowPath，避免解除急停後車子被拉回原路徑
                 self.cancel_current_goal()
                 # 【安全關鍵】急停不能只取消「當前這一條」割草線。
@@ -523,11 +1128,11 @@ class MowerManager(Node):
                     self.clear_swath_queue()
                     # 同上：只有跑到一半被切走才算中止。
                     # 任務已經跑完 (DONE) 之後離開自動模式，那份結果要留著。
-                    self.abort_mission_if_running()
+                    self.abort_mission_if_running('切到%s，這一趟取消了' % mode_name)
 
-                # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖
+                # 【新增】：如果切換到 F2C 模式(1)，就自動呼叫算圖 (實車上先存圖，見 start_f2c)
                 if self.current_mode == 1:
-                    self.call_f2c_planner()
+                    self.start_f2c()
             
             self.stop_robot()
             # 修正：重置 watchdog 計時器，避免切換瞬間報錯
@@ -546,6 +1151,22 @@ class MowerManager(Node):
         if self.current_mode == 4:
             self.stop_robot()
             return
+
+        # 自動模式 (1/3) 放行條件不成立 (沒按住 LB / 手把斷線 / 光達中斷)：
+        # 跟急停一樣每次 timer 都送零速度，不等 watchdog。只在原因改變時印一次 log。
+        if self.current_mode in (1, 3):
+            reason = self.auto_block_reason()
+            if reason != self._auto_block_prev:
+                if reason is not None:
+                    self.get_logger().warn(f'⏸️ 自動模式暫停：{reason}，車子停住，不轉發 Nav2 速度指令')
+                elif self._auto_block_prev is not None:
+                    self.get_logger().info('▶️ 自動模式恢復：放行條件都成立，繼續轉發 Nav2 速度指令')
+                self._auto_block_prev = reason
+            if reason is not None:
+                self.stop_robot()
+                return
+        else:
+            self._auto_block_prev = None
 
         # 其餘模式(0/1/2/3)一律套用通用 watchdog：
         # 超過 watchdog_timeout 沒收到任何 cmd_vel(手把或 Nav2)就停車。
@@ -593,16 +1214,27 @@ class MowerManager(Node):
         ms.current_label = self._current_label
         labels = []
         for label, start, reason in self._skipped:
+            # 原因直接寫在後面：網頁和 car-status 不用再去翻 car-log
+            why = FAIL_TEXT.get(reason, reason)
             if start is not None:
-                labels.append('%s (%.2f, %.2f)' % (label, start[0], start[1]))
+                labels.append('%s (%.2f, %.2f)：%s' % (label, start[0], start[1], why))
             else:
-                labels.append('%s (起點未知)' % label)
-            _ = reason
+                labels.append('%s (起點未知)：%s' % (label, why))
         ms.skipped_labels = labels
         ms.message = self._mission_message
+        if self.current_mode in (1, 3):
+            reason = self.auto_block_reason()
+            if reason is not None:
+                pause = '暫停：%s。' % reason
+                ms.message = pause + ('\n' + ms.message if ms.message else '')
+        if self._note is not None:
+            if self.get_clock().now() < self._note[1]:
+                ms.message = (ms.message + '\n' if ms.message else '') + self._note[0]
+            else:
+                self._note = None
         self.mission_status_pub.publish(ms)
 
-    def abort_mission_if_running(self):
+    def abort_mission_if_running(self, message=''):
         """只有 PLANNING / EXECUTING 才轉成 ABORTED；IDLE 與 DONE 維持原狀。
 
         呼叫時機是「外力把任務打斷」(急停、離開自動模式)。
@@ -610,7 +1242,7 @@ class MowerManager(Node):
         """
         if self._mission_state in (MissionStatus.STATE_PLANNING,
                                    MissionStatus.STATE_EXECUTING):
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=message)
 
     def set_mission_state(self, state, label=None, message=''):
         """集中改任務狀態，順便把「目前段落」與說明訊息一起更新。
@@ -626,6 +1258,8 @@ class MowerManager(Node):
         if state in (MissionStatus.STATE_IDLE, MissionStatus.STATE_DONE,
                      MissionStatus.STATE_ABORTED):
             self._current_label = ''
+        if state in (MissionStatus.STATE_DONE, MissionStatus.STATE_ABORTED):
+            self.end_plan()
 
     # ==================================================================
     # 覆蓋任務：路徑切割與循序執行
@@ -636,12 +1270,14 @@ class MowerManager(Node):
             remaining = len(self._swath_queue) - self._current_swath_idx
             self.get_logger().warn(f'🧹 清空覆蓋任務佇列 (還有 {remaining} 個任務未執行)')
         self._swath_queue = []
+        self._edge_cont = set()
         self._current_swath_idx = 0
         self._swath_total = 0
         self._result_future = None
         self._align_phase = False
         self._aligned_idx = None
         self._reset_approach_tracking()
+        self._wait_deadman_start = False
 
     def cancel_current_goal(self):
         """取消目前正在執行的 FollowPath goal
@@ -690,6 +1326,18 @@ class MowerManager(Node):
             return None
         return (tf.transform.translation.x, tf.transform.translation.y)
 
+    def get_robot_pose2d(self):
+        """車子在 map 座標系的 (x, y, yaw)，查不到回傳 None (沿邊繞圈判斷能不能接著走用)。"""
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                'map', 'base_footprint', Time(), timeout=Duration(seconds=1.0))
+        except Exception as exc:
+            self.get_logger().warn(f'⚠️ 查不到 map -> base_footprint 的 TF：{exc}')
+            return None
+        q = tf.transform.rotation
+        yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        return tf.transform.translation.x, tf.transform.translation.y, yaw
+
     def build_approach_path(self, robot_xy, first_swath, label='approach'):
         """產生「從某個位置前往下一段路徑起點」的移動路徑。
 
@@ -704,6 +1352,10 @@ class MowerManager(Node):
         (c) log 與報告數據分得開，才知道失敗是卡在移動還是卡在割草。
 
         距離小於 APPROACH_SKIP_DISTANCE 時回傳 None，代表不需要 approach。
+
+        2026-10-21 起回傳一個 list (一段或好幾段)：直線會穿過障礙物或禁區時 (這一趟的
+        self._transit 判斷)，改成繞過去的折線，每個轉折切成一段 (每一段開始前 manager 會原地對正，
+        轉折點都選在掉得了頭的地方)。直線走得過去、或沒有規劃器時，跟以前一樣只有一段直線。
         """
         start = first_swath.poses[0].pose.position
         dx = start.x - robot_xy[0]
@@ -716,34 +1368,58 @@ class MowerManager(Node):
                 f'(< {self.APPROACH_SKIP_DISTANCE} m)，直接開始割草')
             return None
 
-        num_segments = max(1, int(round(distance / self.APPROACH_WAYPOINT_SPACING)))
-        approach = Path()
-        # frame_id 跟割草線一致，都是 F2C 路徑的 "map"
-        approach.header.frame_id = first_swath.header.frame_id
-        approach.header.stamp = self.get_clock().now().to_msg()
+        corners = [tuple(robot_xy), (start.x, start.y)]
+        if self._transit is not None:
+            plan = self._transit.plan(corners[0], corners[1], self.TRANSIT_RELAX)
+            if plan is None:
+                self.get_logger().warn(
+                    f'⚠️ {label}：直線會碰到邊界或障礙物，也找不到繞過去的路，照舊走直線 (可能會被擋下來跳過)')
+            elif len(plan) > 2:
+                corners = plan
 
-        yaw = math.atan2(dy, dx)
-        qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
-        for k in range(num_segments + 1):
-            ratio = float(k) / float(num_segments)
-            pose = PoseStamped()
-            pose.header = approach.header
-            pose.pose.position.x = robot_xy[0] + dx * ratio
-            pose.pose.position.y = robot_xy[1] + dy * ratio
-            pose.pose.orientation.z = qz
-            pose.pose.orientation.w = qw
-            approach.poses.append(pose)
+        stamp = self.get_clock().now().to_msg()
+        legs = []
+        for (ax, ay), (bx, by) in zip(corners[:-1], corners[1:]):
+            lx, ly = bx - ax, by - ay
+            num_segments = max(1, int(round(math.hypot(lx, ly) / self.APPROACH_WAYPOINT_SPACING)))
+            approach = Path()
+            # frame_id 跟割草線一致，都是 F2C 路徑的 "map"
+            approach.header.frame_id = first_swath.header.frame_id
+            approach.header.stamp = stamp
+            yaw = math.atan2(ly, lx)
+            qz, qw = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
+            for k in range(num_segments + 1):
+                ratio = float(k) / float(num_segments)
+                pose = PoseStamped()
+                pose.header = approach.header
+                pose.pose.position.x = ax + lx * ratio
+                pose.pose.position.y = ay + ly * ratio
+                pose.pose.orientation.z = qz
+                pose.pose.orientation.w = qw
+                approach.poses.append(pose)
+            legs.append(approach)
 
         # 最後一個航點改成朝向第 1 條割草線的行進方向，
         # 讓車子走完 approach 就已經對準，減少開始割草前的原地迴轉。
         target_q = first_swath.poses[0].pose.orientation
-        final_q = approach.poses[-1].pose.orientation
+        final_q = legs[-1].poses[-1].pose.orientation
         final_q.x, final_q.y = target_q.x, target_q.y
         final_q.z, final_q.w = target_q.z, target_q.w
 
-        self.get_logger().info(
-            f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(approach.poses)} 個航點')
-        return approach
+        if len(legs) == 1:
+            self.get_logger().info(
+                f'🚗 產生 {label} 路徑：距離 {distance:.2f} m，{len(legs[0].poses)} 個航點')
+        else:
+            total = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                        for a, b in zip(corners[:-1], corners[1:]))
+            self.get_logger().info(
+                f'🚗 產生 {label} 路徑：直線 {distance:.2f} m 會穿過障礙物或禁區，改繞 {total:.2f} m，'
+                f'分 {len(legs)} 段 (轉折點 '
+                + '、'.join('(%.2f, %.2f)' % c for c in corners[1:-1]) + ')')
+        return legs
+
+    # 規劃轉場時，起點 / 終點附近這麼近的地方不檢查 (那兩點由 approach_target 與掉頭檢查把關)
+    TRANSIT_RELAX = 0.5
 
     # 跑道的航點間距，與割草線、approach 同一個來源
     LEAD_IN_WAYPOINT_SPACING = WAYPOINT_SPACING
@@ -870,6 +1546,15 @@ class MowerManager(Node):
                 return '落在邊界外面'
             if bd < need_b:
                 return '離邊界只有 %.2f m (%s需要 %.2f m)' % (bd, what, need_b)
+
+        # 光達停止區開著：原地轉身時停止區 (車頭前 0.40 m) 掃到地圖上的牆，車子就停在那裡
+        if need_rotation:
+            wc = self.wall_turn()
+            if wc is not None:
+                wd = float(wc.at((x, y)))
+                if wd < self.turn_wall_need:
+                    return ('離牆只有 %.2f m (掉頭時光達停止區會掃到牆，需要 %.2f m)'
+                            % (wd, self.turn_wall_need))
         return None
 
     def start_pose_blocked(self):
@@ -1030,16 +1715,225 @@ class MowerManager(Node):
 
         回傳 (環繞航點 list, 其餘航點 list)。沒有環繞時回傳 ([], 全部航點)，
         舊版 f2c_server 的路徑因此完全照原本的流程走。
+        2026-10-21 起 f2c_server 每一塊作業區、每一個內環各繞一圈，這裡把前面的每一圈都切下來
+        (見 split_off_perimeter_loops)，接成一個 list 回傳。
         """
-        poses = path_msg.poses
-        if len(poses) < 4:
-            return [], list(poses)
-        p0 = poses[0].pose.position
-        for k in range(3, len(poses)):
-            pk = poses[k].pose.position
-            if math.hypot(pk.x - p0.x, pk.y - p0.y) <= self.PERIMETER_CLOSE_TOL:
-                return list(poses[:k + 1]), list(poses[k + 1:])
-        return [], list(poses)
+        loops, rest = self.split_off_perimeter_loops(path_msg)
+        return [ps for loop in loops for ps in loop], rest
+
+    def split_off_perimeter_loops(self, path_msg):
+        """路徑最前面的周邊環繞，一圈一圈切下來。回傳 ([每一圈的航點 list], 其餘航點 list)。
+
+        每一圈都是「最後一個航點的座標 = 這一圈第 0 個」；割草線不會回到自己的起點，
+        所以切到找不到這樣的一圈就是割草線開始了。
+        """
+        poses = list(path_msg.poses)
+        loops = []
+        start = 0
+        while len(poses) - start >= 4:
+            p0 = poses[start].pose.position
+            end = None
+            for k in range(start + 3, len(poses)):
+                pk = poses[k].pose.position
+                if math.hypot(pk.x - p0.x, pk.y - p0.y) <= self.PERIMETER_CLOSE_TOL:
+                    end = k
+                    break
+            if end is None:
+                break
+            loops.append(poses[start:end + 1])
+            start = end + 1
+        return loops, poses[start:]
+
+    @staticmethod
+    def rotate_loop(loop, i):
+        """閉合的一圈 (最後一點 = 第 0 點) 改從第 i 點開始繞，仍然是最後一點 = 第 0 點。"""
+        core = loop[:-1]
+        if i <= 0 or i >= len(core):
+            return list(loop)
+        out = core[i:] + core[:i]
+        closing = copy.deepcopy(out[-1])
+        closing.pose.position = copy.deepcopy(out[0].pose.position)
+        return out + [closing]
+
+    @staticmethod
+    def reversed_path(path):
+        """反方向走同一條割草線：航點倒過來，每一點的朝向轉 180°。"""
+        out = Path()
+        out.header = path.header
+        for ps in reversed(path.poses):
+            q = copy.deepcopy(ps)
+            o = q.pose.orientation
+            o.x, o.y, o.z, o.w = swath_angle.rotate_quat(o.x, o.y, o.z, o.w, math.pi)
+            out.poses.append(q)
+        return out
+
+    def make_transit_planner(self, rings):
+        """這一次規劃的轉場路線規劃器。
+
+        直線離邊界 / 障礙物至少側向半寬 + 0.05 m，轉折點離邊界至少原地旋轉半徑 + 0.05 m；
+        光達停止區開著時轉折點也要離牆夠遠 (wall_turn)。
+        """
+        if not rings or len(rings[0]) < 3:
+            return None
+        try:
+            return route_plan.TransitPlanner(
+                rings,
+                max(self.LEAD_IN_BOUNDARY_CLEARANCE, self.LEAD_IN_OBSTACLE_CLEARANCE)
+                + self.TRANSIT_MARGIN,
+                self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN,
+                walls=self.wall_turn(), wall_need=self.turn_wall_need)
+        except Exception as e:      # 算不出來就照以前走直線，不要讓任務因此開不了
+            self.get_logger().error('🧭 轉場路線規劃器建不起來 (%s: %s)，這一趟 approach 走直線。'
+                                    % (type(e).__name__, e))
+            return None
+
+    # 轉場路線比 lead-in / 掉頭門檻再多留的餘裕
+    TRANSIT_MARGIN = 0.05
+
+    # 沿邊路線「接著上一段」的那一段：車子離它的起點這麼近 (APPROACH_SKIP_DISTANCE 內)、
+    # 方向差不到這麼多 (rad)，就不原地對正，直接接著走。比 general_goal_checker 的
+    # yaw_goal_tolerance (0.5) 大：上一段 Nav2 判到達的朝向一定接得上 (以前 0.35，
+    # 轉彎處車頭落後 20°～28° 時判接不上，整圈剩下的都不割)。
+    EDGE_ALIGN_SKIP = 0.55
+
+    def plan_edge_routes(self, rings, start_xy, transit, header):
+        """沿邊多繞幾圈 (route_plan.EdgeLoops)：回傳 ([(Path, 標籤)], 走完停在哪裡, 給 /edge_path 的航點)。
+
+        沒打開、或算不出來時回傳 ([], start_xy, [])，任務跟以前一樣只有環繞與割草線。
+        先繞哪一圈：從 start_xy 找轉場最近的進圈點，一圈接一圈。每一圈切成幾段，
+        第一段從匝道的起點開始 (掉得了頭，照常原地對正)，後面幾段接著前一段 (不對正，見
+        check_edge_continuation)。
+        """
+        self._edge = None
+        self._edge_cont = set()
+        if not self.edge_offsets or not rings or len(rings[0]) < 3:
+            return [], start_xy, []
+        rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
+        try:
+            walls = self.map_walls()
+            edge = route_plan.EdgeLoops(
+                rings, self.FRONT_EXTENT, self.REAR_EXTENT, self.LEAD_IN_BOUNDARY_CLEARANCE,
+                walls=walls,
+                stop_len=float(self.get_parameter('stop_zone_length').value),
+                stop_side=float(self.get_parameter('stop_zone_side_margin').value),
+                turn_wall=self.turn_wall_need if walls is not None else 0.0)
+            routes = edge.routes(self.edge_offsets, self.headland_width, rot_need)
+        except Exception as e:     # 算不出來就不繞，不要讓任務因此開不了
+            self.get_logger().error('🪢 沿邊繞圈算不出來 (%s: %s)，這一趟不繞。' % (type(e).__name__, e))
+            return [], start_xy, []
+        self._edge = edge
+        if walls is None:
+            self.get_logger().warn('🪢 還沒收到地圖：沿邊繞圈不知道哪裡是真的牆，牆邊轉角光達停止區有可能擋車')
+        here, left, ordered = start_xy, list(range(len(routes))), []
+        while left:
+            def cost(k):
+                p = routes[k]['pts'][0]
+                if transit is not None:
+                    return transit.length(here, (float(p[0]), float(p[1])))
+                return math.hypot(p[0] - here[0], p[1] - here[1])
+            k = min(left, key=cost)
+            left.remove(k)
+            ordered.append(routes[k])
+            e = routes[k]['pts'][-1]
+            here = (float(e[0]), float(e[1]))
+        entries, display = [], []
+        segs = [route_plan.segment_route(r['pts']) for r in ordered]
+        n_seg = sum(len(sg) for sg in segs)
+        for r, sg in zip(ordered, segs):
+            pts = r['pts']
+            d = np.diff(pts, axis=0)
+            yaw = np.arctan2(d[:, 1], d[:, 0])
+            yaw = np.append(yaw, yaw[-1])
+            poses = []
+            for (x, y), a in zip(pts, yaw):
+                ps = PoseStamped()
+                ps.header = header
+                ps.pose.position.x, ps.pose.position.y = float(x), float(y)
+                ps.pose.orientation.z, ps.pose.orientation.w = math.sin(a / 2.0), math.cos(a / 2.0)
+                poses.append(ps)
+            display.extend(poses)
+            for j, (i0, i1) in enumerate(sg):
+                path = Path()
+                path.header = header
+                path.poses = poses[i0:i1 + 1]
+                entries.append((path, '沿邊 %d/%d' % (len(entries) + 1, n_seg)))
+                if j > 0:
+                    self._edge_cont.add(id(path))
+        if ordered:
+            loops = '、'.join('離邊 %.2f m %s %.1f m'
+                             % (r['d'], '一整圈' if r['full'] else '一截', r['length'])
+                             for r in ordered)
+            self.get_logger().info(
+                '🪢 沿邊多繞：%s，共 %d 段 %.1f m (%s)' % (
+                    loops, n_seg, sum(r['length'] for r in ordered),
+                    '牆邊轉角加大圓弧' if walls is not None else '沒有地圖，不看牆'))
+        else:
+            self.get_logger().info('🪢 沿邊多繞：範圍太窄或太彎，這一趟沒有可以繞的圈')
+        return entries, here, display
+
+    def check_edge_continuation(self):
+        """沿邊路線「接著上一段」的那一段要送出前：車子在上一段的終點、方向也連續，就不原地對正。
+
+        上一段沒走完 (失敗被跳過) 時，車子停在離邊很近的地方，原地轉身車頭會掃出邊界：
+        這一圈剩下的幾段不割，先從車子現在的位置斜斜開回能原地轉身的地方 (EdgeLoops.escape)。
+        原地轉過去掃不到邊的話 (rotation_ok) 照常對正、照常走。
+        """
+        idx = self._current_swath_idx
+        if idx >= len(self._swath_queue):
+            return
+        path, label = self._swath_queue[idx]
+        if id(path) not in self._edge_cont or self._aligned_idx == idx or not path.poses:
+            return
+        pose = self.get_robot_pose2d()
+        if pose is None:
+            return
+        x, y, yaw = pose
+        p0 = path.poses[0].pose.position
+        q = path.poses[0].pose.orientation
+        head = math.atan2(2.0 * q.w * q.z, 1.0 - 2.0 * q.z * q.z)
+        err = abs(math.atan2(math.sin(yaw - head), math.cos(yaw - head)))
+        dist = math.hypot(p0.x - x, p0.y - y)
+        if dist < self.APPROACH_SKIP_DISTANCE:
+            if err < self.EDGE_ALIGN_SKIP:
+                self._aligned_idx = idx
+                self.get_logger().info(
+                    f'🪢 [{label}] 接著上一段 (差 {dist:.2f} m、方向差 {math.degrees(err):.0f}°)，不原地對正')
+                return
+            if self._edge is not None and self._edge.rotation_ok((x, y), yaw, head):
+                return
+        dropped = 0
+        while idx < len(self._swath_queue) and id(self._swath_queue[idx][0]) in self._edge_cont:
+            pth, lbl = self._swath_queue.pop(idx)
+            self._edge_cont.discard(id(pth))        # 丟掉的物件 id 之後可能被別的 Path 用到
+            a = pth.poses[0].pose.position
+            self._skipped.append((lbl, (a.x, a.y), '沿邊接不上'))
+            dropped += 1
+        self.get_logger().warn(
+            f'⏭️ [{label}] 車子不在上一段的終點 (差 {dist:.2f} m、方向差 {math.degrees(err):.0f}°)，'
+            f'原地轉身會掃到邊：這一圈剩下的 {dropped} 段不割')
+        rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
+        if self._edge is not None and float(self._edge.clearance_at(np.array([x, y]))) < rot_need:
+            got = self._edge.escape((x, y), yaw, rot_need)
+            if got is None:
+                self.get_logger().warn(
+                    '⚠️ 找不到斜斜開回能原地轉身的路，照常往下一段 (原地轉身有可能被 Nav2 擋下)')
+            else:
+                line, hd = got
+                esc = Path()
+                esc.header.frame_id = path.header.frame_id or 'map'
+                esc.header.stamp = self.get_clock().now().to_msg()
+                for px, py in line:
+                    ps = PoseStamped()
+                    ps.header = esc.header
+                    ps.pose.position.x, ps.pose.position.y = float(px), float(py)
+                    ps.pose.orientation.z = math.sin(hd / 2.0)
+                    ps.pose.orientation.w = math.cos(hd / 2.0)
+                    esc.poses.append(ps)
+                self._swath_queue.insert(idx, (esc, '沿邊退出'))
+                self.get_logger().info(
+                    f'🪢 先斜斜開回能原地轉身的地方 ({len(line) * route_plan.EDGE_STEP:.1f} m，'
+                    f'方向 {math.degrees(hd):.0f}°)')
+        self._mission_total = len(self._swath_queue)
 
     # 相鄰兩個航點距離超過這個值就視為「跳接」而不是同一段路徑。
     # 割草線與環繞的內插間距都是 0.1 m，所以 0.3 m 已經有 3 倍餘裕；
@@ -1220,6 +2114,11 @@ class MowerManager(Node):
         path, label = self._swath_queue[self._current_swath_idx]
         if label == 'approach':
             return False            # 已經是 approach，不要再包一層
+        if id(path) in self._edge_cont and self._aligned_idx == self._current_swath_idx:
+            # 沿邊「接著上一段」而且車子就在起點 (check_edge_continuation 確認過)：不轉身、直接接著走。
+            # 不能再找「掉得了頭的航點」插 approach：10-21 模擬實跑時 approach 把車往前開了 0.6 m，
+            # 車子就不在這一段的起點了，check_edge_continuation 再看一次就把這一圈剩下的 6 段丟掉
+            return False
         robot_xy = self.get_robot_pose_in_map()
         if robot_xy is None:
             self.get_logger().warn(
@@ -1273,11 +2172,14 @@ class MowerManager(Node):
                     f'⚠️ [{label}] {give_up}，放棄接近，直接送出該段落')
                 return False
 
-        approach = self.build_approach_path(robot_xy, target)
-        if approach is None:
+        legs = self.build_approach_path(robot_xy, target)
+        if legs is None:
             return False            # 夠近，不需要 approach
         self._approach_tries += 1
-        self._swath_queue.insert(self._current_swath_idx, (approach, 'approach'))
+        # 繞路時是好幾段，都叫 approach (不會再被包一層)；其中一段失敗時，剩下的幾段一起丟掉
+        # (見 follow_path_result_callback)，下一次從車子當下的位置重新規劃。
+        for k, leg in enumerate(legs):
+            self._swath_queue.insert(self._current_swath_idx + k, (leg, 'approach'))
         # 佇列變長了，畫面上的總段數要跟著變，不然進度條會超過 100%
         self._mission_total = len(self._swath_queue)
         return True
@@ -1356,8 +2258,38 @@ class MowerManager(Node):
             f'(往後 {skipped:.2f} m)')
         return sub
 
+    def begin_execution(self):
+        """規劃好了，開始送第一段。實車放行條件不成立時先等，見 _wait_deadman_start。"""
+        reason = self.start_wait_reason()
+        if reason is not None:
+            self._wait_deadman_start = True
+            if self.auto_requires_deadman and not self.map_saving():
+                text = '路線規劃好了，按住 LB 才開始走（還沒按之前不會出發，可以慢慢看路線）。'
+            else:
+                text = '路線規劃好了，還不能出發：%s。' % reason
+            self.set_mission_state(MissionStatus.STATE_EXECUTING, message=text)
+            self.get_logger().info('🗺️ 路線規劃好了，等放行條件成立才送出第一段 (%s)。' % reason)
+            return
+        self.send_next_swath()
+
+    def maybe_start_waiting(self):
+        """在等放行條件 (按住 LB / 手把連上) 的任務，一成立就送出第一段。"""
+        if not self._wait_deadman_start:
+            return
+        if self.current_mode not in (1, 3) or not self._swath_queue:
+            self._wait_deadman_start = False
+            return
+        if self.start_wait_reason() is not None:
+            return
+        self._wait_deadman_start = False
+        self._mission_message = ''
+        self.get_logger().info('▶️ 放行條件成立 (%s)，開始走。'
+                               % ('按住 LB 了' if self.auto_requires_deadman else '手把連著'))
+        self.send_next_swath()
+
     def send_next_swath(self):
         """送出佇列裡的下一個任務 (approach 或割草線)"""
+        self.check_edge_continuation()
         self.maybe_insert_approach()
         total = len(self._swath_queue)
         if self._current_swath_idx >= total:
@@ -1368,6 +2300,7 @@ class MowerManager(Node):
             return
         path, label = self._swath_queue[self._current_swath_idx]
         self._mission_state = MissionStatus.STATE_EXECUTING
+        self.plan_progress()
         # 【兩階段，階段 38 決定 1】每一段 (含 approach) 先原地對正，對正成功之後才送那一段本身。
         # 原因：DWB 在段落開頭是「邊前進邊轉」(vx 0.70 + wz 1.2 的弧)，新車車頭在旋轉中心前方 0.975 m，
         # 同一個弧讓車頭角撞牆 / 頂住箱子 (docs/stage38_collision_brief.md)。
@@ -1485,11 +2418,12 @@ class MowerManager(Node):
                 self.send_path_to_nav2(path, label)
                 return
             # 對正失敗 = 該段失敗，走下面既有的跳過邏輯 (計入 max_consecutive_failures)。
-            # 原地旋轉不平移，progress checker (只看平移) 15 s 一到就判 ABORTED —— 這幾乎一定是對正超時。
+            # 2026-10-20 起 progress checker 是 PoseProgressChecker：轉了 0.5 rad 也算進展，
+            # 所以對正中被判 ABORTED = 15 s 內位置和角度都沒什麼動 (轉不動、或一直暫停)。
             status_name = 'ALIGN_TIMEOUT'
             self.get_logger().error(
-                f'⏱️ [{label}] 對正超時 (原地旋轉 15 s 內沒有完成；progress checker 只看平移，'
-                f'原地旋轉期間永遠看不到進展) —— 視為這一段失敗')
+                f'⏱️ [{label}] 對正超時 (原地旋轉 15 s 內轉不到 0.5 rad：轉不動，或停止區 / 手把斷線一直暫停)'
+                f' —— 視為這一段失敗')
         self._align_phase = False
 
         # ---- 1. 主動取消：維持原本的行為與訊息 ----
@@ -1498,7 +2432,12 @@ class MowerManager(Node):
             self.get_logger().error(
                 f'❌ [{label}] 失敗 (status={status_name})，'
                 f'停止整個覆蓋任務，不自動重試')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            message = '[%s] 被取消了 (%s)，這一趟停止' % (label, status_name)
+            if self._mission_state == MissionStatus.STATE_ABORTED and self._mission_message:
+                # 急停、切模式的時候已經寫好原因 (abort_mission_if_running)，取消的結果晚一點才回來，
+                # 不要把它蓋成「[(未知任務)] 被取消了」(佇列那時已經清掉，查不到是哪一段)
+                message = self._mission_message
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=message)
             self.clear_swath_queue()
             self.stop_robot()
             return
@@ -1506,6 +2445,7 @@ class MowerManager(Node):
         # ---- 2. 成功 ----
         if status == GoalStatus.STATUS_SUCCEEDED:
             self._consecutive_failures = 0
+            self._fail_streak = []
             self._succeeded += 1
             if label == 'approach':
                 self.get_logger().info('✅ approach 完成，開始割草')
@@ -1528,6 +2468,7 @@ class MowerManager(Node):
             p0 = path.poses[0].pose.position
             start = (p0.x, p0.y)
         self._skipped.append((label, start, status_name))
+        self._fail_streak.append((label, start, status_name))
         self.get_logger().error(
             f'❌ [{label}] 失敗 (status={status_name})，'
             f'連續失敗 {self._consecutive_failures}/{self.max_consecutive_failures} 次')
@@ -1542,7 +2483,9 @@ class MowerManager(Node):
                 f'🛑 連續 {self._consecutive_failures} 段失敗，'
                 f'達到 max_consecutive_failures={self.max_consecutive_failures}，'
                 f'停止整個覆蓋任務。這 {self._consecutive_failures} 段分別是：')
-            for label, start, reason in self._skipped[-self._consecutive_failures:]:
+            # _fail_streak，不是 _skipped 的最後幾筆：中間可能夾著「沿邊接不上」那種沒送出去的段落
+            # (10-21 模擬實跑時這裡列錯了兩段)
+            for label, start, reason in self._fail_streak:
                 if start is None:
                     self.get_logger().error(f'   {label}：起點未知，status={reason}')
                     continue
@@ -1551,7 +2494,13 @@ class MowerManager(Node):
                     f'   {label}：起點 ({start[0]:.2f}, {start[1]:.2f})，'
                     f'status={reason}，起點 {self.describe_cost(cost)}')
             self.log_mission_summary(ended_early=True)
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            failed = self._fail_streak
+            last = failed[-1][1] if failed else None
+            text = ('連續 %d 段沒走完，這一趟停止：%s。%s細節看 car-log 的 🛑 那幾行。' % (
+                self._consecutive_failures,
+                '、'.join('%s %s' % (lb, FAIL_TEXT.get(rs, rs)) for lb, _st, rs in failed),
+                '最後一段的起點 (%.2f, %.2f)。' % last if last else ''))
+            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
             self.clear_swath_queue()
             self.stop_robot()
             return
@@ -1561,6 +2510,18 @@ class MowerManager(Node):
             f'⏭️ 跳過此段 {label} {where}，繼續下一段'
             f'（臨時障礙物不應該讓整片草坪停擺）')
         self._current_swath_idx += 1
+        if label == 'approach':
+            # 繞路的 approach 有好幾段：這一段沒走完，後面幾段的起點已經不是車子所在的地方，
+            # 一起丟掉；送下一段之前 maybe_insert_approach 會從車子當下的位置重新規劃。
+            dropped = 0
+            while (self._current_swath_idx < len(self._swath_queue)
+                   and self._swath_queue[self._current_swath_idx][1] == 'approach'):
+                del self._swath_queue[self._current_swath_idx]
+                dropped += 1
+            if dropped:
+                self._mission_total = len(self._swath_queue)
+                total = len(self._swath_queue)
+                self.get_logger().warn(f'⏭️ 這段 approach 後面還有 {dropped} 段繞路一起丟掉，從車子現在的位置重新規劃')
         if self._current_swath_idx >= total:
             self.log_mission_summary()
             self.set_mission_state(MissionStatus.STATE_DONE)
@@ -1601,6 +2562,8 @@ class MowerManager(Node):
         """
         if not self.nav_client.wait_for_server(timeout_sec=2.0):
             self.get_logger().error('⚠️ 找不到 Nav2 的 follow_path 伺服器，請確認 Nav2 是否正常啟動！')
+            # 以前只印 log 就 return：任務永遠停在「執行中」，佇列也留著 (2026-10-20 will 同意改)
+            self.nav2_unavailable('找不到 Nav2 (follow_path 沒有開)')
             return
 
         self.get_logger().info('🚀 啟接割草任務！正在將路徑交給 Nav2 控制器...')
@@ -1617,16 +2580,23 @@ class MowerManager(Node):
         self._send_goal_future = self.nav_client.send_goal_async(goal_msg)
         self._send_goal_future.add_done_callback(self.goal_response_callback)
 
+    def nav2_unavailable(self, what):
+        """Nav2 沒開或不收任務：這一趟沒辦法繼續，比照失敗處理並寫原因。"""
+        text = '%s，這一趟停止：car-stop 再 car-start；還是一樣就看 car-status 的導航那幾行' % what
+        self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+        self.clear_swath_queue()
+        self.stop_robot()
+
     def goal_response_callback(self, future):
         """
         確認 Nav2 是否成功接受了我們的循跡任務
         """
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self.get_logger().error('❌ Nav2 拒絕了割草路徑！(可能是路徑起點距離車體太遠)')
-            # 被拒絕代表這條割草線送不出去，整個任務沒辦法繼續，比照失敗處理
-            self.clear_swath_queue()
-            self.stop_robot()
+            # 拒絕是 action server 層的事 (controller_server 沒進 active 之類)，跟路徑起點遠不遠無關：
+            # 起點太遠是接受之後才回 ABORTED。以前這裡沒有改任務狀態，畫面一直寫「執行中」。
+            self.get_logger().error('❌ Nav2 拒絕了 [%s]' % self._current_label)
+            self.nav2_unavailable('Nav2 拒絕了 [%s] (controller_server 沒有進 active？)' % self._current_label)
             return
         # 保存 handle，讓急停時可以取消這個任務
         self._goal_handle = goal_handle
@@ -1635,30 +2605,46 @@ class MowerManager(Node):
         self._result_future = goal_handle.get_result_async()
         self._result_future.add_done_callback(self.follow_path_result_callback)
 
-    def f2c_response_callback(self, future):
+    def f2c_response_callback(self, future, preview=False, epoch=None, angle=0.0, seq=None,
+                              rings=None):
         """
-        接收 C++ 算好的路徑並廣播與導航
+        接收 C++ 算好的路徑並廣播與導航 (preview 時只廣播，不導航)
         """
+        if seq is not None:
+            if self._f2c_pending is None or self._f2c_pending[0] != seq:
+                self.get_logger().warn('🗺️ F2C 的結果超過 %.0f 秒才回來 (已經判失敗了)，不用。' % F2C_TIMEOUT)
+                return
+            self._f2c_pending = None
         try:
             response = future.result()
+            if preview and self.current_mode in (1, 3):
+                # 預覽還沒算完就按了 LB + B：真的規劃已經接手，不要蓋掉它的狀態
+                self.get_logger().warn('👀 預覽結果回來了，但已經切到自動割草，丟掉不用。')
+                return
+            if not preview and epoch is not None and epoch != self._mode_epoch:
+                # 規劃中切走 (離開 mode 1 時任務已經標成中止) 或又按了一次 LB + B (新的規劃接手)
+                self.get_logger().warn('🗺️ 規劃結果回來了，但這中間模式已經切換過，不執行。')
+                return
             if response.success:
                 self.get_logger().info(f'🎉 成功拿到 F2C 路徑！總航點數: {len(response.coverage_path.poses)}')
-                # 【關鍵】：把路徑廣播出去給 RViz2 畫圖
-                self.path_pub.publish(response.coverage_path)
-                # 先把最前面的周邊環繞那一圈切下來 (沒有環繞時就是空的)，
+                if angle != 0.0:
+                    # 送出去之前邊界轉了 -angle (send_f2c_request)，路線轉回來
+                    self.rotate_path(response.coverage_path, angle)
+                # 先把最前面的周邊環繞切下來 (一塊作業區一圈；沒有環繞時就是空的)，
                 # 剩下的才是弓字形割草線。
-                perimeter_poses, swath_poses = self.split_off_perimeter(
-                    response.coverage_path)
+                loops, swath_poses = self.split_off_perimeter_loops(response.coverage_path)
                 rest = Path()
                 rest.header = response.coverage_path.header
                 rest.poses = swath_poses
-                perimeter_edges = self.split_perimeter_into_edges(
-                    perimeter_poses, response.coverage_path.header)
                 # 切成一條一條割草線後循序執行，一次只給 Nav2 一條直線
                 swaths = self.split_path_into_swaths(rest)
+                # 光達停止區開著：割草線兩頭離牆太近 (掉頭時停止區會掃到牆) 的往裡面縮短
+                swaths = self.trim_for_wall_turns(swaths, '割草線')
                 if not swaths:
+                    # 【關鍵】：把路徑廣播出去給 RViz2 畫圖 (切不出割草線時照 F2C 原樣)
+                    self.path_pub.publish(response.coverage_path)
                     self.get_logger().error('⚠️ 這條覆蓋路徑切不出任何割草線，任務中止。')
-                    self.set_mission_state(MissionStatus.STATE_ABORTED)
+                    self.set_mission_state(MissionStatus.STATE_ABORTED, message=self.too_narrow_text())
                     self.clear_swath_queue()
                     return
 
@@ -1666,10 +2652,58 @@ class MowerManager(Node):
                 # 查不到 TF 就不啟動任務，不要用舊資料硬上。
                 robot_xy = self.get_robot_pose_in_map()
                 if robot_xy is None:
+                    self.path_pub.publish(response.coverage_path)
                     self.get_logger().error('⚠️ 不知道車子在哪裡，不啟動覆蓋任務。')
-                    self.set_mission_state(MissionStatus.STATE_ABORTED)
+                    self.set_mission_state(
+                        MissionStatus.STATE_ABORTED,
+                        message='查不到車子在地圖上的位置 (建圖開了嗎？光達有資料嗎？)，沒有出發')
                     self.clear_swath_queue()
                     return
+
+                # 【割草順序與轉場，2026-10-21 will 選 1】(route_plan)
+                # (1) 周邊環繞從離車子最近的地方開始繞 (以前從 F2C 環的第 0 點，車子常常要先開過半個場地)。
+                # (2) 割草線被障礙物或凹口切開時分塊，一塊一塊照弓字形割 (以前照 F2C 清單一來一回，
+                #     相鄰兩條在障礙物兩邊，接起來穿過障礙物)。F2C 的順序本來就好時完全不動。
+                # (3) 轉場 (approach) 直線會穿過障礙物或禁區時繞過去 (build_approach_path)。
+                transit = self.make_transit_planner(rings)
+                loop_xy = [[(ps.pose.position.x, ps.pose.position.y) for ps in lp] for lp in loops]
+                loops = [self.rotate_loop(loops[k], i)
+                         for k, i in route_plan.order_loops(loop_xy, robot_xy)]
+                perimeter_poses = [ps for lp in loops for ps in lp]
+                perimeter_edges = self.split_perimeter_into_edges(
+                    perimeter_poses, response.coverage_path.header)
+                self.check_perimeter_corners(perimeter_edges)
+                start_xy = robot_xy
+                if perimeter_edges:
+                    q = perimeter_edges[-1].poses[-1].pose.position
+                    start_xy = (q.x, q.y)
+                ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
+                         (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y))
+                        for sw in swaths]
+                order, oinfo = route_plan.plan_order(
+                    ends, angle, self.swath_spacing, start_xy,
+                    dist=transit.length if transit is not None else None,
+                    clear=transit.clear if transit is not None else None)
+                if oinfo['changed']:
+                    swaths = [self.reversed_path(swaths[i]) if rev else swaths[i]
+                              for i, rev in order]
+                    self.get_logger().info(
+                        f'🧩 割草線被障礙物或凹口切開：分成 {oinfo["chains"]} 塊，一塊一塊照弓字形割')
+                # (4) 沿邊多繞幾圈 (2026-10-21 will 同意)：割草線全部割完之後才繞。
+                # 10-21 模擬實跑時排在割草線前面，沿邊在牆角卡住 (停止區掃到牆、不能倒車)，
+                # 連續失敗三段整趟停止，55 條割草線一條都沒割；放在最後，沿邊出問題也不拖累割草線。
+                if swaths:
+                    q = swaths[-1].poses[-1].pose.position
+                    start_xy = (q.x, q.y)
+                edge_entries, _end_xy, edge_display = self.plan_edge_routes(
+                    rings, start_xy, transit, response.coverage_path.header)
+                # 【關鍵】：把路徑廣播出去給 RViz2 / 網頁畫圖：照真的割草順序，轉場會繞路的地方畫繞路
+                self.path_pub.publish(self.display_route(
+                    response.coverage_path, loops, swaths, transit))
+                edge_msg = Path()
+                edge_msg.header = response.coverage_path.header
+                edge_msg.poses = edge_display
+                self.edge_path_pub.publish(edge_msg)
 
                 total = len(swaths)
                 # 每條割草線前面接上共線的跑道，讓車子掉完頭先收斂橫向誤差，
@@ -1682,12 +2716,13 @@ class MowerManager(Node):
                     '%.2f m x %d 條' % (k, v)
                     for k, v in sorted(self._lead_in_hist.items(), reverse=True))
                 self.get_logger().info(f'🛬 跑道長度分布：{hist}')
-                # 周邊環繞排在割草線前面：先把作業區邊緣繞一圈再開始弓字形。
+                # 周邊環繞排在割草線前面：先把作業區邊緣繞一圈再開始弓字形；沿邊多繞排在最後。
                 # _swath_total 仍然只算割草線，「共完成 N 條割草線」的意義不變。
                 n_edges = len(perimeter_edges)
                 queue = [(e, f'周邊環繞 {i + 1}/{n_edges}')
                          for i, e in enumerate(perimeter_edges)]
                 queue += [(sw, f'割草線 {i + 1}/{total}') for i, sw in enumerate(swaths)]
+                queue += edge_entries
                 # 【不變量 ②】起點等於終點的段落不得送出 (見 drop_closed_segments)
                 queue = self.drop_closed_segments(queue)
                 # 【不在這裡插 approach】
@@ -1702,11 +2737,26 @@ class MowerManager(Node):
                 # 正常推進、跳過之後、任務開頭全部走同一條路徑。
                 _ = robot_xy
 
+                self.publish_plan(queue, 'preview' if preview else 'mission', transit, robot_xy)
+                if preview:
+                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。車子不會動；'
+                            'OK 就按 LB + B 開始割。'
+                            % (total, math.degrees(angle) % 180.0,
+                               '、分 %d 塊割' % oinfo['chains'] if oinfo['changed'] else '',
+                               '、周邊環繞 %d 段' % n_edges if n_edges else '',
+                               '、割完再沿邊多繞 %d 段' % len(edge_entries) if edge_entries else '',
+                               len(queue)))
+                    self.get_logger().info('👀 ' + text)
+                    self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
+                    return
+
                 self._swath_queue = queue
+                self._transit = transit
                 self._swath_total = total
                 self._current_swath_idx = 0
                 # 每次重新規劃都是一個新任務，失敗統計要歸零
                 self._consecutive_failures = 0
+                self._fail_streak = []
                 self._skipped = []
                 self._succeeded = 0
                 self._cancelling = False
@@ -1729,13 +2779,126 @@ class MowerManager(Node):
                         '📋 佇列 %d/%d [%s] 起點 (%.2f, %.2f) 終點 (%.2f, %.2f) '
                         '長度 %.2f m' % (i + 1, len(queue), lbl,
                                         a.x, a.y, b.x, b.y, length))
-                self.send_next_swath()
+                self.begin_execution()
             else:
                 self.get_logger().error('⚠️ F2C 伺服器回報路徑規劃失敗！')
-                self.set_mission_state(MissionStatus.STATE_ABORTED)
+                # srv 沒有原因欄位；最常見的是地頭吃光了作業區，其他原因只在 f2c_server 的 log
+                self.set_mission_state(
+                    MissionStatus.STATE_ABORTED,
+                    message=self.too_narrow_text() + '其他原因看 car-log 裡 f2c_server 的那幾行。')
         except Exception as e:
             self.get_logger().error(f'呼叫 F2C 服務時發生錯誤: {str(e)}')
-            self.set_mission_state(MissionStatus.STATE_ABORTED)
+            self.set_mission_state(MissionStatus.STATE_ABORTED,
+                                   message='算路線時程式出錯 (%s: %s)，看 car-log' % (type(e).__name__, e))
+
+    def publish_plan(self, queue, kind, transit, robot_xy):
+        """這次路線每一段的幾何發到 /mission_plan (網頁換算要多久)。算不出來只少了預計時間，任務照常。"""
+        try:
+            pose = self.get_robot_pose2d()
+            if pose is None:
+                pose = (robot_xy[0], robot_xy[1], 0.0)
+            entries = [([(ps.pose.position.x, ps.pose.position.y) for ps in pth.poses],
+                        id(pth) in self._edge_cont) for pth, _lbl in queue]
+            plan = ((lambda a, b: transit.plan(a, b, self.TRANSIT_RELAX))
+                    if transit is not None else None)
+            segs = mission_time.plan_geometry(entries, pose, plan)
+        except Exception as e:      # noqa: BLE001
+            self.get_logger().warn('⏱️ 算不出這次路線要開多遠 (%s: %s)，網頁不會顯示預計時間'
+                                   % (type(e).__name__, e))
+            return
+        self._plan = {'kind': kind, 'segs': [[round(v, 3) for v in sg] for sg in segs],
+                      'labels': [lbl for _pth, lbl in queue], 'cur': None, 'cur_t': None,
+                      'started': None, 'ended': None, 't': round(time.time(), 1)}
+        self._plan_paths = [pth for pth, _lbl in queue] if kind == 'mission' else []
+        self._plan_ids = {id(pth): k for k, pth in enumerate(self._plan_paths)}
+        n_align = sum(1 for sg in segs for a in (sg[0], sg[3]) if a >= mission_time.ALIGN_TOL)
+        self.get_logger().info(
+            '⏱️ 這次路線實際要開 %.0f m (含轉場)、原地轉身 %d 次，'
+            '速度上限 0.25 約 %.0f 分鐘、0.50 約 %.0f 分鐘'
+            % (mission_time.route_meters(segs), n_align,
+               mission_time.total_seconds(segs, 0.25) / 60.0,
+               mission_time.total_seconds(segs, 0.5) / 60.0))
+        self.send_plan()
+
+    def send_plan(self):
+        if self._plan is not None:
+            self.plan_pub.publish(String(data=json.dumps(self._plan, ensure_ascii=False)))
+
+    def plan_progress(self):
+        """送出佇列裡的下一個東西之前：記下現在在走原本的第幾段 (轉場算在它後面那一段)。"""
+        if self._plan is None or not self._plan_ids or self._plan['ended'] is not None:
+            return
+        k = None
+        for pth, _lbl in self._swath_queue[self._current_swath_idx:]:
+            k = self._plan_ids.get(id(pth))
+            if k is not None:
+                break
+        if k is None or k == self._plan['cur']:
+            return
+        now = round(time.time(), 1)
+        self._plan['cur'], self._plan['cur_t'] = k, now
+        if self._plan['started'] is None:
+            self._plan['started'] = now
+        self.send_plan()
+
+    def end_plan(self):
+        """任務結束 (做完或中止)：記下結束時間，印實際花多久 (之後拿來調 mission_time 的常數)。"""
+        p = self._plan
+        if p is None or p['kind'] != 'mission' or p['ended'] is not None:
+            return
+        self._plan['ended'] = round(time.time(), 1)
+        if self._plan['started'] is not None:
+            self.get_logger().info(
+                '⏱️ 這一趟從出發到結束 %.1f 分鐘 (路線 %.0f m)'
+                % ((self._plan['ended'] - self._plan['started']) / 60.0,
+                   mission_time.route_meters(self._plan['segs'])))
+        self._plan_ids = {}
+        self._plan_paths = []
+        self.send_plan()
+
+    def display_route(self, raw, loops, swaths, transit):
+        """給 RViz / Lichtblick / 網頁看的路線 (/f2c_path)：環繞 + 照割草順序的割草線，轉場會繞路的地方插入繞路的點。
+
+        跟以前一樣不含跑道與從車子出發的那段 approach。順序、方向、環繞起點都沒變、也不用繞路時，
+        直接送 F2C 原本那一條 (一個位元都不差)。
+        """
+        pieces = []
+        for lp in loops:
+            # 環繞被障礙物挖開的缺口：缺口兩邊分開，中間照轉場畫 (跟真的執行時一樣)
+            cur = [lp[0]]
+            for ps in lp[1:]:
+                a, b = cur[-1].pose.position, ps.pose.position
+                if math.hypot(b.x - a.x, b.y - a.y) > self.GAP_CUT_DISTANCE:
+                    pieces.append(cur)
+                    cur = []
+                cur.append(ps)
+            pieces.append(cur)
+        pieces += [list(sw.poses) for sw in swaths]
+        out = Path()
+        out.header = raw.header
+        detour = False
+        for piece in pieces:
+            if out.poses and transit is not None:
+                a, b = out.poses[-1].pose.position, piece[0].pose.position
+                if math.hypot(b.x - a.x, b.y - a.y) >= self.APPROACH_SKIP_DISTANCE:
+                    plan = transit.plan((a.x, a.y), (b.x, b.y), self.TRANSIT_RELAX)
+                    if plan is not None and len(plan) > 2:
+                        detour = True
+                        for (cx, cy) in plan[1:-1]:
+                            ps = copy.deepcopy(piece[0])
+                            ps.pose.position.x, ps.pose.position.y = cx, cy
+                            out.poses.append(ps)
+            out.poses.extend(piece)
+        same = (not detour and len(out.poses) == len(raw.poses) and all(
+            p is q for p, q in zip(out.poses, raw.poses)))
+        return raw if same else out
+
+    def too_narrow_text(self):
+        """區域太窄切不出割草線時給人看的話。寬度由地頭與線距推算 (邊界另外內縮約 0.10 m，見 map_to_boundary)。"""
+        edge = 2.0 * (self.headland_width + 0.10)
+        return ('算不出割草線：區域四周各要留 %.1f m 的地頭，最窄的地方要大於約 %.1f m '
+                '(3 條線約 %.1f m)。把範圍圍大一點再試。'
+                % (self.headland_width, edge + 0.5 * self.swath_spacing, edge + 2.5 * self.swath_spacing))
 
 
 def main(args=None):

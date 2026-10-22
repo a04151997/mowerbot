@@ -13,6 +13,7 @@
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一行
+source ~/tf2_fix_ws/install/setup.bash    # tf2 死鎖修正，實車也要疊（docs/tf2_deadlock_fix.md）
 ```
 
 目前的狀態：
@@ -23,7 +24,7 @@ source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一�
 | `bridge_node`（ROS ↔ 驅動板） | 骨架完成，用 loopback 假驅動測過（Phase H） |
 | 里程計數學 | 完成，單元測試在 `mowerbot_bridge/test/test_odometry.py` |
 | 馬達驅動（`drivers/wheeltec.py`） | 依輪趣 C30D 協定寫的，**待驗證**：新控制板 STM32F407 的協定待學長 ROS 1 原始碼比對 |
-| 光達驅動 | **空白**：RPLIDAR，型號細節待確認 |
+| 光達驅動 | **Slamtec RPLIDAR S3**，`bringup_real.launch.py` 已接 `rplidar_ros`。2026-10-12 單獨用 `view_rplidar_s3_launch.py` 實機驗證：S3M1、韌體 1.02、1 Mbps、DenseBoost、`/scan` 10 Hz；轉接板 DC 孔接車上 5.1 V 降壓模組。跟 bringup 一起跑待驗證 |
 | 車輛幾何 `vehicle.yaml` | 階段 38：實測 / 粗略實測 / 暫定三類並存，見下面「實機資訊」與 `measurement_worklist.md` |
 
 ---
@@ -36,7 +37,7 @@ source ~/mowerbot/install/setup.bash      # workspace 放在別處就改這一�
 | 原廠規格 | 98 × 73 × 46 cm，57.2 kg + 電池 16.2 kg，割幅約 50 cm，圓盤 4 支刀組，割草高度 1 ~ 8 cm 無段可調，最高車速 4.5 km/h |
 | | ⚠ 最高車速是原廠值，**本機已更換驅動馬達，不適用**，實際上限待實測。⚠ 本機加裝鋁架，實測外形 1.13 × 0.84 m（`vehicle.yaml` 一律用實測值） |
 | 控制板 | **STM32F407**。OLED 顯示 DIFF / GYRO / ROS / 左右輪數值 / BIAS；板上有 MotorA ~ D 四個馬達通道（目前用兩個）、USB-C、Power 滑動開關、USER / RESET 按鍵。具體型號未確認，但目錄結構（`turn_on_mini3_robot`）與 OLED 格式高度符合輪趣（Wheeltec）系控制板 |
-| 光達 | **RPLIDAR**，裝於引擎與電池之間的鋁架上，位於後輪軸前方。現場目視確認**未**被引擎遮擋 |
+| 光達 | **Slamtec RPLIDAR S3**（學長 `mapping.launch` / `navigation.launch` 載入 `rplidar_s3.launch`：1 Mbps、10 Hz）。5 V、啟動約 1.2 A，接頭 XH2.54-5P（紅 VCC、黃 TX、綠 RX、黑 GND、一格 NC），要經 CP2102 轉接板接 USB。裝於引擎與電池之間的鋁架上，位於後輪軸前方。現場目視確認**未**被引擎遮擋 |
 | 深度相機 | **無**。學長 workspace 裡的 `ros_astra_camera` / `rtabmap` / `3d_navigation` 全是原「mini3」平台遺留，與割草機無關，忽略 |
 | 上位機 | Intel N100 四核 / 約 16 GB RAM |
 | 上位機 OS | **Ubuntu 18.04.6 LTS**，核心 `5.16.0-051600rc7-generic`（手動安裝的 mainline RC 核心，為支援 N100 硬體）。⚠ **不要執行 `apt upgrade`**，會動到這顆核心，換回舊核心可能導致顯示異常 |
@@ -461,7 +462,8 @@ ros2 topic pub -r 10 /cmd_vel geometry_msgs/msg/Twist "{angular: {z: -0.3}}"    
 M3 必須先過。
 
 按鍵對應（`mowerbot_bridge/config/joystick.yaml`）：LB = deadman（index 4）、RB = 急停（index 5）、
-A = 建圖模式、B = 自動割草、X = 手動；左搖桿上下 = 前後（全推 0.7 m/s）、左右 = 轉向（全推 1.2 rad/s）。
+A = 建圖模式、B = 自動割草、X = 手動、Y = 存圖 + 預覽割草路線（不用按 LB）；左搖桿上下 = 前後（全推 0.7 m/s）、左右 = 轉向（全推 1.2 rad/s）。
+實車上（2026-10-18 起）LB + A 才開始建圖；2026-10-19 起 Y 存圖 + 預覽、LB + B 直接規劃割草，見 7-0。
 
 ### 指令
 
@@ -593,8 +595,14 @@ ros2 launch mowerbot_description robot_state_publisher.launch.py use_sim_time:=f
 ros2 run tf2_ros tf2_echo base_link radar                          # 印出來的平移要等於量到的值
 ```
 
-光達驅動節點填在 `bringup_real.launch.py` 的 TODO（型號確定之後），
-`frame_id` 必須是 `radar`，裝置用 udev 固定成 `/dev/mowerbot_lidar`（在 `deploy/99-mowerbot.rules` 的光達 TODO 那一行填好，做法同 M1 第 3 步）。
+光達驅動（RPLIDAR S3）已經接在 `bringup_real.launch.py`，`frame_id` 是 `radar`。先安裝驅動：
+
+```bash
+sudo apt install -y ros-humble-rplidar-ros
+```
+
+裝置用 udev 固定成 `/dev/mowerbot_lidar`（`deploy/99-mowerbot.rules` 的光達那一行比對轉接板序號，安裝做法同 M1 第 3 步）。
+換了轉接板就要改那一行的序號；規則還沒裝的機器，啟動時加 `lidar_port:=/dev/ttyUSB0`。只測底盤、沒接光達時加 `use_lidar:=false`。
 
 ### 預期看到什麼
 
@@ -617,6 +625,31 @@ ros2 run tf2_ros tf2_echo base_link radar                          # 印出來�
 **安全前提：落地；急停在手邊；旁邊有第二個人；場地淨空、沒有人或寵物在裡面。
 M0 ~ M6 與 M-1 全部完成、M-1 的結果已經交回來並確認規劃策略可行。**
 
+### 7-0 手把三種模式（2026-10-18）
+
+實車（`bringup_real.launch.py`）開機之後全部用手把切換，模式都是按住 LB 再按（Y 不用按 LB）：
+
+| 按鍵 | 模式 | 實車上做什麼 |
+|------|------|--------------|
+| LB + X | 手動（mode 2，開機預設） | 純遙控車。**還沒按過 LB + A 之前沒有地圖** |
+| LB + A | 建圖（mode 0） | 第一次按的時候才開始建圖（`slam_scan_gate` 開始把 `/scan` 轉給 slam_toolbox）。開到要割的地方再按 |
+| Y | （不切模式） | 存一份地圖（`maps/map_<月日>_<時分秒>`，約 10 ~ 30 秒，結果在 `/map_autosave/last`），同時照 LB + B 的流程算一次割草路線發到 `/f2c_path`，**車子不動**、任務回到 IDLE，訊息寫路線摘要。自動割草（mode 1 / 3）中按 Y 不做事 |
+| LB + B | 自動割草（mode 1） | 直接規劃路線（約 1 秒，跟 Y 預覽的同一張圖、同一個禁區），規劃好就出發，**之後不用按住 LB**（2026-10-19 will）。停車：RB 急停、LB + X 回手動、關手把，見 7-3 |
+
+- 開始建圖之後就一直建到 bringup 關掉：切回手動或自動割草，SLAM 還是繼續收光達資料，
+  因為它同時負責定位（map -> odom）。要一張新的圖就重開 bringup。
+- 地圖的 map 座標系 = odom 座標系（bringup 開機的位置），從第一次按 LB + A 的地方開始有內容。
+- Nav2（controller_server + 光達停止區）跟著 bringup_real 一起開（`use_nav:=true`，預設）。
+  `use_nav:=false` 時 LB + B 只規劃路線（`/f2c_path` 看得到）、車子不會走。
+- 割草範圍只取**車子所在的那一塊**空地（`map_to_boundary` 的 `boundary_region:=robot`，預設）：
+  紅線圍一圈、車子停在圈裡，就只割圈裡面。查不到車子位置時退回取最大的一塊（`boundary_region:=largest` 是舊行為）。
+- 模擬（`use_sim_time:=true`）維持原樣：一開機就建圖、切 mode 1 直接規劃。
+  開關是 `mower_control.launch.py` 的 `mapping_on_button`、`save_map_before_f2c`（LB + B 先存圖再規劃，2026-10-19 起 bringup_real 關掉，改用 Y 存圖）。
+- 割草線方向（2026-10-19）：實車每次規劃自動挑**掉頭最少**的方向（`swath_angle:=auto`，長走廊就順著走廊跑直線），
+  Y 預覽的訊息寫選了幾度（從 map 的 x 軸量，x 軸 = bringup 開機時的車頭方向）。
+  固定方向用 `swath_angle:=<度>`；模擬維持 0°（沿 x 軸）。原理見 `mowerbot_action/swath_angle.py`。
+- 測試：`python3 test/smoke_test.py --phases=M`（不需要 Gazebo）。
+
 ### 7-1 落地低速
 
 ```bash
@@ -632,14 +665,14 @@ ros2 launch mowerbot_bringup bringup_real.launch.py \
 ### 7-2 SLAM 建圖
 
 ```bash
-# bringup_real 維持開著（它已經包含建圖模式的 slam_toolbox）
+# bringup_real 維持開著（它已經包含 slam_toolbox；實車要按 LB + A 才開始建圖，見 7-0）
 ros2 topic hz /scan                                # 光達有資料
 ros2 run tf2_ros tf2_echo odom base_footprint      # 里程計 TF 有在動
 ros2 run tf2_ros tf2_echo base_link radar          # 光達外參對得上 M5
 rviz2 -d ~/mowerbot/src/mowerbot_description/rviz/mowerbot.rviz
 ```
 
-按住 LB + A 切到建圖模式，慢慢（搖桿推 1/3 以下）沿著場地邊界繞一圈，回到起點。然後存圖：
+按住 LB + A 切到建圖模式（地圖從這裡開始建），慢慢（搖桿推 1/3 以下）沿著場地邊界繞一圈，回到起點。然後存圖：
 
 ```bash
 ros2 run mowerbot_bringup save_map.sh <地圖名稱>
@@ -648,19 +681,77 @@ ros2 run mowerbot_bringup save_map.sh <地圖名稱>
 **預期**：RViz 裡的地圖沒有重影或糊掉；繞回起點時牆面與第一次掃到的重疊；
 `save_map.sh` 印出四個檔案（`.posegraph .data .pgm .yaml`），`.yaml` 的 `free_thresh` 是 0.10。
 
+#### 7-2b 草地邊界（戶外、草地旁邊沒有牆時必做）
+
+2D 光達看不到草地和水泥地、步道的分界。四周沒有牆時，`map_to_boundary` 會把光達掃到的空地
+全部當成草地，F2C 會規劃到草地外面。做法是在同一次建圖裡，用手把**沿著草地邊緣開一圈**記成割草範圍：
+
+```bash
+ros2 service call /boundary_recorder/start std_srvs/srv/Trigger
+# 手把沿草地邊緣慢慢開一整圈，開回起點附近（1 m 以內）
+ros2 service call /boundary_recorder/stop  std_srvs/srv/Trigger
+```
+
+- 記的是後輪軸中心的軌跡，**邊界就是這條軌跡**，不會往外推。車子開在草地裡面一點，比壓著邊緣開安全。
+- `stop` 回報終點離起點太遠時，再往起點開一點、再呼叫一次 `stop`（記錄不會中斷）。要整圈重來用 `cancel`。
+- RViz 加 `/boundary_recorder/track`（Path）看正在記的軌跡、`/lawn_boundary`（Polygon）看結果；
+  `/f2c_boundary` 應該縮到草地邊界裡面。
+- 要回到「只看牆」：`ros2 service call /boundary_recorder/clear std_srvs/srv/Trigger`。
+- **每次重開 bringup 都要重新繞**：每次啟動 slam_toolbox 都從頭建一張新圖，上次的多邊形放進新地圖會錯位。
+  存檔（`~/.ros/mowerbot_lawn_boundary.yaml`）只留紀錄，預設不載入。
+- 限制：只管 F2C 規劃的範圍。Nav2 從一條割草線開到下一條時，路線不受草地邊界限制；
+  草地是凹形（L 形、U 形）時可能抄近路經過草地外面。第一次先找接近方形的草地。
+
+#### 7-2c 禁區：在地圖上用紅色畫（光達看不到的玻璃、坑洞、低矮障礙物）
+
+光達只看得到它那個高度（約 0.55 m）的東西：玻璃門只掃得到門框，地圖上是虛線，割草範圍會從縫漏出去；
+坑洞、低矮的石頭完全看不到。做法是存圖之後，在地圖圖片上用紅色把牆和禁區畫上去，
+割草範圍（F2C）與 Nav2 的 local costmap 都會避開。**跟 7-2b 一樣，只在同一次開機有效**：
+建圖、存圖、畫圖、套用、割草都要在同一次 bringup 裡做完。
+
+```bash
+ros2 run mowerbot_bringup save_map.sh <地圖名稱>     # 會多存 <名稱>.session 與 <名稱>_draw.png
+# 用任何繪圖程式在 <名稱>_draw.png 上畫紅色（Mac 預覽程式的標示工具、小畫家都可以），存檔
+ros2 run mowerbot_action keepout_tool apply <maps 資料夾>/<地圖名稱> [畫好的圖]
+ros2 run mowerbot_action keepout_tool clear          # 清除禁區
+```
+
+- 只認紅色（R 至少 150、比 G 與 B 都大 80 以上）。地圖本身是灰階，不會被誤認。
+  1 像素 = 5 公分；線要從牆畫到牆、中間不能有缺口，否則外面那塊仍然連在一起。
+- **割的是車子所在的那一塊**（2026-10-19 起，`map_to_boundary` 參數 `boundary_region`，預設 `robot`）：
+  用紅線圍一圈、車子停在圈裡，就只割圈裡面。查不到車子位置（map -> base_footprint）時取面積最大的一塊。
+  之前一律取最大的一塊：10-19 在 lab1 用紅線圍出中間 195 m²，程式卻選了紅線外更大的房間（217 m²）。
+  要回到舊行為：把 `map_to_boundary` 的參數 `boundary_region` 設成 `largest`。
+- 套用之後看：RViz / Lichtblick 加 `/keepout_mask`（OccupancyGrid）看禁區位置；
+  `/f2c_boundary` 會繞開禁區（禁區在中間就變成內部障礙物，碰到外圈就切掉外圈）。
+- 開機永遠沒有禁區。`keepout_server` 每次啟動產生新的 session，
+  上一次開機存的地圖畫出來的禁區會被拒絕（每次開機地圖原點不同，舊的禁區會錯位）。
+- 實作：`keepout_server` 發布 `/keepout_mask`；`map_to_boundary` 把禁區格子（多擴 1 格）當成不能割；
+  local costmap 的 `keepout_layer`（StaticLayer）把它當成牆。說明見 `mowerbot_action/keepout.py`。
+
 ### 7-3 自動割草（刀盤先不接電）
 
 第一次不要直接跑整個覆蓋任務：
 
-1. 先確認 Nav2 起得來：
+1. 先確認 Nav2 起得來（2026-10-18 起 bringup_real 已經一起開 Nav2，不用另外開 navigation.launch.py）：
 
 ```bash
-ros2 launch mowerbot_bringup navigation.launch.py use_sim_time:=false
 ros2 lifecycle get /controller_server              # 要是 active
 ```
 
-2. 按住 LB + B 切到自動割草（mode 1）。manager 會自己從地圖萃取邊界、呼叫 F2C 規劃、開始執行。
+   這時 log 要有 `光達停止區開啟：車頭前 0.40 m`，`ros2 lifecycle get /collision_monitor` 也要是 active。
+   第一次只想看規劃、不讓車子走：按 Y 預覽（7-0），或 bringup_real 加 `use_nav:=false`。
+2. 按住 LB + B 切到自動割草（mode 1）。manager 用目前的地圖萃取的邊界呼叫 F2C 規劃，規劃好就開始執行，
+   **之後不用按住 LB**（2026-10-19 will；10-15 到 10-19 之間是整趟按住 LB）。還停得下來的方式：
+   - **RB 急停**：馬上停、鎖住，要 LB + X 回手動才能再動。
+   - **LB + X 回手動**：車子停、任務取消。
+   - **關手把 / 手把斷線**（約 0.5 秒）、**光達斷線**、**車頭前 0.40 m 有東西**：車子停在原地
+     （`mower_manager` 印 `⏸️ 自動模式暫停`）。光達恢復、東西拿走就接著走；
+     **手把斷線過，重新連上之後不會自己走，要按一下 LB 才繼續**。停超過 15 秒，那一段會被當成失敗跳過。
+   - 拔接收器時 xone 會把最後的狀態再送約 5 秒（2026-10-07 實測），所以這不是快的停法；急停用 RB 或主開關。
+   想改回整趟按住 LB：bringup_real.launch.py 裡 `auto_requires_deadman` 改回 `'true'`。
 3. **第一趟刀盤不接電**，人跟在車旁邊，手放在急停上。
+   車頭前 0.40 m 內有東西會停車，但光達只看得到它那個高度（約 55 cm）的東西，比它矮的東西看不到。
 4. 第一趟正常跑完，才在第二趟接上刀盤。
 
 **預期**：`mower_manager` 的 log 依序出現 `邊界提取成功`、`📋 佇列`、`➡️ 送出任務`、`✅ ... 完成`；
@@ -674,7 +765,7 @@ DWB 的權重、`xy_goal_tolerance`、跑道長度全部要在實車上重新實
 | 徵狀 | 原因 | 處理 |
 |------|------|------|
 | 建圖時地圖轉一轉就糊掉 | 九成是 M4 的 `wheel_separation_correction` 還不夠準 | 回 M4 用 `--turns=3` 重做原地旋轉 |
-| `controller_server` 卡在 inactive | 已知的 Nav2 生命週期競態（`simulation_results.md` 7.12 節，模擬裡也會發生） | 停掉 navigation.launch.py 重起一次；記下發生次數 |
+| `controller_server` 卡在 inactive | 已知的 Nav2 生命週期競態（`simulation_results.md` 7.12 節，模擬裡也會發生） | 整個 bringup_real 重起一次；記下發生次數 |
 | 每條割草線結尾都 `Failed to make progress`，車子在掉頭處原地打轉或不動 | 原地掉頭做不到或太慢 —— M-1 的情況 | 按急停。這不是調參數能解決的，交回來重新討論規劃策略 |
 
 ---

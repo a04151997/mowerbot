@@ -16,6 +16,10 @@
   <depend>robot_state_publisher</depend>
   <depend>joint_state_publisher</depend>
   <depend>gazebo_ros</depend>
+  <!-- 實車光達 RPLIDAR S3 (bringup_real.launch.py)；sudo apt install ros-humble-rplidar-ros -->
+  <exec_depend>rplidar_ros</exec_depend>
+  <!-- 光達停止區 (navigation.launch.py)；包含在 ros-humble-navigation2 裡 -->
+  <exec_depend>nav2_collision_monitor</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
