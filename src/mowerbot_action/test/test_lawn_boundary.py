@@ -227,3 +227,102 @@ def test_reverse_near_the_start_only_touches_the_tail():
     # 尾巴之前的那一段 (lookback 外) 不會被找到
     track = list(sq)
     assert lb.erase_back(track, 1.0, 0.0, lookback=2.0) == 0.0
+
+
+# ---- 只修錯的那一段 (2026-10-28 will：圈外框失敗只修錯的地方，不要整趟重跑) ----
+def walk(corners, step=0.1):
+    """照 corners 一段一段走 (含最後一點)，每 step 一個點。"""
+    pts = []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        n = max(int(round(math.hypot(bx - ax, by - ay) / step)), 1)
+        pts += [(ax + (bx - ax) * t / n, ay + (by - ay) * t / n) for t in range(n)]
+    return pts + [tuple(corners[-1])]
+
+
+def test_ring_crossings_finds_the_place():
+    assert lb.ring_crossings([(0, 0), (1, 0), (1, 1), (0, 1)]) == []
+    found = lb.ring_crossings([(0, 0), (2, 2), (2, 0), (0, 2)])
+    assert len(found) == 1
+    assert found[0][2] == pytest.approx((1.0, 1.0))
+    # 頂點碰到別的邊也算 (跟以前的 self_intersects 一樣)
+    assert lb.ring_crossings([(0, 0), (2, 0), (1, 0), (1, 2), (0, 2)])
+
+
+def test_small_knot_is_removed_automatically():
+    # 6 x 4 m 繞一圈，下面那條邊中間原地繞了一個 0.5 m 的小圈 (倒車、原地轉身弄出來的)
+    track = walk([(0, 0), (3.0, 0)])
+    track += walk([(3.0, 0), (3.5, 0.4), (3.0, 0.6), (2.8, -0.1)])[1:]
+    track += walk([(2.8, -0.1), (3.2, 0.0), (6, 0), (6, 4), (0, 4), (0, 0.3)])[1:]
+    with pytest.raises(lb.SelfIntersectError):
+        lb._close_once(track, lb.MAX_CLOSE_GAP_M, lb.SIMPLIFY_EPS_M, lb.MIN_AREA_M2)
+    res = lb.close_and_simplify(track)
+    assert len(res['knots']) >= 1
+    assert all(a < lb.KNOT_MAX_AREA for _x, _y, a in res['knots'])
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_out_and_back_excursion_is_removed():
+    # 右邊那條邊開到草地外面 3 m 又開回來，回來時壓過去的線 (細細的一圈、面積很小)：自動拿掉
+    track = walk([(0, 0), (6, 0), (6, 1.9), (9, 2.1), (6, 1.8), (6, 4), (0, 4), (0, 0.3)])
+    res = lb.close_and_simplify(track)
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert max(x for x, _y in res['polygon']) < 6.2
+
+
+def big_crossing_track():
+    """6 x 4 m 的一圈，右邊那條邊開歪了：往左上斜斜切過去又開回右邊，交叉圍出兩塊大的 (小的那塊 3.5 m²)。"""
+    return walk([(0, 0), (6, 0), (6, 1), (1, 3.5), (1, 0.8), (6, 3.5), (6, 4), (0, 4), (0, 0.3)])
+
+
+def test_big_crossing_reports_where():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    assert len(e.value.crossings) == 1
+    x, y = e.value.crossings[0]
+    assert x == pytest.approx(3.6, abs=0.1) and y == pytest.approx(2.2, abs=0.1)
+    assert '修一段' in str(e.value)
+    assert e.value.ring is not None and len(e.value.ring) > 100
+
+
+def test_fix_one_piece_replaces_the_wrong_part():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    base = e.value.ring
+    # 從右下角上面一點 (6, 0.6) 沿著真的邊 (x = 6) 開到 (6, 3.8)，接回原來的線
+    patch = walk([(6.05, 0.6), (6.05, 3.8)])
+    out = lb.splice(base, patch)
+    assert out['crossings'] == []
+    assert 12.0 < out['replaced'] < 16.0              # 換掉的是開歪的那一截 (約 14 m)，不是其他的
+    res = lb.finish_ring(out['ring'])
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_fix_driven_in_the_opposite_direction():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    patch = walk([(6.05, 3.8), (6.05, 0.6)])         # 反方向開也一樣
+    out = lb.splice(e.value.ring, patch)
+    assert out['crossings'] == []
+    assert lb.finish_ring(out['ring'])['area'] == pytest.approx(24.0, rel=0.03)
+
+
+def test_fix_a_finished_frame_adds_a_missed_corner():
+    # 圈好的 6 x 4 m 外框漏了右上角一塊：從右邊開出去繞過那一塊再接回上面那條邊
+    poly = lb.close_and_simplify(walk([(0, 0), (6, 0), (6, 4), (0, 4), (0, 0.3)]))['polygon']
+    base = lb.densify(poly)
+    patch = walk([(6.0, 3.0), (7.5, 3.0), (7.5, 5.5), (5.0, 5.5), (5.0, 4.0)])
+    out = lb.splice(base, patch)
+    assert out['crossings'] == []
+    res = lb.finish_ring(out['ring'])
+    # 原來 24 m² + 右上那一塊 (x 5~7.5、y 3~5.5 扣掉原來就在裡面的 x 5~6、y 3~4)
+    assert res['area'] == pytest.approx(24.0 + 2.5 * 2.5 - 1.0, rel=0.03)
+
+
+def test_fix_far_from_the_frame_is_refused():
+    base = lb.densify([(0, 0), (6, 0), (6, 4), (0, 4)])
+    with pytest.raises(ValueError, match='起點離原來的外框'):
+        lb.splice(base, walk([(3, 2), (3, 3)]))
+    with pytest.raises(ValueError, match='終點離原來的外框'):
+        lb.splice(base, walk([(6, 1), (4, 2)]))

@@ -103,7 +103,10 @@ SAVE_MAX = 130.0
 # 外框 (草地邊界，boundary_recorder)：開回起點多近才能「結束」(跟 lawn_boundary.MAX_CLOSE_GAP_M 一樣)。
 # 2026-10-21 起網頁叫它「外框」(will 的說法)：建圖中按開始、沿邊開一圈、按結束，走過的線就是割草範圍的外框。
 LAWN_CLOSE_GAP = 1.0
-LAWN_WHAT = {'start': '開始圈外框', 'stop': '外框圈好了', 'cancel': '放棄這次圈外框', 'clear': '清除外框'}
+LAWN_WHAT = {'start': '開始圈外框', 'stop': '外框圈好了', 'cancel': '放棄這次圈外框', 'clear': '清除外框',
+             'fix': '修一段外框'}
+# 修一段 (2026-10-28 will：圈外框失敗只修錯的地方，不要整趟重跑)：開了多長才算「修過去了」可以按完成
+LAWN_FIX_MIN_LEN = 1.0
 
 # 網頁改速度 (2026-10-21 will)。跟 car-start 的「速度上限」是同一個比例 (speed_scale)：手把和 Nav2 都乘它。
 # 執行中改，重開車上程式就回到 car-start 的值 (0.25)。0.5 要先量過煞車距離 (實車還沒量)。
@@ -320,6 +323,9 @@ class HmiWeb(Node):
         self.lawn_pts = None                            # /lawn_boundary
         self.lawn_ver = 0
         self.rec_on = False                             # /boundary_recorder/recording
+        # /boundary_recorder/state (修一段：交叉的地方、要修的那一圈)
+        self.rec_state = {}
+        self.fix_ver = 0
         self.rec_pts = None                             # 正在記錄的軌跡
         self.rec_len = 0.0
         self.rec_ver = 0
@@ -349,7 +355,7 @@ class HmiWeb(Node):
         self.frame = {}
         self.heavy = {'alarms': ([], 0), 'events': ([], 0), 'route': (None, 0),
                       'boundary': (None, 0), 'trail': (None, 0), 'lawn': (None, 0), 'rec': (None, 0),
-                      'edge': (None, 0)}
+                      'edge': (None, 0), 'fix': (None, 0)}
         self.map_png = None
         self.map_meta = {'ready': False, 'ver': 0}
         self.map_ver = 0
@@ -436,6 +442,7 @@ class HmiWeb(Node):
         sub(PolygonStamped, '/lawn_boundary', self._on_lawn, LATCHED)
         sub(Bool, '/boundary_recorder/recording', self._on_rec, LATCHED)
         sub(Path, '/boundary_recorder/track', self._on_track, 10)
+        sub(String, '/boundary_recorder/state', self._on_rec_state, LATCHED)
         sub(PolygonStamped, '/polygon_stop', self._on_zone, qos_profile_sensor_data)
         sub(String, '/map_session/info', self._on_map_info, LATCHED)
         sub(String, '/map_session/match', self._on_loc, LATCHED)
@@ -685,6 +692,15 @@ class HmiWeb(Node):
             self.rec_on = bool(msg.data)
             self.rec_ver += 1
 
+    def _on_rec_state(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except ValueError:
+            return
+        with self._lock:
+            self.rec_state = data if isinstance(data, dict) else {}
+            self.fix_ver += 1
+
     def _on_track(self, msg):
         pts = [[round(p.pose.position.x, 3), round(p.pose.position.y, 3)] for p in msg.poses]
         with self._lock:
@@ -843,13 +859,26 @@ class HmiWeb(Node):
                 nav_ready = False
 
         with self._lock:
+            rs = self.rec_state
+            lstate = rs.get('state') or ('recording' if self.rec_on else 'idle')
+            fix_base = rs.get('base') if lstate in ('needs_fix', 'fixing') else None
             lawn = {'recording': self.rec_on, 'set': bool(self.lawn_pts), 'length': None, 'gap': None,
-                    'area': None, 'perimeter': None, 'close_gap': LAWN_CLOSE_GAP}
+                    'area': None, 'perimeter': None, 'close_gap': LAWN_CLOSE_GAP,
+                    # 修一段 (2026-10-28)：state = idle / recording / needs_fix (交叉了，等修) / fixing
+                    'state': lstate,
+                    'crossings': len(rs.get('crossings') or []) if fix_base else 0,
+                    'fix_frame': bool(rs.get('fix_frame')), 'fix_min': LAWN_FIX_MIN_LEN,
+                    'message': rs.get('message', '') if lstate == 'needs_fix' else ''}
             if self.rec_on and self.rec_pts:
                 lawn['length'] = round(self.rec_len, 1)
                 if pose and frame == 'map':
-                    x0, y0 = self.rec_pts[0]
-                    lawn['gap'] = round(math.hypot(pose['x'] - x0, pose['y'] - y0), 2)
+                    if lstate == 'fixing' and fix_base:
+                        # 修一段：要開回原來的外框線上才能完成，所以顯示離那條線多遠
+                        gap = min(math.hypot(pose['x'] - x, pose['y'] - y) for x, y in fix_base)
+                        lawn['gap'] = round(gap, 2)
+                    else:
+                        x0, y0 = self.rec_pts[0]
+                        lawn['gap'] = round(math.hypot(pose['x'] - x0, pose['y'] - y0), 2)
             if self.lawn_pts:
                 area, perim = poly_area_perimeter(self.lawn_pts)
                 lawn['area'], lawn['perimeter'] = round(area, 1), round(perim, 1)
@@ -909,6 +938,8 @@ class HmiWeb(Node):
                 'lawn': (self.lawn_pts, self.lawn_ver),
                 'rec': (self.rec_pts if self.rec_on else None, self.rec_ver),
                 'edge': (self.edge_pts, self.edge_ver),
+                'fix': ({'base': fix_base, 'crossings': rs.get('crossings') or []}
+                        if fix_base else None, self.fix_ver),
             }
             self.release_stale_holder()
 
@@ -1125,6 +1156,8 @@ class HmiWeb(Node):
                 self.rec_on = False
                 self.rec_pts = None
                 self.rec_ver += 1
+                self.rec_state = {}
+                self.fix_ver += 1
                 self.map_msg = None
                 self.keepout_msg = None
                 self.map_meta = {'ready': False, 'ver': 0}
@@ -1671,13 +1704,14 @@ class HmiWeb(Node):
         if cmd == 'lawn':
             if arg not in LAWN_WHAT:
                 return False, '不認得的指令'
-            if mode in (1, 3) and arg in ('start', 'stop'):
+            if mode in (1, 3) and arg in ('start', 'stop', 'fix'):
                 return False, '自動割草中不能圈外框，先切手動'
-            if arg == 'start' and not self.map_active():
+            if arg in ('start', 'fix') and not self.map_active():
                 return False, '還沒開始建圖：先「開始建圖」（手把 LB + A），外框要記在地圖上'
-            if arg == 'start' and self.localization() and not (self.loc_state() or {}).get('ok'):
+            loc_bad = self.localization() and not (self.loc_state() or {}).get('ok')
+            if arg in ('start', 'fix') and loc_bad:
                 return False, '定位還沒對上存好的地圖：先「設定車子位置」，外框才會記在對的地方'
-            if arg == 'start' and self.rec_on:
+            if arg in ('start', 'fix') and self.rec_on:
                 return False, '已經在記錄了'
             if arg == 'stop' and not self.rec_on:
                 return False, '目前沒有在記錄'

@@ -374,6 +374,7 @@ tr.rtn td { color: var(--fg-3); }
               <span><i style="border-top:2px solid var(--fg)"></i>割草範圍</span>
               <span id="lgLawn" hidden><i style="border-top:2px dotted var(--fg-2)"></i>外框</span>
               <span id="lgRec" hidden><i style="border-top:2.5px solid var(--sel)"></i>記錄中的邊界</span>
+              <span id="lgFix" hidden><i style="border-top:2px dashed var(--p1)"></i>要修的外框（紅圈 = 交叉）</span>
               <span><i style="background:repeating-linear-gradient(135deg,var(--fg-3) 0 2px,transparent 2px 5px)"></i>禁區</span>
               <span><i style="background:var(--mown)"></i>已割</span>
               <span><i style="border-top:1.5px dashed var(--route)"></i>還沒割</span>
@@ -387,7 +388,7 @@ tr.rtn td { color: var(--fg-3); }
             <div class="panel">
               <div class="why" id="why"></div>
               <!-- 按鈕不放在 #why 裡：#why 每 0.2 秒重畫，手指按下去的時候按鈕被換掉就按不到 -->
-              <div class="why-act" id="whyAct" hidden><button type="button" class="btn" id="btnWhyLawnStop">完成記錄邊界</button><button type="button" class="btn go" id="btnWhyLocate" hidden>設定車子位置</button><button type="button" class="btn go" id="btnWhyDraw" hidden>畫禁區</button><button type="button" class="btn" id="btnWhySave" hidden>存地圖</button><button type="button" class="btn" id="btnWhyCancelMap" hidden>取消建圖</button><button type="button" class="btn" id="btnWhyManual" hidden>手動（解除停止）</button><button type="button" class="btn go" id="btnWhyResume" hidden>接著割</button><button type="button" class="btn" id="btnWhyRestart" hidden>重新開始</button></div>
+              <div class="why-act" id="whyAct" hidden><button type="button" class="btn" id="btnWhyLawnStop">完成記錄邊界</button><button type="button" class="btn go" id="btnWhyLawnFix" hidden>修一段</button><button type="button" class="btn go" id="btnWhyLocate" hidden>設定車子位置</button><button type="button" class="btn go" id="btnWhyDraw" hidden>畫禁區</button><button type="button" class="btn" id="btnWhySave" hidden>存地圖</button><button type="button" class="btn" id="btnWhyCancelMap" hidden>取消建圖</button><button type="button" class="btn" id="btnWhyManual" hidden>手動（解除停止）</button><button type="button" class="btn go" id="btnWhyResume" hidden>接著割</button><button type="button" class="btn" id="btnWhyRestart" hidden>重新開始</button></div>
             </div>
             <div class="panel">
               <h2>出發條件<span class="r muted">全部正常車子才會走</span></h2>
@@ -438,6 +439,7 @@ tr.rtn td { color: var(--fg-3); }
                 <div class="btnrow">
                   <button type="button" class="btn" id="btnFrameStart">開始圈外框</button>
                   <button type="button" class="btn" id="btnFrameStop">結束</button>
+                  <button type="button" class="btn" id="btnFrameFix">修一段</button>
                 </div>
               </div>
               <div class="auth-note" id="authNote" hidden>
@@ -504,11 +506,12 @@ tr.rtn td { color: var(--fg-3); }
                 <div class="btnrow" style="margin-top:10px">
                   <button type="button" class="btn" id="btnLawnStart">開始圈外框</button>
                   <button type="button" class="btn" id="btnLawnStop">結束</button>
+                  <button type="button" class="btn" id="btnLawnFix">修一段</button>
                   <button type="button" class="btn" id="btnLawnCancel">取消這次</button>
                   <button type="button" class="btn" id="btnLawnClear">清除外框</button>
                 </div>
                 <p class="note" id="lawnWhy" hidden></p>
-                <p class="note">外框 = 你開車走過的那一圈，割草只在它裡面。草地旁邊沒有牆（水泥地、步道），或地圖從玻璃漏出去，就要圈。建圖中（用存好的地圖時，定位對上之後）把車開到要割的範圍邊上，按「開始圈外框」，用手把沿著邊開一圈，開回起點（總覽地圖上的虛線圓，1 m 內）按「結束」。開錯了不用重來：用手把沿原路倒車，退過的線會擦掉，退到開錯之前再往前開。記的是後輪中間走過的線，割草線和沿邊兩圈都在它裡面。外框跟著地圖存：下次用同一張存好的地圖啟動會自動載回來，建新地圖就要重圈。</p>
+                <p class="note">外框 = 你開車走過的那一圈，割草只在它裡面。草地旁邊沒有牆（水泥地、步道），或地圖從玻璃漏出去，就要圈。建圖中（用存好的地圖時，定位對上之後）把車開到要割的範圍邊上，按「開始圈外框」，用手把沿著邊開一圈，開回起點（總覽地圖上的虛線圓，1 m 內）按「結束」。開錯了不用重來：用手把沿原路倒車，退過的線會擦掉，退到開錯之前再往前開。按「結束」時外框自己交叉了，開歪繞出來的小圈會自動拿掉；拿不掉的會在地圖上畫紅圈，只要修錯的那一段：把車開到錯的地方前面的紅色虛線上，按「修一段」，沿著正確的邊開過去、接回紅色虛線，按「結束」。圈好的外框有一段不對，也可以這樣只修那一段。記的是後輪中間走過的線，割草線和沿邊兩圈都在它裡面。外框跟著地圖存：下次用同一張存好的地圖啟動會自動載回來，建新地圖就要重圈。</p>
               </div>
             </div>
             <div class="panel">
@@ -725,8 +728,8 @@ function demoSource() {
   const RES = 0.05;
   let RW = Math.ceil((RB.x1 - RB.x0) / RES), RH = Math.ceil((RB.y1 - RB.y0) / RES);
   // 展示版圈外框：車子自己沿著草地邊 (往裡 0.3 m) 開一圈，開過起點 0.5 m 停 (真的車是人用手把開)
-  const FRAME_LOOP = (() => {
-    const P = [[-5.7, -2.7], [5.7, -2.7], [5.7, 1.5], [4.5, 1.5], [4.5, 2.7], [-5.7, 2.7]].map(p => SITE.W(...p));
+  function frameLoop(UV) {
+    const P = UV.map(p => SITE.W(...p));
     const cum = [0]; for (let i = 0; i < P.length; i++) { const a = P[i], b = P[(i + 1) % P.length]; cum.push(cum[i] + Math.hypot(b[0] - a[0], b[1] - a[1])); }
     const L = cum[P.length];
     const at = u => {
@@ -736,7 +739,43 @@ function demoSource() {
     };
     const pts = () => { const out = []; for (let u = 0; u < L; u += 0.1) { const q = at(u); out.push([q.x, q.y]); } return out; };
     return { L, at, pts, overshoot: 0.5 };
-  })();
+  }
+  const FRAME_LOOP = frameLoop([[-5.7, -2.7], [5.7, -2.7], [5.7, 1.5], [4.5, 1.5], [4.5, 2.7], [-5.7, 2.7]]);
+  // 第一次圈外框故意開錯一段 (示範「修一段」，2026-10-28)：下面那條邊開到一半往裡繞回來，壓過自己開過的線
+  const FRAME_WRONG = frameLoop([[-5.7, -2.7], [2, -2.7], [2, -0.5], [-1, -0.5], [-1, -3.2], [3, -3.2], [3, -2.7],
+    [5.7, -2.7], [5.7, 1.5], [4.5, 1.5], [4.5, 2.7], [-5.7, 2.7]]);
+  // 修的那一段：正確的外框上 u = 3.2 (錯的地方前面) 開到 u = 9.3 (後面)
+  const FRAME_FIX = { u0: 3.2, u1: 9.3 };
+  // 外框交叉的地方 (跟 lawn_boundary.ring_crossings 一樣，展示版沒有自動拿掉小圈)
+  function ringCrossings(R) {
+    const out = [], n = R.length;
+    for (let i = 0; i < n; i++) {
+      const a = R[i], b = R[(i + 1) % n];
+      for (let j = i + 2; j < n; j++) {
+        if (i === 0 && j === n - 1) continue;
+        const c = R[j], d = R[(j + 1) % n];
+        const d1 = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]), d2 = (b[0] - a[0]) * (d[1] - a[1]) - (b[1] - a[1]) * (d[0] - a[0]);
+        const d3 = (d[0] - c[0]) * (a[1] - c[1]) - (d[1] - c[1]) * (a[0] - c[0]), d4 = (d[0] - c[0]) * (b[1] - c[1]) - (d[1] - c[1]) * (b[0] - c[0]);
+        if (d1 * d2 < 0 && d3 * d4 < 0) { const t = d3 / (d3 - d4); out.push([a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])]); }
+      }
+    }
+    // 同一個地方 (取樣點很密) 只算一個
+    return out.filter((p, k) => out.findIndex(q => Math.hypot(q[0] - p[0], q[1] - p[1]) < 0.3) === k);
+  }
+  // 修一段：新開的這段換掉原來外框的那一截 (簡化版的 lawn_boundary.splice：起點、終點各接最近的一點，兩個方向挑交叉少、換掉短的)
+  function spliceFix(base, patch) {
+    const n = base.length, near = p => { let k = 0, bd = Infinity; base.forEach((q, i) => { const d = Math.hypot(q[0] - p[0], q[1] - p[1]); if (d < bd) { bd = d; k = i; } }); return [k, bd]; };
+    const [ia, ga] = near(patch[0]), [ib, gb] = near(patch[patch.length - 1]);
+    if (ga > 1.0) return { err: '修的這一段的起點離原來的外框 ' + fx(ga, 1) + ' m，要在 1 m 內' };
+    if (gb > 1.0) return { err: '終點離原來的外框還有 ' + fx(gb, 1) + ' m，開回原來的線 1 m 內再按結束' };
+    const arc = (i, j) => { const out = []; for (let k = i; ; k = (k + 1) % n) { out.push(base[k]); if (k === j) break; } return out; };
+    const len = P => P.slice(1).reduce((a, q, i) => a + Math.hypot(q[0] - P[i][0], q[1] - P[i][1]), 0);
+    const A = { ring: patch.concat(arc(ib, ia).slice(1, -1)), replaced: len(arc(ia, ib)) };
+    const B = { ring: arc(ia, ib).concat(patch.slice().reverse().slice(1, -1)), replaced: len(arc(ib, ia)) };
+    [A, B].forEach(o => { o.crossings = ringCrossings(o.ring); });
+    const best = (A.crossings.length - B.crossings.length || A.replaced - B.replaced) <= 0 ? A : B;
+    return Object.assign(best, { added: len(patch) });
+  }
   function polyAreaPerim(P) {
     let a = 0, l = 0; for (let i = 0; i < P.length; i++) { const p = P[i], q = P[(i + 1) % P.length]; a += p[0] * q[1] - q[0] * p[1]; l += Math.hypot(q[0] - p[0], q[1] - p[1]); }
     return [Math.abs(a) / 2, l];
@@ -1026,7 +1065,7 @@ function demoSource() {
       mode: 1, mstate: 2, msg: '', route: buildRoute(SITE.start), routeShown: true, s: 0, mown: [],
       v: 0.175, w: 0, navV: 0.175, pose: { ...SITE.start }, joy: { connected: true, latched: false },
       obstacle: null, blockedFor: 0, skipped: [], authority: 'here', freezeUntil: 0, alarms: [], events: [], scan: [], zoneN: 0,
-      scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '', siteKo: true, savingUntil: 0, lawnRec: null, lawnPts: null,
+      scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '', siteKo: true, savingUntil: 0, lawnRec: null, lawnPts: null, lawnFix: null, frameTries: 0,
       resume: null, planOpt: sim.planOpt || { spacing: 0.3, edge: '1.10,0.75' },
     });
     const R = sim.route; let g = R.segs.findIndex(sg => /^割草線 4\//.test(sg.label));
@@ -1083,13 +1122,13 @@ function demoSource() {
     sim.zoneN = n;
     const LR = sim.lawnRec;
     if (LR && LR.driving && sim.mode !== 4) {
-      LR.u = Math.min(FRAME_LOOP.L + FRAME_LOOP.overshoot, LR.u + SPEED * SPEEDUP * dt);
-      const prev = sim.pose.yaw; sim.pose = FRAME_LOOP.at(LR.u); sim.v = SPEED;
+      LR.u = Math.min(LR.uEnd, LR.u + SPEED * SPEEDUP * dt);
+      const prev = sim.pose.yaw; sim.pose = LR.path.at(LR.u); sim.v = SPEED;
       let dy = sim.pose.yaw - prev; while (dy > Math.PI) dy -= 2 * Math.PI; while (dy < -Math.PI) dy += 2 * Math.PI;
       sim.w = Math.max(-1.2, Math.min(1.2, dt > 0 ? dy / (dt * SPEEDUP) : 0));
       const q = LR.pts[LR.pts.length - 1];
       if (Math.hypot(sim.pose.x - q[0], sim.pose.y - q[1]) >= 0.1) { LR.len += Math.hypot(sim.pose.x - q[0], sim.pose.y - q[1]); LR.pts.push([sim.pose.x, sim.pose.y]); }
-      if (LR.u >= FRAME_LOOP.L + FRAME_LOOP.overshoot) { LR.driving = false; sim.v = 0; sim.w = 0; logEv('系統', '（展示版）車子開回起點附近了，可以按「結束」'); }
+      if (LR.u >= LR.uEnd) { LR.driving = false; sim.v = 0; sim.w = 0; logEv('系統', LR.fix ? '（展示版）車子開回原來的外框線上了，可以按「結束」' : '（展示版）車子開回起點附近了，可以按「結束」'); }
       return;
     }
     if (LR && !LR.driving) { sim.v = 0; sim.w = 0; }
@@ -1183,8 +1222,14 @@ function demoSource() {
       keepout: { zones: sim.koZones || 0, area: sim.koArea || 0, undo: sim.koUndo.length > 0 },
       saving: up && Date.now() < (sim.savingUntil || 0),
       lawn: (() => {
-        const L = { recording: !!sim.lawnRec, set: !!sim.lawnPts, length: null, gap: null, area: null, perimeter: null, close_gap: 1.0 };
-        if (sim.lawnRec) { const p0 = sim.lawnRec.pts[0]; L.length = Math.round(sim.lawnRec.len * 10) / 10; L.gap = Math.round(Math.hypot(sim.pose.x - p0[0], sim.pose.y - p0[1]) * 100) / 100; }
+        const LF = sim.lawnFix, fixing = !!(sim.lawnRec && sim.lawnRec.fix);
+        const L = { recording: !!sim.lawnRec, set: !!sim.lawnPts, length: null, gap: null, area: null, perimeter: null, close_gap: 1.0,
+          state: fixing ? 'fixing' : sim.lawnRec ? 'recording' : LF ? 'needs_fix' : 'idle', crossings: LF ? LF.crossings.length : 0, fix_frame: false, fix_min: 1.0, message: '' };
+        if (sim.lawnRec) {
+          const p0 = sim.lawnRec.pts[0]; L.length = Math.round(sim.lawnRec.len * 10) / 10;
+          const gap = fixing ? Math.min(...LF.base.map(q => Math.hypot(sim.pose.x - q[0], sim.pose.y - q[1]))) : Math.hypot(sim.pose.x - p0[0], sim.pose.y - p0[1]);
+          L.gap = Math.round(gap * 100) / 100;
+        }
         if (sim.lawnPts) { const [a, l] = polyAreaPerim(sim.lawnPts); L.area = Math.round(a * 10) / 10; L.perimeter = Math.round(l * 10) / 10; }
         return L;
       })(),
@@ -1201,6 +1246,7 @@ function demoSource() {
         scan: sim.scan,
         lawn: up ? sim.lawnPts : null,
         rec: up && sim.lawnRec ? sim.lawnRec.pts : null,
+        fix: up && sim.lawnFix ? { base: sim.lawnFix.base, crossings: sim.lawnFix.crossings } : null,
       },
       vehicle: VEH0,
       alarms: sim.alarms, events: sim.events,
@@ -1293,7 +1339,7 @@ function demoSource() {
         // 存好的地圖：那張圖畫的禁區、圈的外框一起載回來 (清單上寫有的才載)
         const m = (frame().maps || []).find(x => x.name === name) || {};
         Object.assign(sim, { running: true, busy: null, since: Date.now(), mode: 2, mstate: 0, msg: '', mapping: saved, mapName: saved ? name : null, routeShown: false, s: 0, mown: [[0, 0]], skipped: [], pose: { ...SITE.start }, obstacle: null,
-          siteKo: saved && !!m.keepout, ko: [], koUndo: [], lawnRec: null, lawnPts: saved && m.lawn && !SITE.base ? FRAME_LOOP.pts() : null, mapVer: sim.mapVer + 1,
+          siteKo: saved && !!m.keepout, ko: [], koUndo: [], lawnRec: null, lawnFix: null, lawnPts: saved && m.lawn && !SITE.base ? FRAME_LOOP.pts() : null, mapVer: sim.mapVer + 1,
           loc: saved ? { state: 'lost', ok: false, score: 0.21, text: '對不上地圖 (最好的位置也只有 21% 光達落在牆上)：車子可能不在上次關機的位置附近。在網頁上點出車子在哪、朝哪' } : null, locName: saved ? name : '' });
         sim.route = buildRoute(sim.pose);
         logEv('系統', '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s）' + (saved ? '，用存好的地圖 ' + name : '，建新地圖'));
@@ -1325,7 +1371,7 @@ function demoSource() {
       setTimeout(() => { sim.running = false; sim.busy = 'starting'; logEv('系統', '車上程式關掉了'); }, 2000);
       setTimeout(() => {
         Object.assign(sim, { running: true, busy: null, since: Date.now(), mode: 2, mstate: 0, msg: '', mapping: false, mapName: null, routeShown: false, s: 0, mown: [[0, 0]], skipped: [],
-          obstacle: null, siteKo: false, ko: [], koUndo: [], lawnRec: null, lawnPts: null, mapVer: sim.mapVer + 1, loc: null, locName: '', resume: null });
+          obstacle: null, siteKo: false, ko: [], koUndo: [], lawnRec: null, lawnFix: null, lawnPts: null, mapVer: sim.mapVer + 1, loc: null, locName: '', resume: null });
         sim.route = buildRoute(sim.pose);
         logEv('系統', '車上程式在跑了（光達開，速度上限 0.25，最快約 0.17 m/s），建新地圖');
       }, 4500);
@@ -1351,26 +1397,60 @@ function demoSource() {
         if (sim.loc && !sim.loc.ok) return { ok: false, text: '定位還沒對上存好的地圖：先「設定車子位置」，外框才會記在對的地方' };
         if (sim.lawnRec) return { ok: false, text: '已經在記錄了' };
         if (SITE.base) return { ok: false, text: '（展示版）用你自己的地圖時不示範圈外框：車子不知道你的草地邊在哪。重新整理網頁換回示範地圖就能試' };
-        sim.pose = FRAME_LOOP.at(0);
-        sim.lawnRec = { pts: [[sim.pose.x, sim.pose.y]], len: 0, u: 0, driving: true };
-        logEv('網頁 (' + LABEL + ')', '開始圈外框（展示版：車子自己沿邊開一圈；真的車是你用手把開）');
+        // 第一次故意開錯一段，示範「修一段」
+        const wrong = sim.frameTries++ === 0, path = wrong ? FRAME_WRONG : FRAME_LOOP;
+        sim.pose = path.at(0); sim.lawnFix = null;
+        sim.lawnRec = { pts: [[sim.pose.x, sim.pose.y]], len: 0, u: 0, uEnd: path.L + path.overshoot, path, driving: true };
+        logEv('網頁 (' + LABEL + ')', '開始圈外框（展示版：車子自己沿邊開一圈' + (wrong ? '，這一圈故意開錯一段，示範「修一段」' : '') + '；真的車是你用手把開）');
         return { ok: true, text: '開始記錄：沿著邊開一圈，開回起點 1 m 內按「結束」' };
+      }
+      if (a === 'fix') {
+        if (sim.mode === 1) return { ok: false, text: '自動割草中不能圈外框，先切手動' };
+        if (sim.lawnRec) return { ok: false, text: '已經在記錄了' };
+        if (!sim.lawnFix) return { ok: false, text: sim.lawnPts ? '（展示版）只示範修交叉的那一圈：再按一次「開始圈外框」會圈對，真的車上圈好的外框也能修一段' : '還沒有外框可以修：先「開始圈外框」' };
+        sim.pose = FRAME_LOOP.at(FRAME_FIX.u0);
+        sim.lawnRec = { pts: [[sim.pose.x, sim.pose.y]], len: 0, u: FRAME_FIX.u0, uEnd: FRAME_FIX.u1, path: FRAME_LOOP, driving: true, fix: true };
+        logEv('網頁 (' + LABEL + ')', '修一段外框（展示版：車子自己從錯的地方前面開到後面；真的車是你用手把開）');
+        return { ok: true, text: '開始修一段：沿正確的邊開過要修的地方，接回原來的外框（紅色虛線）1 m 內按「結束」' };
       }
       if (a === 'stop') {
         if (!sim.lawnRec) return { ok: false, text: '目前沒有在記錄' };
+        if (sim.lawnRec.fix) {
+          if (sim.lawnRec.len < 1.0) return { ok: false, text: '才開了 ' + fx(sim.lawnRec.len, 1) + ' m：開過要修的地方再按結束' };
+          const r = spliceFix(sim.lawnFix.base, sim.lawnRec.pts);
+          if (r.err) return { ok: false, text: r.err + '（還在記錄中）' };
+          sim.lawnRec = null;
+          if (r.crossings.length) { sim.lawnFix = { base: r.ring, crossings: r.crossings }; return { ok: false, text: '這一段接上了，但外框還有 ' + r.crossings.length + ' 個地方交叉（紅圈），再修一段' }; }
+          sim.lawnFix = null; sim.lawnPts = r.ring;
+          if (sim.resume && !sim.resume.changed.includes('外框')) sim.resume.changed.push('外框');
+          const [ar] = polyAreaPerim(sim.lawnPts);
+          logEv('網頁 (' + LABEL + ')', '外框修好了：換掉原來的 ' + fx(r.replaced, 1) + ' m，' + fx(ar, 1) + ' m²');
+          return { ok: true, text: '外框修好了：換掉原來的 ' + fx(r.replaced, 1) + ' m、接上新開的 ' + fx(r.added, 1) + ' m，面積 ' + fx(ar, 1) + ' m²' };
+        }
         const p0 = sim.lawnRec.pts[0], gap = Math.hypot(sim.pose.x - p0[0], sim.pose.y - p0[1]);
         if (gap > 1.0) return { ok: false, text: '離起點還有 ' + fx(gap, 1) + ' m，開回起點 1 m 內再按結束' };
         // 開過頭：剪掉最後一次進起點 1 m 內那段裡最靠近起點之後的點 (跟 lawn_boundary.py 一樣)
         const P = sim.lawnRec.pts; let k = P.length - 1, best = k, bd = Infinity;
         while (k > 0 && Math.hypot(P[k][0] - p0[0], P[k][1] - p0[1]) <= 1.0) { const d = Math.hypot(P[k][0] - p0[0], P[k][1] - p0[1]); if (d < bd) { bd = d; best = k; } k--; }
-        sim.lawnPts = P.slice(0, best + 1); sim.lawnRec = null;
+        const ring = P.slice(0, best + 1), cr = ringCrossings(ring);
+        sim.lawnRec = null;
+        if (cr.length) {
+          sim.lawnFix = { base: ring, crossings: cr };
+          logEv('網頁 (' + LABEL + ')', '外框交叉了 ' + cr.length + ' 個地方，等修一段');
+          return { ok: false, text: '外框有 ' + cr.length + ' 個地方交叉了（地圖上的紅圈）。開到錯的地方前面的紅色虛線上按「修一段」，其他地方不用重開' };
+        }
+        sim.lawnPts = ring;
         if (sim.resume && !sim.resume.changed.includes('外框')) sim.resume.changed.push('外框');
         const [ar] = polyAreaPerim(sim.lawnPts);
         logEv('網頁 (' + LABEL + ')', '外框記好了：' + fx(ar, 1) + ' m²');
         return { ok: true, text: '外框記好了：' + fx(ar, 1) + ' m²，割草只在它裡面' };
       }
-      if (a === 'cancel') { if (!sim.lawnRec) return { ok: false, text: '目前沒有在記錄' }; sim.lawnRec = null; logEv('網頁 (' + LABEL + ')', '取消這次圈外框'); return { ok: true, text: '取消了，舊的外框留著' }; }
-      if (a === 'clear') { if (sim.resume && sim.lawnPts && !sim.resume.changed.includes('外框')) sim.resume.changed.push('外框'); sim.lawnPts = null; logEv('網頁 (' + LABEL + ')', '清除外框'); return { ok: true, text: '外框清掉了' }; }
+      if (a === 'cancel') {
+        if (sim.lawnRec && sim.lawnRec.fix) { sim.lawnRec = null; logEv('網頁 (' + LABEL + ')', '取消修這一段'); return { ok: true, text: '修的這一段不要了，交叉的那一圈還在，可以再修' }; }
+        if (!sim.lawnRec && !sim.lawnFix) return { ok: false, text: '目前沒有在記錄' };
+        sim.lawnRec = null; sim.lawnFix = null; logEv('網頁 (' + LABEL + ')', '取消這次圈外框'); return { ok: true, text: '取消了，舊的外框留著' };
+      }
+      if (a === 'clear') { if (sim.resume && sim.lawnPts && !sim.resume.changed.includes('外框')) sim.resume.changed.push('外框'); sim.lawnPts = null; sim.lawnFix = null; logEv('網頁 (' + LABEL + ')', '清除外框'); return { ok: true, text: '外框清掉了' }; }
       return { ok: false, text: '不認得的指令' };
     },
     planopt(a) {
@@ -1549,8 +1629,8 @@ function demoSource() {
 // 畫面
 // ===================================================================
 let last = null, lastRx = 0, view = 'overview', almTab = 'active', pending = null, everRx = false;
-const cache = { alarms: [], events: [], route: null, boundary: null, trail: null, current: null, lawn: null, rec: null, edge: null };
-const GEO_KEYS = ['route', 'boundary', 'trail', 'current', 'lawn', 'rec', 'edge'];
+const cache = { alarms: [], events: [], route: null, boundary: null, trail: null, current: null, lawn: null, rec: null, edge: null, fix: null };
+const GEO_KEYS = ['route', 'boundary', 'trail', 'current', 'lawn', 'rec', 'edge', 'fix'];
 const trendBuf = []; for (let i = 0; i < 300; i++) trendBuf.push([0, 0]);
 
 // 大的欄位 (警報、紀錄、路線、軌跡) N150 只在有變的時候送；沒送就沿用上一次的
@@ -1614,6 +1694,7 @@ function tileBlock(tile, st) {
     if (r.changed && r.changed.length) return '停下來之後改過' + r.changed.join('和') + '，舊的路線不能用了：用「自動割草」重新開始';
   }
   if ((auto || tile.m === 'preview') && st.lawn && st.lawn.recording) return '正在圈外框：先按「結束」或「取消這次」';
+  if ((auto || tile.m === 'preview') && st.lawn && st.lawn.state === 'needs_fix') return '外框交叉了還沒修：先「修一段」，或「取消這次」用原來的外框';
   if (auto && !st.joy.connected) return '手把沒連上：自動割草要手把連著';
   if (auto && !st.nav_ready) return '導航 (Nav2) 還沒準備好';
   if (tile.m === 'preview' && st.mode === 1) return '自動割草中不能預覽，先切手動';
@@ -1677,7 +1758,13 @@ function ask(kind, tile) {
       + '車上程式會先關掉（先切停止，輪子停了才關）再開起來，大約 30～60 秒。開好了從車子現在的位置重新建圖：按「開始建圖」或手把 LB + A。';
     run = () => Source.send('cancelmap');
   }
-  else if (kind === 'lawnCancel') { title = '取消這次圈外框？'; detail = '開過的這一段不要了。之前圈好的外框不會動。'; run = () => Source.send('lawn', 'cancel'); }
+  else if (kind === 'lawnCancel') {
+    const ls = last && last.lawn ? last.lawn.state : '';
+    if (ls === 'fixing') { title = '取消修這一段？'; detail = '修的這一段不要了，外框跟修之前一樣' + (last.lawn.fix_frame ? '。' : '（交叉的那一圈還在，可以再按「修一段」）。'); }
+    else if (ls === 'needs_fix') { title = '放棄這次圈的外框？'; detail = '交叉的那一圈不要了。之前圈好的外框不會動。'; }
+    else { title = '取消這次圈外框？'; detail = '開過的這一段不要了。之前圈好的外框不會動。'; }
+    run = () => Source.send('lawn', 'cancel');
+  }
   else if (kind === 'lawnClear') { title = '清除外框？'; detail = '割草範圍改回只看地圖上的牆、障礙物和禁區。草地旁邊沒有牆的話會割到外面。'; run = () => Source.send('lawn', 'clear'); }
   else if (kind === 'speed') { title = '速度上限改成 ' + fx(tile, 2) + '？'; detail = '最快約 ' + fx(0.7 * tile, 2) + ' m/s，手把和自動割草一起變快。' + (tile >= 0.5 ? '0.50 要先量過煞車距離。' : '') + '旁邊要有人顧馬達總開關。'; run = () => Source.send('speed', tile); }
   else if (kind === 'koClear') { title = '清除全部禁區？'; detail = '地圖上畫的禁區全部拿掉（可以按「復原上一次」拿回來）。'; run = () => Source.send('keepout', { op: 'clear' }); }
@@ -1728,6 +1815,9 @@ $('#btnLawnClear').onclick = () => ask('lawnClear');
 $('#btnWhyLawnStop').onclick = () => { if (linkOk()) Source.send('lawn', 'stop').then(report); };
 $('#btnFrameStart').onclick = () => Source.send('lawn', 'start').then(report);
 $('#btnFrameStop').onclick = () => Source.send('lawn', 'stop').then(report);
+$('#btnLawnFix').onclick = () => Source.send('lawn', 'fix').then(report);
+$('#btnFrameFix').onclick = () => Source.send('lawn', 'fix').then(report);
+$('#btnWhyLawnFix').onclick = () => { if (linkOk()) Source.send('lawn', 'fix').then(report); };
 // 降速直接改 (按一次)；加速要確認
 $('#poSpacingSeg').addEventListener('click', e => {
   const el = e.target.closest('[data-po-spacing]'); if (!el || el.disabled) return;
@@ -1808,7 +1898,7 @@ function renderOverview(st) {
     ? '這一趟' + esc(resumeText(resumeOf(st))) + '。先按「手動」（或手把 LB + X）解除停止，再選「接著割」或「重新開始」。'
     : '到「操作」按「手動」或手把 LB + X 解除。') + '</p></div>';
   else if (b) html = almIcon(b.p) + '<div><strong>車子暫停：' + esc(b.text) + '</strong><p>' + esc(b.hint || '') + '</p></div>';
-  else if (st.lawn && st.lawn.recording) html = lawnBanner(st);
+  else if (st.lawn && (st.lawn.recording || st.lawn.state === 'needs_fix')) html = lawnBanner(st);
   else if (locMode(st) && st.mapsrc.loc && st.mapsrc.loc.state === 'lost' && !(st.mode === 1 && ms.state === 2))
     html = almIcon(2) + '<div><strong>定位對不上存好的地圖</strong><p>' + esc(st.mapsrc.loc.text || '') + '</p></div>';
   else if (locMode(st) && st.mapsrc.loc && (st.mapsrc.loc.state === 'waiting' || st.mapsrc.loc.state === 'locating'))
@@ -1829,10 +1919,13 @@ function renderOverview(st) {
   $('#mapLocate').hidden = drawing || (!(locMode(st) && st.program.running && isHolder(st)) && !locating);
   renderDraw();
   const recNow = st.program.running && st.manager && st.mode !== 4 && !b && st.lawn && st.lawn.recording;
+  const fixNow = st.program.running && st.manager && st.mode !== 4 && !b && st.lawn && st.lawn.state === 'needs_fix' && !lawnFixBlock(st);
   const lostNow = st.program.running && locMode(st) && st.mapsrc.loc && st.mapsrc.loc.state === 'lost' && !locating && !locBlock(st);
   // 建圖中 (2026-10-21 will)：建完圖就在這裡畫禁區、存地圖，不用找到「操作」那一頁
-  const mapNow = st.program.running && st.manager && st.mode === 0 && !b && !recNow && !draw && !koBlock(st);
+  const mapNow = st.program.running && st.manager && st.mode === 0 && !b && !recNow && !fixNow && !draw && !koBlock(st);
   $('#btnWhyLawnStop').hidden = !recNow;
+  $('#btnWhyLawnStop').textContent = st.lawn && st.lawn.state === 'fixing' ? '完成這一段' : '完成記錄邊界';
+  $('#btnWhyLawnFix').hidden = !fixNow;
   $('#btnWhyLocate').hidden = !!recNow || !lostNow;
   $('#btnWhyDraw').hidden = !mapNow;
   $('#btnWhySave').hidden = !mapNow;
@@ -1851,8 +1944,8 @@ function renderOverview(st) {
   $('#btnWhyRestart').disabled = !!tileBlock(MODE_TILES.find(t => t.m === 1), st);
   $('#btnWhyResume').title = tileBlock(MODE_TILES.find(t => t.m === 'resume'), st) || '';
   $('#btnWhyRestart').title = tileBlock(MODE_TILES.find(t => t.m === 1), st) || '';
-  $('#whyAct').hidden = !((recNow || lostNow || mapNow || stopNow || resNow) && isHolder(st));
-  $('#btnWhyLawnStop').classList.toggle('go', !!recNow && st.lawn.gap != null && st.lawn.gap <= st.lawn.close_gap);
+  $('#whyAct').hidden = !((recNow || fixNow || lostNow || mapNow || stopNow || resNow) && isHolder(st));
+  $('#btnWhyLawnStop').classList.toggle('go', !!recNow && lawnCanStop(st.lawn));
 
   if (!st.program.running) {
     setHTML($('#interlocks'), ['手把', '光達', '前方停止區', '導航', '停止'].map(n => '<div class="name">' + n + '</div><div class="val ok">—</div>').join(''));
@@ -1888,15 +1981,37 @@ function renderOverview(st) {
   $('#cPose').textContent = st.pose ? 'x ' + fx(st.pose.x, 2) + '　y ' + fx(st.pose.y, 2) + '　' + fx(((st.pose.yaw / DEG) % 360 + 360) % 360, 0) + '°' + (st.pose.frame === 'odom' ? '（odom）' : '') : '—';
 }
 
+// 修一段 (2026-10-28 will：圈外框失敗只修錯的地方，不要整趟重跑)：state = needs_fix (交叉了，等修) / fixing
+// fixing 時 gap = 離原來的外框線多遠 (要接回那條線才能完成)，其他時候 = 離起點多遠
+function lawnCanStop(L) {
+  if (!L || !L.recording || L.gap == null || L.gap > L.close_gap) return false;
+  return L.state !== 'fixing' || (L.length || 0) >= (L.fix_min || 1.0);
+}
 function lawnGapText(L) {
   if (L.gap == null) return '';
-  return L.gap <= L.close_gap ? '離起點 ' + fx(L.gap, 1) + ' m，可以按結束' : '離起點 ' + fx(L.gap, 1) + ' m';
+  const what = L.state === 'fixing' ? '離原來的外框 ' : '離起點 ';
+  return what + fx(L.gap, 1) + ' m' + (lawnCanStop(L) ? '，可以按結束' : '');
 }
 function lawnBanner(st) {
   const L = st.lawn;
+  if (L.state === 'needs_fix') return almIcon(2) + '<div><strong>外框交叉了：只要修錯的那一段</strong><p>地圖上紅圈是交叉的地方'
+    + (L.crossings ? '（' + L.crossings + ' 個）' : '') + '。把車開到錯的地方前面的紅色虛線上，按「修一段」，沿著正確的邊開過去、接回紅色虛線（'
+    + fx(L.close_gap, 0) + ' m 內）按「結束」。其他地方不用重開。要整圈重來就按「開始圈外框」。</p></div>';
+  if (L.state === 'fixing') return '<span class="dot-run on"></span><div><strong>修一段中</strong><p>' +
+    (L.length != null ? '已開 ' + fx(L.length, 1) + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。' : '') +
+    '沿著正確的邊開過要修的地方，開回原來的外框（紅色虛線）按結束，新開的這一段會換掉原來那一截。開錯了一樣可以倒車擦掉。</p></div>';
   return '<span class="dot-run on"></span><div><strong>圈外框中</strong><p>' +
     (L.length != null ? '已開 ' + fx(L.length, 1) + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。' : '') +
     '沿著要割的範圍邊上開一圈，開回起點（地圖上的虛線圓）按結束。</p></div>';
+}
+function lawnFixBlock(st) {
+  const L = st.lawn || {};
+  const lw = lawnBlock(st);
+  if (lw) return lw;
+  if (L.recording) return L.state === 'fixing' ? '正在修一段' : '正在圈外框：先按「結束」或「取消這次」';
+  if (L.state !== 'needs_fix' && !L.set) return '還沒有外框可以修';
+  if (!locOk(st)) return '定位還沒對上存好的地圖（先讓它對上）';
+  return null;
 }
 function lawnBlock(st) {
   if (!isHolder(st)) return '操作權在另一台';
@@ -1985,29 +2100,40 @@ function renderOps(st) {
   const L = st.lawn || {}, lw = lawnBlock(st);
   // 開始圈外框還要定位對上 (不然外框畫歪)；結束不擋：圈到一半定位變弱也能收尾
   const lwStart = lw || (!L.recording && !locOk(st) ? '定位還沒對上存好的地圖（先讓它對上）' : null);
-  setHTML($('#lawnState'), L.recording ? '<span class="tag sel">記錄中</span>' : L.set ? '已設定' : '<span class="muted">沒有</span>');
+  const fixing = L.state === 'fixing', needsFix = L.state === 'needs_fix', lwFix = lawnFixBlock(st);
+  setHTML($('#lawnState'), fixing ? '<span class="tag sel">修一段中</span>' : L.recording ? '<span class="tag sel">記錄中</span>'
+    : needsFix ? '<span class="tag p2">交叉了，要修</span>' : L.set ? '已設定' : '<span class="muted">沒有</span>');
   let kv;
-  if (L.recording) kv = '<dt>已開</dt><dd class="num">' + (L.length != null ? fx(L.length, 1) + ' m' : '—') + '</dd><dt>離起點</dt><dd class="num">' + (L.gap != null ? fx(L.gap, 1) + ' m' + (L.gap <= L.close_gap ? '（可以按完成）' : '（' + fx(L.close_gap, 0) + ' m 內才能完成）') : '—') + '</dd>';
+  if (L.recording) kv = '<dt>已開</dt><dd class="num">' + (L.length != null ? fx(L.length, 1) + ' m' : '—') + '</dd><dt>' + (fixing ? '離原來的外框' : '離起點') + '</dt><dd class="num">' + (L.gap != null ? fx(L.gap, 1) + ' m' + (lawnCanStop(L) ? '（可以按完成）' : L.gap <= L.close_gap ? '（再開過要修的地方）' : '（' + fx(L.close_gap, 0) + ' m 內才能完成）') : '—') + '</dd>';
+  else if (needsFix) kv = '<dt>交叉</dt><dd class="num">' + (L.crossings || '—') + ' 個（地圖上的紅圈）</dd><dt>怎麼修</dt><dd>開到錯的地方前面的紅色虛線上按「修一段」</dd>';
   else if (L.set) kv = '<dt>面積</dt><dd class="num">' + fx(L.area, 1) + ' m²</dd><dt>周長</dt><dd class="num">' + fx(L.perimeter, 1) + ' m</dd>';
   else kv = '<dt>狀態</dt><dd>沒有：割草範圍只看地圖上的牆和障礙物</dd>';
   setHTML($('#lawnKv'), kv);
   $('#btnLawnStart').disabled = !!lwStart || !!L.recording;
   $('#btnLawnStop').disabled = !!lw || !L.recording;
-  $('#btnLawnStop').classList.toggle('go', !!L.recording && L.gap != null && L.gap <= L.close_gap);
-  $('#btnLawnCancel').disabled = !here || !st.program.running || !L.recording;
+  $('#btnLawnStop').classList.toggle('go', lawnCanStop(L));
+  $('#btnLawnFix').disabled = !!lwFix;
+  $('#btnLawnFix').classList.toggle('go', needsFix && !lwFix);
+  $('#btnLawnFix').title = lwFix || '';
+  $('#btnLawnCancel').disabled = !here || !st.program.running || !(L.recording || needsFix);
   $('#btnLawnClear').disabled = !here || !st.program.running || !L.set || !!L.recording;
   const lwn = $('#lawnWhy'); lwn.hidden = !lwStart || !st.program.running; lwn.textContent = lwStart ? '不能圈外框：' + lwStart : '';
 
   // 圈外框 (模式卡片裡，跟「草地邊界」卡片是同一件事)
   let ft;
-  if (L.recording) ft = '圈外框中：已開 ' + (L.length != null ? fx(L.length, 1) : '0') + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。開回起點 ' + fx(L.close_gap, 0) + ' m 內按「結束」。開錯了就沿原路倒車，退過的線會擦掉。';
+  if (fixing) ft = '修一段中：已開 ' + (L.length != null ? fx(L.length, 1) : '0') + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。開過要修的地方、接回原來的外框（紅色虛線）' + fx(L.close_gap, 0) + ' m 內按「結束」。';
+  else if (L.recording) ft = '圈外框中：已開 ' + (L.length != null ? fx(L.length, 1) : '0') + ' m' + (L.gap != null ? '，' + lawnGapText(L) : '') + '。開回起點 ' + fx(L.close_gap, 0) + ' m 內按「結束」。開錯了就沿原路倒車，退過的線會擦掉。';
+  else if (needsFix) ft = '外框交叉了（地圖上的紅圈）。開到錯的地方前面的紅色虛線上按「修一段」，沿正確的邊開過去、接回紅色虛線按「結束」，其他地方不用重開。';
   else if (lwStart) ft = '建圖中沿著要割的範圍開一圈，走過的線就是外框。現在不能圈：' + lwStart;
   else if (L.set) ft = '外框 ' + fx(L.area, 1) + ' m²、周長 ' + fx(L.perimeter, 1) + ' m。要重圈就再按「開始圈外框」。';
   else ft = '把車開到要割的範圍邊上，按「開始圈外框」，沿著邊開一圈回到起點，按「結束」。割草只在這一圈裡面。';
   $('#frameTxt').textContent = ft;
   $('#btnFrameStart').disabled = !!lwStart || !!L.recording;
   $('#btnFrameStop').disabled = !!lw || !L.recording;
-  $('#btnFrameStop').classList.toggle('go', !!L.recording && L.gap != null && L.gap <= L.close_gap);
+  $('#btnFrameStop').classList.toggle('go', lawnCanStop(L));
+  $('#btnFrameFix').disabled = !!lwFix;
+  $('#btnFrameFix').hidden = !needsFix;
+  $('#btnFrameFix').classList.toggle('go', needsFix && !lwFix);
 
   // 速度上限
   const sp = st.speed || {}, cur = speedNow(st), choices = sp.choices || [];
@@ -2110,7 +2236,8 @@ function computeView(st) {
   let B;
   const g = st.geo, wide = locMode(st) && !locOk(st);
   if (wide && st.map.ready && st.map.w) B = { x0: st.map.x0, y0: st.map.y0, x1: st.map.x0 + st.map.w * st.map.res, y1: st.map.y0 + st.map.h * st.map.res };
-  else if (g.rec && g.rec.length > 1) B = bbox(g.rec.concat(st.pose ? [[st.pose.x, st.pose.y]] : []), 2.0);
+  else if (g.rec && g.rec.length > 1 && !(g.fix && g.fix.base)) B = bbox(g.rec.concat(st.pose ? [[st.pose.x, st.pose.y]] : []), 2.0);
+  else if (g.fix && g.fix.base && g.fix.base.length > 2) B = bbox(g.fix.base.concat(st.pose ? [[st.pose.x, st.pose.y]] : []), 1.6);
   else if (g.lawn && g.lawn.length > 2) B = bbox(g.lawn.concat(g.boundary || []), 1.6);
   else if (g.boundary && g.boundary.length > 2) B = bbox(g.boundary, 1.6);
   else if (st.map.ready && st.map.w) B = { x0: st.map.x0, y0: st.map.y0, x1: st.map.x0 + st.map.w * st.map.res, y1: st.map.y0 + st.map.h * st.map.res };
@@ -2134,6 +2261,7 @@ function drawMap() {
   ensureRaster(st.map);
   $('#mapEmpty').hidden = hasMap && !!st.pose;
   $('#lgLawn').hidden = !(hasMap && st.geo.lawn); $('#lgRec').hidden = !(hasMap && st.geo.rec);
+  $('#lgFix').hidden = !(hasMap && st.geo.fix);
   $('#mapEmptyTxt').textContent = !st.program.running ? '車上程式沒在跑' : !st.pose ? '還不知道車子在哪（等 TF）' : '還沒有地圖。到「操作」按「開始建圖」，或手把 LB + A。';
   if (hasMap && rasterImg && rasterData) {
     const m = rasterData.meta;
@@ -2146,10 +2274,19 @@ function drawMap() {
   const g = st.geo;
   if (hasMap && g.boundary && g.boundary.length > 2) { line(g.boundary, true); cx.strokeStyle = tok('--fg'); cx.lineWidth = px(2); cx.stroke(); }
   if (hasMap && g.lawn && g.lawn.length > 2) { line(g.lawn, true); cx.strokeStyle = tok('--fg-2'); cx.lineWidth = px(2); cx.setLineDash([px(1), px(4)]); cx.stroke(); cx.setLineDash([]); }
+  // 修一段 (2026-10-28)：要修的那一圈畫紅色虛線、交叉的地方畫紅圈
+  if (hasMap && g.fix && g.fix.base && g.fix.base.length > 2) {
+    cx.strokeStyle = tok('--p1'); cx.lineWidth = px(2); cx.setLineDash([px(5), px(3)]);
+    line(g.fix.base, true); cx.stroke(); cx.setLineDash([]);
+    cx.lineWidth = px(2.4);
+    (g.fix.crossings || []).forEach(([x, y]) => { cx.beginPath(); cx.arc(x, y, Math.max(0.5, px(12)), 0, 2 * Math.PI); cx.stroke(); });
+  }
   if (hasMap && g.rec && g.rec.length > 0) {
     const [sx, sy] = g.rec[0], rr = (st.lawn && st.lawn.close_gap) || 1.0;
     cx.strokeStyle = tok('--sel'); cx.lineWidth = px(1.5); cx.setLineDash([px(4), px(3)]);
-    cx.beginPath(); cx.arc(sx, sy, rr, 0, 2 * Math.PI); cx.stroke(); cx.setLineDash([]);
+    // 修一段的時候不是開回起點，是接回原來的線 (紅色虛線)，起點的圓不畫
+    if (!(st.lawn && st.lawn.state === 'fixing')) { cx.beginPath(); cx.arc(sx, sy, rr, 0, 2 * Math.PI); cx.stroke(); }
+    cx.setLineDash([]);
     if (g.rec.length > 1) { cx.lineWidth = px(2.6); line(g.rec); cx.stroke(); }
     cx.fillStyle = tok('--sel'); cx.beginPath(); cx.arc(sx, sy, px(4), 0, 2 * Math.PI); cx.fill();
   }
