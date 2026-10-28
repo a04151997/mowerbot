@@ -388,6 +388,8 @@ def generate_launch_description():
                 'rotation_swept_radius': geom.rotation_swept_radius,
                 'soft_inflation_radius': geom.soft_inflation_radius,
                 'blade_width': geom.blade_width,
+                # 刀盤中心在後輪軸前多遠：算周邊環繞跟沿邊重不重複 (2026-10-28)
+                'blade_offset_x': geom.blade_offset_x,
                 # 割草線方向 auto 跟 F2C 一樣在扣掉地頭的區域上挑 (2026-10-19)
                 'headland_width': geom.headland_width,
                 # 周邊環繞的轉角偵測 (vehicle_geometry) 與起點 = 終點的判定門檻 (nav2)

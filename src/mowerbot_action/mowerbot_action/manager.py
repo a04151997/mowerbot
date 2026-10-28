@@ -318,6 +318,11 @@ class MowerManager(Node):
         self.declare_parameter('edge_loops', '', ParameterDescriptor(dynamic_typing=True))
         self.declare_parameter('front_extent', Parameter.Type.DOUBLE)
         self.declare_parameter('rear_extent', Parameter.Type.DOUBLE)
+        # 沿邊那幾圈與割草線都割得到的周邊環繞不繞 (2026-10-28 will：把割草路徑更優化，route_plan 第 5 節)。
+        # 只在沿邊打開時有作用；blade_offset_x (刀盤中心在後輪軸前多遠) 來自 vehicle_geometry，算覆蓋時才要。
+        self.declare_parameter('drop_redundant_perimeter', True)
+        self.drop_redundant_perimeter = bool(self.get_parameter('drop_redundant_perimeter').value)
+        self.declare_parameter('blade_offset_x', Parameter.Type.DOUBLE)
         # 光達停止區 (navigation.launch.py 的 STOP_ZONE_LENGTH / STOP_ZONE_SIDE_MARGIN，要一致)：
         # 沿邊那幾圈在牆邊轉彎時，停止區不能掃到地圖上的牆 (掃到車子就停，那一段 15 s 後判失敗)
         self.declare_parameter('stop_zone_length', 0.40)
@@ -2097,14 +2102,14 @@ class MowerManager(Node):
     # 轉彎處車頭落後 20°～28° 時判接不上，整圈剩下的都不割)。
     EDGE_ALIGN_SKIP = 0.55
 
-    def plan_edge_routes(self, rings, start_xy, transit, header):
+    def plan_edge_routes(self, rings, start_xy, transit, header, edge=None):
         """沿邊多繞幾圈 (route_plan.EdgeLoops)：回傳 ([(Path, 標籤)], 走完停在哪裡, 給 /edge_path 的航點)。
 
         沒打開、或算不出來時回傳 ([], start_xy, [])，任務跟以前一樣只有環繞與割草線。
         先繞哪一圈：從 start_xy 找轉場最近的那一圈，一整圈從離車子近的地方進圈 (2026-10-22，
         EdgeLoops.plan；以前每一圈都從最直的地方進，常常要橫越場地)，一圈接一圈。每一圈切成幾段，
         第一段從匝道的起點開始 (掉得了頭，照常原地對正)，後面幾段接著前一段 (不對正，見
-        check_edge_continuation)。
+        check_edge_continuation)。edge：已經建好的 route_plan.EdgeLoops (edge_loops_for)；None = 這裡建。
         """
         self._edge = None
         self._edge_cont = set()
@@ -2112,14 +2117,15 @@ class MowerManager(Node):
             return [], start_xy, []
         rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
         try:
-            walls = self.map_walls()
-            edge = self.new_edge_loops(rings, walls)
+            if edge is None:
+                edge = self.new_edge_loops(rings, self.map_walls())
             ordered = edge.plan(self.edge_offsets, self.headland_width, rot_need, start_xy,
                                 cost=transit.length if transit is not None else None)
         except Exception as e:     # 算不出來就不繞，不要讓任務因此開不了
             self.get_logger().error('🪢 沿邊繞圈算不出來 (%s: %s)，這一趟不繞。' % (type(e).__name__, e))
             return [], start_xy, []
         self._edge = edge
+        walls = edge.wall
         if walls is None:
             self.get_logger().warn('🪢 還沒收到地圖：沿邊繞圈不知道哪裡是真的牆，牆邊轉角光達停止區有可能擋車')
         here = start_xy
@@ -2168,6 +2174,55 @@ class MowerManager(Node):
             stop_len=float(self.get_parameter('stop_zone_length').value),
             stop_side=float(self.get_parameter('stop_zone_side_margin').value),
             turn_wall=self.turn_wall_need if walls is not None else 0.0)
+
+    def edge_loops_for(self, rings):
+        """這一次規劃的沿邊 route_plan.EdgeLoops (周邊環繞重不重複、沿邊路線共用一份)；沒開沿邊、建不起來回傳 None。"""
+        if not self.edge_offsets or not rings or len(rings[0]) < 3:
+            return None
+        try:
+            return self.new_edge_loops(rings, self.map_walls())
+        except Exception as e:     # noqa: BLE001  建不起來就不繞 (plan_edge_routes 會再試一次、印原因)
+            self.get_logger().error('🪢 沿邊繞圈建不起來 (%s: %s)' % (type(e).__name__, e))
+            return None
+
+    def drop_redundant_loops(self, loops, swaths, rings, edge):
+        """沿邊那幾圈與割草線都割得到的地方，周邊環繞不再重複割 (route_plan 第 5 節，2026-10-28 will：把割草路徑更優化)。
+
+        10-24 實車：環繞 49.6 m 開了 2.8 分鐘，只有它割到的地方 0.59 m² (那一趟割到 94.8 m² 的 0.6%)，
+        沿邊 23 段還跳過了 11 段。一圈「只有它割得到」的地方只剩小碎片 (每塊不到 0.10 m²、加起來不到它
+        自己割的 2%) 就不繞 (route_plan.Coverage.redundant)；直角場地的角落照舊靠環繞割。
+        沒開沿邊、drop_redundant_perimeter 關掉、算不出來時照舊繞。回傳 (留下來的 loops, 不繞的總長 m)。
+        """
+        if not loops or edge is None or not self.drop_redundant_perimeter:
+            return loops, 0.0
+        rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
+        try:
+            cov = route_plan.Coverage(rings, float(self.get_parameter('blade_offset_x').value),
+                                      0.5 * self.blade_width)
+            fixed = [cov.cells(r['pts'])
+                     for r in edge.routes(self.edge_offsets, self.headland_width, rot_need)]
+            if not fixed:
+                return loops, 0.0           # 沿邊一圈都繞不了：環繞照舊
+            fixed += [cov.cells(self.path_xy(sw.poses)) for sw in swaths]
+            drop = cov.redundant(fixed, [cov.cells(self.path_xy(lp)) for lp in loops])
+        except Exception as e:     # noqa: BLE001  算不出來就照舊繞，不要讓任務因此開不了
+            self.get_logger().error('🧹 算不出周邊環繞跟沿邊重不重複 (%s: %s)，照舊繞。'
+                                    % (type(e).__name__, e))
+            return loops, 0.0
+        if not drop:
+            return loops, 0.0
+        gone = {i for i, _a in drop}
+        length = sum(float(np.sum(np.hypot(*np.diff(self.path_xy(loops[i]), axis=0).T)))
+                     for i in gone)
+        self.get_logger().info(
+            '🧹 周邊環繞 %d 圈 (共 %.1f m) 跟沿邊、割草線重複 (只有它割得到 %s m²)，這一趟不繞%s'
+            % (len(gone), length, '、'.join('%.2f' % a for _i, a in drop),
+               '' if len(gone) == len(loops) else '；還有 %d 圈照舊繞' % (len(loops) - len(gone))))
+        return [lp for i, lp in enumerate(loops) if i not in gone], length
+
+    @staticmethod
+    def path_xy(poses):
+        return np.array([(ps.pose.position.x, ps.pose.position.y) for ps in poses], dtype=float)
 
     def make_edge_loops(self, rings):
         """接著割的沿邊那幾段：重建 EdgeLoops，執行中沒接上時才算得出退出路線 (check_edge_continuation)。
@@ -3158,6 +3213,9 @@ class MowerManager(Node):
                     transit.length if transit is not None
                     else (lambda a, b: math.hypot(a[0] - b[0], a[1] - b[1])))
                 clear = transit.clear if transit is not None else None
+                # (6) 2026-10-28：沿邊那幾圈與割草線都割得到的地方，周邊環繞不再重複割 (drop_redundant_loops)
+                edge = self.edge_loops_for(rings)
+                loops, dropped = self.drop_redundant_loops(loops, swaths, rings, edge)
                 ends = [((sw.poses[0].pose.position.x, sw.poses[0].pose.position.y),
                          (sw.poses[-1].pose.position.x, sw.poses[-1].pose.position.y))
                         for sw in swaths]
@@ -3195,7 +3253,7 @@ class MowerManager(Node):
                     q = swaths[-1].poses[-1].pose.position
                     start_xy = (q.x, q.y)
                 edge_entries, _end_xy, edge_display = self.plan_edge_routes(
-                    rings, start_xy, transit, response.coverage_path.header)
+                    rings, start_xy, transit, response.coverage_path.header, edge=edge)
                 # 【關鍵】：把路徑廣播出去給 RViz2 / 網頁畫圖：照真的割草順序，轉場會繞路的地方畫繞路
                 self.path_pub.publish(self.display_route(
                     response.coverage_path, loops, swaths, transit))
@@ -3241,13 +3299,14 @@ class MowerManager(Node):
 
                 self.publish_plan(queue, 'preview' if preview else 'mission', transit, robot_xy)
                 if preview:
-                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。車子不會動；'
+                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。%s車子不會動；'
                             'OK 就按 LB + B 開始割。'
                             % (total, math.degrees(angle) % 180.0,
                                '、分 %d 塊割' % oinfo['chains'] if oinfo['changed'] else '',
                                '、周邊環繞 %d 段' % n_edges if n_edges else '',
                                '、割完再沿邊多繞 %d 段' % len(edge_entries) if edge_entries else '',
-                               len(queue)))
+                               len(queue),
+                               '外圈 (周邊環繞 %.0f m) 跟沿邊重複，不繞。' % dropped if dropped else ''))
                     self.get_logger().info('👀 ' + text)
                     self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
                     return

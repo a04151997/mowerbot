@@ -24,6 +24,8 @@
 
 4. WallClearance / trim_ends：要原地轉身的地方離地圖上的牆要夠遠，光達停止區轉一圈才掃不到牆 (第 4 節)。
 
+5. Coverage / redundant：沿邊與割草線都割得到的周邊環繞不繞 (第 5 節)。
+
 作業區一樣用點陣算 (跟 swath_angle 同一套)：把邊界塗成格子圖、挖掉內環，算每一格離邊界多遠。
 """
 import math
@@ -838,6 +840,7 @@ class EdgeLoops:
             self._wall_near = self.wall_dist <= EDGE_ZONE_MARGIN + 0.5 * res
             self.zone_front, self.zone_half = self.front + stop_len, zw
         self.turn_wall = float(turn_wall) if self.wall is not None else 0.0
+        self._items = {}                # items() 算過的 (offsets, safe_offset)
 
     # ---- 查格子 ----
     def _cells(self, xy):
@@ -1055,7 +1058,11 @@ class EdgeLoops:
         """要繞的每一圈 (整圈走得過去) 或每一截 (走不過去的地方斷開)，還沒挑從哪裡進圈。
 
         回傳 [{'d', 'off', 'full', 'pts', 'yaw'}]：full 的 pts 是閉合的一圈，否則是開放的一截。
+        同樣的 offsets、safe_offset 算過就用上次的 (manager 先用 routes 算周邊環繞重不重複，再用 plan 排順序)。
         """
+        key = (tuple(float(d) for d in offsets), float(safe_offset))
+        if key in self._items:
+            return self._items[key]
         out = []
         for d in offsets:
             off = max(0.0, float(safe_offset) - float(d))
@@ -1081,6 +1088,7 @@ class EdgeLoops:
                         out.append({'d': float(d), 'off': off, 'full': False, 'pts': piece,
                                     'yaw': _headings(piece, False)})
                     run = []
+        self._items[key] = out
         return out
 
     @staticmethod
@@ -1290,3 +1298,122 @@ def zone_sweep_clearance(walls, xy, yaw0, yaw1, x0, x1, half_w, step=math.radian
         pts = p + np.column_stack([c * box[:, 0] - s * box[:, 1], s * box[:, 0] + c * box[:, 1]])
         best = min(best, float(walls.at(pts).min()))
     return best
+
+
+# ---------------------------------------------------------------------------
+# 5. 別的段落都割得到的周邊環繞不繞 (2026-10-28 will：把割草路徑更優化)
+# ---------------------------------------------------------------------------
+# 沿邊那幾圈打開之後 (實車 1.10、0.75 m)，F2C 的周邊環繞 (離邊界 地頭寬 + 線距 / 2 = 0.85 m) 整圈
+# 落在沿邊兩圈割到的帶子裡 (0.75 那圈割 0.50～1.00 m，1.10 那圈割 0.85～1.35 m)。
+# 10-24 實車 (沿邊 23 段跳過了 11 段)：環繞 49.6 m、2.8 分鐘，只有它割到的地方 0.59 m²
+# (那一趟割到 94.8 m² 的 0.6%)；兩邊的沿邊都有開到的地方只有 0.07 m²。
+# 用格子算：每一段刀盤 (後輪軸前 blade_x、半徑 blade_r) 割得到哪幾格，一圈環繞「只有它割得到」的格子
+# 連成的每一小塊都不到 REDUNDANT_MAX_PATCH、加起來也不到它自己割的 REDUNDANT_MAX_SHARE 就不繞。
+# 直角的場地照舊繞：沿邊在角落轉圓弧，環繞的直角割到的角落每個約 0.2 m² 只有它割得到；
+# 角是鈍角 (10-24 那張圖) 時只剩 0.05 m² 以下的小碎片。一次拿掉一圈 (最少的先拿)，拿掉之後重算：
+# 兩圈互相重疊、別人都割不到的地方不會被一起拿掉。
+
+COVER_RES = 0.05            # 格子大小 (m)
+COVER_MAX_CELLS = 1200      # 作業區很大時格子放大，一邊最多這麼多格
+REDUNDANT_MAX_PATCH = 0.10  # 只有它割得到的地方，連成的一小塊 (m²) 都不到這個
+REDUNDANT_MAX_SHARE = 0.02  # 加起來不到它自己割的面積的這麼多
+
+
+class Coverage:
+    """作業區 (外圈 + 內環) 的覆蓋格子：一條路線的刀盤割得到作業區裡的哪幾格。
+
+    blade_x：刀盤中心在後輪軸 (base_footprint) 前面多遠；blade_r：刀盤半徑。
+    原地轉身掃過的地方不算 (每一段都少算，不會因此多拿掉)。
+    """
+
+    def __init__(self, rings, blade_x, blade_r, res=COVER_RES):
+        outer = np.asarray(rings[0], dtype=float)
+        lo, hi = outer.min(axis=0), outer.max(axis=0)
+        self.res = res = max(float(res), float(max(hi - lo)) / COVER_MAX_CELLS)
+        self.origin = lo - 2 * res
+        w = int(math.ceil((hi[0] - lo[0]) / res)) + 5
+        h = int(math.ceil((hi[1] - lo[1]) / res)) + 5
+
+        def px(ring):
+            p = (np.asarray(ring, dtype=float) - self.origin) / res - 0.5
+            return np.round(p * 16).astype(np.int32).reshape(-1, 1, 2)   # 4 bit 小數 (shift=4)
+
+        mask = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(mask, [px(rings[0])], 1, lineType=cv2.LINE_8, shift=4)
+        for hole in rings[1:]:
+            if len(hole) >= 3:
+                cv2.fillPoly(mask, [px(hole)], 0, lineType=cv2.LINE_8, shift=4)
+        self.field = mask.astype(bool).ravel()
+        self.shape = (h, w)
+        self.cell_area = res * res
+        self.blade_x, self.blade_r = float(blade_x), float(blade_r)
+
+    def cells(self, pts):
+        """pts：(N, 2) 航點 (後輪軸中心，車頭朝下一點)。回傳割得到的作業區格子 (攤平的編號，不重複)。"""
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        if len(pts) < 2:
+            return np.zeros(0, np.int64)
+        d = np.diff(pts, axis=0)
+        yaw = np.arctan2(d[:, 1], d[:, 0])
+        yaw = np.append(yaw, yaw[-1])
+        c = pts + self.blade_x * np.column_stack([np.cos(yaw), np.sin(yaw)])
+        # 航點間距比格子大時中間補點，刀盤掃過的帶子才不會斷成一個一個圓
+        dense = [c[:1]]
+        for a, b in zip(c[:-1], c[1:]):
+            k = max(int(math.ceil(math.hypot(*(b - a)) / (2.0 * self.res))), 1)
+            dense.append(a + np.outer(np.arange(1, k + 1) / k, b - a))
+        g = (np.concatenate(dense) - self.origin) / self.res - 0.5     # 格子 (i, j) 的中心在 (i, j)
+        # 每一點周圍的格子，中心離刀盤中心 <= 半徑的算割到 (cv2.circle 會多畫半格，刀盤寬多算 10%)
+        r = self.blade_r / self.res
+        k = np.arange(-int(math.ceil(r)) - 1, int(math.ceil(r)) + 2)
+        ox, oy = (a.ravel() for a in np.meshgrid(k, k))
+        base = np.floor(g + 0.5).astype(np.int64)
+        cx = base[:, :1] + ox
+        cy = base[:, 1:] + oy
+        h, w = self.shape
+        ok = (((cx - g[:, :1]) ** 2 + (cy - g[:, 1:]) ** 2 <= r * r)
+              & (cx >= 0) & (cx < w) & (cy >= 0) & (cy < h))
+        idx = np.unique(cy[ok] * w + cx[ok])
+        return idx[self.field[idx]]
+
+    def redundant(self, fixed, candidates):
+        """candidates (每一圈環繞割到的格子，cells 的回傳值) 裡面哪幾圈不用繞：fixed (一定會走的沿邊、割草線)
+        加上還留著的其他圈都割得到它割的地方，只差幾塊小碎片 (REDUNDANT_MAX_PATCH、REDUNDANT_MAX_SHARE)。
+
+        每一輪拿掉「只有它割得到」最少的那一圈，再重算。回傳 [(candidates 的索引, 只有它割得到的面積 m²)]，
+        照拿掉的順序；都要繞時回傳 []。
+        """
+        count = np.zeros(self.shape[0] * self.shape[1], np.int32)
+        for c in list(fixed) + list(candidates):
+            np.add.at(count, c, 1)          # 每一段的格子不重複 (cells)
+        kept = set(range(len(candidates)))
+        out = []
+        while kept:
+            best = None
+            for i in kept:
+                cells = candidates[i]
+                only = cells[count[cells] == 1]
+                area = len(only) * self.cell_area
+                if (area < REDUNDANT_MAX_SHARE * len(cells) * self.cell_area
+                        and self.biggest_patch(only) < REDUNDANT_MAX_PATCH
+                        and (best is None or area < best[0])):
+                    best = (area, i)
+            if best is None:
+                break
+            area, i = best
+            kept.discard(i)
+            np.subtract.at(count, candidates[i], 1)
+            out.append((i, area))
+        return out
+
+    def biggest_patch(self, cells):
+        """這些格子連成的最大一塊有多大 (m²)。"""
+        if len(cells) == 0:
+            return 0.0
+        h, w = self.shape
+        v, u = np.divmod(np.asarray(cells), w)
+        lo_v, lo_u = int(v.min()), int(u.min())
+        m = np.zeros((int(v.max()) - lo_v + 1, int(u.max()) - lo_u + 1), np.uint8)
+        m[v - lo_v, u - lo_u] = 1
+        _n, _lab, st, _c = cv2.connectedComponentsWithStats(m, connectivity=8)
+        return float(st[1:, cv2.CC_STAT_AREA].max()) * self.cell_area

@@ -567,3 +567,109 @@ def test_edge_plan_two_blocks_no_back_and_forth():
     for r in new:
         check_route(el, r)
     assert _transit(start, new, tp.length) <= _transit(start, old, tp.length) + 1e-6
+
+
+# ---- 沿邊與割草線都割得到的周邊環繞不繞 (Coverage / redundant，2026-10-28) ----
+BLADE_X, BLADE_R = 0.375, 0.25
+HEADLAND = 0.70                 # 地頭寬：環繞在 HEADLAND + 線距 / 2，割草線在扣掉地頭的範圍裡
+
+
+def chamfer(w, h, c):
+    """w x h 的長方形，四個角切掉 c (135° 的鈍角)。"""
+    return [(c, 0.0), (w - c, 0.0), (w, c), (w, h - c), (w - c, h), (c, h), (0.0, h - c), (0.0, c)]
+
+
+def inset(poly, d):
+    """凸多邊形 (逆時針) 往內縮 d 的頂點 (直角不修圓，跟 F2C 的環繞一樣)。"""
+    p = np.asarray(poly, dtype=float)
+    lines = []
+    for a, b in zip(p, np.roll(p, -1, axis=0)):
+        t = (b - a) / np.linalg.norm(b - a)
+        lines.append((a + d * np.array([-t[1], t[0]]), t))
+    out = []
+    for (p1, t1), (p2, t2) in zip([lines[-1]] + lines[:-1], lines):
+        s = np.linalg.solve(np.array([t1, -t2]).T, p2 - p1)
+        out.append(p1 + s[0] * t1)
+    return np.array(out)
+
+
+def closed_loop(vertices, step=0.1):
+    """頂點連成一圈，最後一點 = 第 0 點 (F2C 的周邊環繞)。"""
+    v = np.vstack([vertices, vertices[:1]])
+    pts = []
+    for a, b in zip(v[:-1], v[1:]):
+        n = max(int(round(np.linalg.norm(b - a) / step)), 1)
+        pts += [a + (b - a) * k / n for k in range(n)]
+    return np.array(pts + [v[0]])
+
+
+def swaths_in(poly, spacing=0.30):
+    """凸多邊形裡面沿 x 的弓字形割草線，從 y 最小的地方往上半個線距開始，一個線距一條。"""
+    p = np.asarray(poly, dtype=float)
+    out = []
+    y = p[:, 1].min() + spacing / 2.0
+    while y < p[:, 1].max():
+        xs = np.arange(p[:, 0].min(), p[:, 0].max() + 1e-9, 0.1)
+        pts = np.column_stack([xs, np.full(len(xs), y)])
+        e = np.roll(p, -1, axis=0) - p
+        cross = e[:, 0] * (pts[:, None, 1] - p[:, 1]) - e[:, 1] * (pts[:, None, 0] - p[:, 0])
+        inside = np.all(cross >= 0, axis=1)
+        if inside.sum() >= 2:
+            line = pts[inside]
+            out.append(line if len(out) % 2 == 0 else line[::-1])
+        y += spacing
+    return out
+
+
+def perimeter_case(poly, offsets):
+    """(沿邊 + 割草線割到的格子, 環繞割到的格子, Coverage)。"""
+    rings = [poly]
+    el = route_plan.EdgeLoops(rings, FRONT, REAR, HALF_W)
+    cov = route_plan.Coverage(rings, BLADE_X, BLADE_R)
+    fixed = [cov.cells(r['pts']) for r in el.routes(offsets, SAFE, ROT_NEED)]
+    assert len(fixed) == len(offsets)
+    fixed += [cov.cells(s) for s in swaths_in(inset(poly, HEADLAND))]
+    return fixed, cov.cells(closed_loop(inset(poly, HEADLAND + 0.15))), cov
+
+
+def test_perimeter_inside_both_edge_loops_is_dropped():
+    # 角都是 135° 的場地：環繞整圈落在 1.10、0.75 兩圈沿邊與割草線割到的地方，只剩角落的小碎片
+    for c in (1.0, 2.0, 2.5):
+        fixed, perim, cov = perimeter_case(chamfer(10.0, 6.0, c), [1.10, 0.75])
+        out = cov.redundant(fixed, [perim])
+        assert [i for i, _a in out] == [0], c
+        assert out[0][1] < route_plan.REDUNDANT_MAX_SHARE * len(perim) * cov.cell_area
+
+
+def test_perimeter_kept_for_square_corners():
+    # 直角的長方形：沿邊在角落轉圓弧，環繞的直角割到的角落只有它割得到 (每個角約 0.2 m²)，照舊繞
+    fixed, perim, cov = perimeter_case(rect(10, 6), [1.10, 0.75])
+    assert cov.redundant(fixed, [perim]) == []
+    only = perim[~np.isin(perim, np.concatenate(fixed))]
+    assert cov.biggest_patch(only) > route_plan.REDUNDANT_MAX_PATCH
+
+
+def test_perimeter_kept_when_nothing_else_mows_its_band():
+    # 只有 1.10 那一圈沿邊、沒有割草線：環繞 (0.60～1.10 m) 外側那一條 0.60～0.85 m 只有它割得到
+    fixed, perim, cov = perimeter_case(chamfer(10.0, 6.0, 2.0), [1.10])
+    assert cov.redundant(fixed[:1], [perim]) == []
+
+
+def test_redundant_drops_one_of_two_identical_loops():
+    # 兩圈一模一樣、沒有別的段落：拿掉一圈之後另一圈變成只有它割得到，要留下來
+    cov = route_plan.Coverage([rect(10, 6)], BLADE_X, BLADE_R)
+    a = cov.cells(closed_loop(inset(rect(10, 6), 0.85)))
+    out = cov.redundant([], [a, a.copy()])
+    assert len(out) == 1 and out[0][1] == 0.0
+
+
+def test_coverage_cells_band_area():
+    # 一條 8 m 直線，刀盤 0.50 m 寬：割到 8 x 0.5 + 一個圓 (直線兩頭)
+    cov = route_plan.Coverage([rect(10, 6)], BLADE_X, BLADE_R)
+    line = np.column_stack([np.arange(1.0, 9.0 + 1e-9, 0.1), np.full(81, 3.0)])
+    cells = cov.cells(line)
+    assert len(cells) * cov.cell_area == pytest.approx(8.0 * 0.5 + math.pi * 0.25 ** 2, rel=0.03)
+    # 刀盤在車頭前 0.375 m：割到的地方往前移
+    xs = cov.origin[0] + (cells % cov.shape[1] + 0.5) * cov.res
+    assert xs.max() == pytest.approx(9.0 + BLADE_X + BLADE_R, abs=0.06)    # 一格以內
+    assert xs.min() == pytest.approx(1.0 + BLADE_X - BLADE_R, abs=0.06)
