@@ -82,7 +82,15 @@ def controller_injection(params_path, geom, speed_scale=1.0):
                 'AlignController 設定了 min_speed_xy = %r，但 max_vel_x = %r ≠ 0。'
                 'min_speed_xy 的正當性依賴 max_vel_x = 0：只有在不能平移時，它才只是打開 min_speed_theta 的開關，'
                 '否則它就是一個速度限制 (凍結項目)。' % (file_align.get('min_speed_xy'), align['max_vel_x']))
-    kept = sorted(k for k in file_align if k not in owned)
+    # 對正的角速度下限不能比上限大 (2026-10-28 下限定成 0.30)：speed_scale 0.25 以下 FollowPath.max_vel_theta
+    # 跟著降到 0.30 以下，下限比上限還高，DWB 一個合法的取樣都沒有，每一次對正都會失敗。降到上限。
+    floor = float(file_align.get('min_speed_theta', follow.get('min_speed_theta', 0.0)))
+    top = float(align['max_vel_theta'])
+    if floor > top:
+        log.warning('注入覆寫 align_controller.min_speed_theta：%r → %r '
+                    '(不能比 max_vel_theta 大，speed_scale %.2f)' % (floor, top, speed_scale))
+        align['min_speed_theta'] = top
+    kept = sorted(k for k in file_align if k not in align)
     if kept:
         log.info('align_controller 保留參數檔的設定 (不歸注入管)：%s'
                  % ', '.join('%s=%r' % (k, file_align[k]) for k in kept))
@@ -91,11 +99,10 @@ def controller_injection(params_path, geom, speed_scale=1.0):
     old = follow.get('xy_goal_tolerance')
     if old is not None and old != xy_goal_tolerance:
         log.warning('注入覆寫 FollowPath.xy_goal_tolerance：%r → %r' % (old, xy_goal_tolerance))
-    align_xy = float(cs['approach_goal_checker']['xy_goal_tolerance'])
-    old = cs.get('align_goal_checker', {}).get('xy_goal_tolerance')
-    if old is not None and old != align_xy:
-        log.warning('注入覆寫 align_goal_checker.xy_goal_tolerance：%r → %r' % (old, align_xy))
-    injected['align_goal_checker'] = {'xy_goal_tolerance': align_xy}
+    # align_goal_checker 的 xy 容忍不再注入 (以前用 approach_goal_checker 的 0.10)：寫在 nav2_params.yaml，
+    # 理由見那裡 (2026-10-28，10-24 實車原地轉會滑開)。
+    if 'xy_goal_tolerance' not in (cs.get('align_goal_checker') or {}):
+        raise RuntimeError('nav2_params.yaml 的 align_goal_checker 要寫 xy_goal_tolerance')
 
     align_yaw = float(cs['align_goal_checker']['yaw_goal_tolerance'])
     # 啟動警告 (不是錯誤)：對正容忍值吃掉多少轉彎餘裕。每次啟動都要看得見。
@@ -218,10 +225,8 @@ def generate_launch_description():
     if 'xy_goal_tolerance' in cs.get('FollowPath', {}):
         raise RuntimeError('nav2_params.yaml 的 FollowPath 不得自行設定 xy_goal_tolerance：'
                            '它由 navigation.launch.py 從 general_goal_checker 注入。')
-    # align_goal_checker 的 xy 容忍沿用 approach_goal_checker (單一來源)
-    if 'xy_goal_tolerance' in cs.get('align_goal_checker', {}):
-        raise RuntimeError('nav2_params.yaml 的 align_goal_checker 不得自行設定 xy_goal_tolerance：'
-                           '它沿用 approach_goal_checker，由 navigation.launch.py 注入。')
+    # align_goal_checker 的 xy 容忍 2026-10-28 起寫在 nav2_params.yaml (0.50，不再沿用 approach_goal_checker)，
+    # 沒寫的話 controller_injection 會擋下來。
     footprint = str(geom.footprint)
     footprint_params = tempfile.NamedTemporaryFile(
         mode='w', prefix='mowerbot_footprint_', suffix='.yaml', delete=False)

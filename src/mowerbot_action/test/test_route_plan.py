@@ -515,6 +515,25 @@ def _transit(start, routes, dist):
     return total
 
 
+def test_edge_reentry_joins_a_piece_of_the_loop():
+    """沿邊接不上之後從旁邊斜斜開進來 (2026-10-28)：直的一段從第一個點就接得上，匝道起點能原地轉身、
+    車身整條在範圍裡；太短的一段不接。"""
+    el = route_plan.EdgeLoops([rect(10.0, 6.0)], FRONT, REAR, HALF_W)
+    r = el.routes([1.10], SAFE, ROT_NEED)[0]
+    body = r['pts'][r['ramp_in']:len(r['pts']) - r['ramp_out']]
+    low = body[(np.abs(body[:, 1] - 1.10) < 0.05) & (body[:, 0] > 2.5) & (body[:, 0] < 7.5)]
+    piece = low[np.argsort(low[:, 0])]
+    got = el.reentry(piece, SAFE, ROT_NEED)
+    assert got is not None
+    i, ramp = got
+    assert i == 0
+    assert float(el.clearance_at(ramp[0])) >= ROT_NEED
+    line = np.vstack([ramp, piece[i:]])
+    assert el.poses_ok(line, route_yaw(line), margin=0.0).all()
+    assert math.hypot(*(ramp[-1] - piece[i])) <= route_plan.EDGE_STEP + 1e-6
+    assert el.reentry(piece[:15], SAFE, ROT_NEED) is None
+
+
 def test_edge_plan_enters_near_the_car():
     el = route_plan.EdgeLoops([rect(10.0, 6.0)], FRONT, REAR, HALF_W)
     for start in ((1.3, 1.3), (8.7, 4.7), (5.0, 1.3)):

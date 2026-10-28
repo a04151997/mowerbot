@@ -1146,6 +1146,31 @@ class EdgeLoops:
         seq = _best_sequence(options, (float(start[0]), float(start[1])), cost)
         return [options[k][o][2] for k, o in seq]
 
+    def reentry(self, pts, safe_offset, rot_need):
+        """沿邊執行中接不上的那一段 pts (開放折線，(N, 2))：從能原地轉身的地方斜斜開進來接回這一圈 (2026-10-25
+        will 選「接回去」)。匝道跟規劃時一樣 (_ramp)；off 用這一段離邊界多遠算 (規劃時的 d)。
+        從前面找第一個放得下匝道的點 i (最好就是第一個點，一點都不少割)，後面至少留 EDGE_MIN_PIECE。
+        只看 i 之後那一截直不直 (i 之前的不走了)。回傳 (i, 匝道的點 (不含 pts[i])) 或 None。
+        """
+        pts = np.asarray(pts, dtype=float).reshape(-1, 2)
+        n = len(pts)
+        need = int(round(EDGE_MIN_PIECE / EDGE_STEP))
+        if n < need + 2:
+            return None
+        yaw = _headings(pts, False)
+        off = max(0.0, float(safe_offset) - float(np.median(self.clearance_at(pts))))
+        lengths = [(length, int(round(length / EDGE_STEP))) for length in self._ramp_lengths()]
+        for i in range(0, n - need):
+            for length, half in lengths:        # 越前面越好 (少割的最少)，同一個點先試長的匝道
+                if i + half >= n:
+                    continue
+                if np.abs(_wrap(yaw[i:i + half + 1] - yaw[i])).max() > EDGE_RAMP_MAX_TURN:
+                    continue
+                rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need)
+                if rin is not None:
+                    return i, rin
+        return None
+
     def rotation_ok(self, xy, yaw0, yaw1, step=math.radians(5.0)):
         """在 xy 原地從 yaw0 轉到 yaw1 (走比較短的那一邊)，整個過程車身都在範圍裡嗎。"""
         dy = _wrap(yaw1 - yaw0)

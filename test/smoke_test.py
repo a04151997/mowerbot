@@ -2412,7 +2412,8 @@ def classify_world_models(models, touch_tol=0.05):
 # N7 / N8 (階段 38 決定 1)：對正控制器。直接對 AlignController 送一個「原地轉 171°」的 goal
 # (171° = 階段 32 每段開始時的航向差中位數)，用 mode 3 讓 manager 轉發 /cmd_vel_nav。
 #   N7  結果當下的朝向誤差 <= align_goal_checker.yaw_goal_tolerance
-#   N8  對正期間後輪軸的平移 <= align_goal_checker 的 xy 容忍 (= approach_goal_checker 的)
+#   N8  對正期間後輪軸的平移 <= approach_goal_checker 的 xy 容忍 (0.10)。align_goal_checker 自己的 xy
+#       2026-10-28 起故意放寬到 0.50 (實車原地轉會滑開，見 nav2_params.yaml)；N8 的判準不跟著放寬。
 # 對照組 (植入違規)：同一個 goal 改用 approach_goal_checker (yaw 容忍 3.15 = 不檢查朝向)。
 #   它必須「送出當下就成功、誤差遠大於容忍值」—— 也就是 N7 的檢查要能抓到它；抓不到就是測試本身失效。
 # 容忍值一律讀 nav2_params.yaml (單一來源)。

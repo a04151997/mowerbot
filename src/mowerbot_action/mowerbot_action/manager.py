@@ -152,10 +152,20 @@ class MowerManager(Node):
         # _aligned_idx = 已經對正完成的佇列索引 (對正成功之後才送那一段本身)
         self._align_phase = False
         self._aligned_idx = None
+        # 對正卡住 (2026-10-28，10-24 實車資料)：這次對正要轉到的方向、每一段重新對正過幾次
+        self._align_target_yaw = None
+        self._align_retries = {}
+        # 暫停造成的失敗 (2026-10-28)：放行條件最後一次不成立是什麼時候、有沒有一段在等放行才重送、
+        # 每一段因為暫停重送過幾次
+        self._gate_block_time = None
+        self._pause_retry_wait = False
+        self._pause_retries = {}
         # approach 迴圈的終止：記住「現在在接近哪一段」與歷次量到的距離
         self._approach_for = None      # 目前在為哪一個段落插 approach
         self._approach_dists = []      # 每一輪量到的「離目標多遠」
         self._approach_tries = 0       # 已經為這個目標插了幾段 approach
+        self._approach_failed = 0      # 其中幾段是失敗的 (不是成功了但沒有更近)
+        self._approach_retried = False  # 失敗之後已經多給過一次機會
         self._result_future = None
 
         # TF：manager 本來完全不知道車子在哪裡，但要算出「從當下位置前往第 1 條
@@ -1398,8 +1408,14 @@ class MowerManager(Node):
                     self.get_logger().info('▶️ 自動模式恢復：放行條件都成立，繼續轉發 Nav2 速度指令')
                 self._auto_block_prev = reason
             if reason is not None:
+                self._gate_block_time = self.get_clock().now()
                 self.stop_robot()
                 return
+            if self._pause_retry_wait:
+                self._pause_retry_wait = False
+                if self._swath_queue and self._mission_state == MissionStatus.STATE_EXECUTING:
+                    self.get_logger().info('▶️ 放行了：接著走剛才暫停時被 Nav2 判失敗的那一段')
+                    self.send_next_swath()
         else:
             self._auto_block_prev = None
 
@@ -1521,6 +1537,9 @@ class MowerManager(Node):
         self._result_future = None
         self._align_phase = False
         self._aligned_idx = None
+        self._align_retries = {}
+        self._pause_retry_wait = False
+        self._pause_retries = {}
         self._reset_approach_tracking()
         self._wait_deadman_start = False
 
@@ -2191,16 +2210,18 @@ class MowerManager(Node):
                 return
             if self._edge is not None and self._edge.rotation_ok((x, y), yaw, head):
                 return
-        dropped = 0
-        while idx < len(self._swath_queue) and id(self._swath_queue[idx][0]) in self._edge_cont:
-            pth, lbl = self._swath_queue.pop(idx)
-            self._edge_cont.discard(id(pth))        # 丟掉的物件 id 之後可能被別的 Path 用到
-            a = pth.poses[0].pose.position
-            self._skipped.append((lbl, (a.x, a.y), '沿邊接不上'))
-            dropped += 1
-        self.get_logger().warn(
-            f'⏭️ [{label}] 車子不在上一段的終點 (差 {dist:.2f} m、方向差 {math.degrees(err):.0f}°)，'
-            f'原地轉身會掃到邊：這一圈剩下的 {dropped} 段不割')
+        why = (f'車子不在上一段的終點 (差 {dist:.2f} m、方向差 {math.degrees(err):.0f}°)，'
+               f'原地轉身會掃到邊')
+        if not self.edge_reenter(idx, why):
+            dropped = 0
+            queue = self._swath_queue
+            while idx < len(queue) and id(queue[idx][0]) in self._edge_cont:
+                pth, lbl = queue.pop(idx)
+                self._edge_cont.discard(id(pth))        # 丟掉的物件 id 之後可能被別的 Path 用到
+                a = pth.poses[0].pose.position
+                self._skipped.append((lbl, (a.x, a.y), '沿邊接不上'))
+                dropped += 1
+            self.get_logger().warn(f'⏭️ [{label}] {why}，也找不到斜斜開進圈的地方：這一圈剩下的 {dropped} 段不割')
         rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
         if self._edge is not None and float(self._edge.clearance_at(np.array([x, y]))) < rot_need:
             got = self._edge.escape((x, y), yaw, rot_need)
@@ -2224,6 +2245,61 @@ class MowerManager(Node):
                     f'🪢 先斜斜開回能原地轉身的地方 ({len(line) * route_plan.EDGE_STEP:.1f} m，'
                     f'方向 {math.degrees(hd):.0f}°)')
         self._mission_total = len(self._swath_queue)
+
+    def edge_reenter(self, idx, why):
+        """沿邊那一圈接不上了：從第 idx 段 (放不下匝道就往後一段) 斜斜開進圈接回去 (2026-10-25 will 選「接回去」)。
+
+        以前這一圈剩下的全部不割 (10-24 實車因此少割沿邊 6 段)。現在跟規劃時每一圈的第一段一樣：
+        前面接一條匝道 (EdgeLoops.reentry：從能原地轉身的地方斜斜開進來)，這一段改成不是「接著上一段」，
+        送出前照常補 approach 開到匝道起點、照常原地對正；後面幾段照舊接著它。
+        放得下匝道之前的那幾段 (和這一段匝道接上之前的那一截) 記成「沿邊接不上」。回傳 True = 接上了。
+        """
+        if self._edge is None:
+            return False
+        rot_need = self.ROTATION_CLEARANCE + self.TRANSIT_MARGIN
+        queue = self._swath_queue
+        k = idx
+        while k < len(queue) and id(queue[k][0]) in self._edge_cont:
+            pth = queue[k][0]
+            pts = np.array([(ps.pose.position.x, ps.pose.position.y) for ps in pth.poses])
+            try:
+                got = self._edge.reentry(pts, self.headland_width, rot_need)
+            except Exception as e:      # noqa: BLE001  算不出來就照以前，這一圈剩下的不割
+                self.get_logger().warn('🪢 沿邊接回去的匝道算不出來 (%s: %s)' % (type(e).__name__, e))
+                return False
+            if got is None:
+                k += 1
+                continue
+            i, ramp = got
+            lost = []
+            for _ in range(k - idx):
+                p, lbl = queue.pop(idx)
+                self._edge_cont.discard(id(p))
+                a = p.poses[0].pose.position
+                self._skipped.append((lbl, (a.x, a.y), '沿邊接不上'))
+                lost.append(lbl)
+            pth, lbl = queue[idx]
+            cut = float(np.sum(np.hypot(*np.diff(pts[:i + 1], axis=0).T))) if i > 0 else 0.0
+            p = pts[i]
+            hd = math.atan2(p[1] - ramp[0][1], p[0] - ramp[0][0])
+            poses = []
+            for rx, ry in ramp:
+                ps = PoseStamped()
+                ps.header = pth.poses[0].header
+                ps.pose.position.x, ps.pose.position.y = float(rx), float(ry)
+                ps.pose.orientation.z = math.sin(hd / 2.0)
+                ps.pose.orientation.w = math.cos(hd / 2.0)
+                poses.append(ps)
+            pth.poses = poses + list(pth.poses[i:])
+            self._edge_cont.discard(id(pth))
+            miss = '這一段從頭割' if cut < 0.05 else '這一段前面少割 %.1f m' % cut
+            if lost:
+                miss += '；' + '、'.join(lost) + ' 不割'
+            self.get_logger().warn(
+                f'🪢 [{lbl}] {why}：從旁邊斜斜開進圈接回去 (匝道 {len(ramp) * route_plan.EDGE_STEP:.1f} m，'
+                f'{miss})，這一圈接著繞')
+            return True
+        return False
 
     # 相鄰兩個航點距離超過這個值就視為「跳接」而不是同一段路徑。
     # 割草線與環繞的內插間距都是 0.1 m，所以 0.3 m 已經有 3 倍餘裕；
@@ -2438,6 +2514,13 @@ class MowerManager(Node):
             elif self._approach_tries >= self.APPROACH_MAX_TRIES:
                 give_up = (f'approach 已連續插入 {self._approach_tries} 段仍未到達 '
                            f'({chain})，達到上限')
+            if give_up is not None and self._approach_failed and not self._approach_retried:
+                # approach 失敗 (不是成功了但沒有更近) 就再給一次機會，從車子現在的位置重新規劃
+                # (2026-10-25 will 選「接回去」：10-24 有兩段 approach 卡住，後面的沿邊因此搆不到被跳過)
+                self._approach_retried = True
+                self.get_logger().warn(
+                    f'🔁 [{label}] {give_up}：上一段 approach 失敗了，從車子現在的位置再試一次')
+                give_up = None
             if give_up is not None:
                 # 【放棄接近之後的退路依距離分支（階段 26）】
                 # 原本一律「直接送出該段落」，假設它只差不到 0.5 m。實測有一次
@@ -2456,6 +2539,9 @@ class MowerManager(Node):
                     # 沒有送給 Nav2，不算控制器失敗，連續失敗計數不動。
                     self._current_swath_idx += 1
                     self._reset_approach_tracking()
+                    # 下一段是沿邊「接著上一段」的話，先看接不接得上 (接不上就從旁邊接回去)：
+                    # 10-24 實車跳過沿邊 13 之後沒有看，直接開 8.8 m 到 14 的起點，到了才發現轉不了身
+                    self.check_edge_continuation()
                     # 下一段同樣要先看要不要補 approach
                     return self.maybe_insert_approach()
                 self.get_logger().warn(
@@ -2495,6 +2581,8 @@ class MowerManager(Node):
         self._approach_for = None
         self._approach_dists = []
         self._approach_tries = 0
+        self._approach_failed = 0
+        self._approach_retried = False
 
     APPROACH_TARGET_SEARCH_M = 1.0     # 最多往後找這麼長
 
@@ -2635,12 +2723,110 @@ class MowerManager(Node):
         pose.pose.orientation.z, pose.pose.orientation.w = math.sin(yaw / 2.0), math.cos(yaw / 2.0)
         target.poses = [pose]
         self._align_phase = True
+        self._align_target_yaw = yaw
         self._current_label = f'對正 → {label}'
         self.get_logger().info(
             f'↪️ 對正 [{label}]：原地轉到 {math.degrees(yaw):.1f}° (位置 {xy[0]:.2f}, {xy[1]:.2f})')
         self.send_path_to_nav2(target, label, controller_id=self.ALIGN_CONTROLLER,
                                goal_checker_id=self.ALIGN_GOAL_CHECKER)
         return True
+
+    # ---- 暫停造成的失敗 (2026-10-28，10-24 實車資料) ----
+    # 放行條件不成立 (手把斷線、斷線過等 LB、光達中斷、定位暫停) 時 manager 送零速度、Nav2 不知道，
+    # 15 s 沒有進展 (PoseProgressChecker) 就判這一段失敗。10-24 實車手把斷線 5 次 (6 ~ 24 s)，
+    # 因此跳過 3 段、連帶 5 段。暫停本身是安全行為 (照樣停、照樣要按 LB)，但它造成的失敗不算失敗：
+    # 這一段不跳過、不算連續失敗，放行之後從車子現在的位置接著走同一段。
+    # 失敗前 PAUSE_FAIL_WINDOW 秒內暫停過就算 (進展檢查看的是最近 15 s)；同一段最多重送 PAUSE_RETRY_MAX 次。
+    PAUSE_FAIL_WINDOW = 16.0
+    PAUSE_RETRY_MAX = 3
+    # 車子離這一段比這個遠就不剪，整段重走；走不到這麼長也不剪
+    PAUSE_TRIM_NEAR = 0.6
+    PAUSE_TRIM_MIN = 0.2
+
+    def pause_retry(self, path, label):
+        """失敗是暫停造成的就排好重送 (放行了馬上送、還在暫停就等 safety_check)，回傳 True；不是回傳 False。"""
+        t = self._gate_block_time
+        if t is None or self._age(t) > self.PAUSE_FAIL_WINDOW:
+            return False
+        idx = self._current_swath_idx
+        n = self._pause_retries.get(idx, 0)
+        if n >= self.PAUSE_RETRY_MAX:
+            self.get_logger().warn(f'⏸️ [{label}] 暫停之後已經重送 {n} 次，這次照一般失敗處理')
+            return False
+        self._pause_retries[idx] = n + 1
+        what = '對正' if self._align_phase else '這一段'
+        self._align_phase = False
+        self._aligned_idx = None
+        if label == 'approach':
+            # 從車子現在的位置重新規劃 (後面幾段繞路一起丟掉，跟失敗時一樣)，但不記跳過、不算失敗
+            dropped = 0
+            while (idx < len(self._swath_queue) and self._swath_queue[idx][1] == 'approach'):
+                del self._swath_queue[idx]
+                dropped += 1
+            self._mission_total = len(self._swath_queue)
+            self._reset_approach_tracking()
+            redo = '放行之後從車子現在的位置重新規劃 approach'
+        else:
+            cut = self.trim_to_robot(path)
+            redo = ('放行之後從車子現在的位置接著走 (前面 %.1f m 走過了)' % cut if cut > 0
+                    else '放行之後重新走這一段')
+        self.get_logger().warn(
+            f'⏸️ [{label}] 暫停太久，Nav2 把{what}判成沒有進展。暫停不算失敗、不跳過：{redo}')
+        if self.auto_block_reason() is None:
+            self.send_next_swath()
+        else:
+            self._pause_retry_wait = True
+            self.set_note('[%s] 暫停太久被 Nav2 判失敗：不算失敗，放行之後接著走這一段' % label, 60.0)
+        return True
+
+    def trim_to_robot(self, path):
+        """車子停在這一段上 (離線 PAUSE_TRIM_NEAR 以內)：把走過的航點去掉 (改同一個 Path 物件，
+        id 不變，沿邊接續、接著割的紀錄都照舊)。回傳去掉了幾公尺，沒剪回傳 0。"""
+        pose = self.get_robot_pose2d()
+        if pose is None or len(path.poses) < 3:
+            return 0.0
+        pts = [(ps.pose.position.x, ps.pose.position.y) for ps in path.poses]
+        s, d, cum = mission_resume.project(pts, pose[:2])
+        if d > self.PAUSE_TRIM_NEAR or s < self.PAUSE_TRIM_MIN:
+            return 0.0
+        cut = next(i for i, c in enumerate(cum) if c >= s - 1e-9)
+        cut = min(cut, len(path.poses) - 2)
+        if cut <= 0:
+            return 0.0
+        path.poses = list(path.poses[cut:])
+        return cum[cut]
+
+    # ---- 對正卡住 (2026-10-28，10-24 實車資料) ----
+    # 原地轉到最後導航只給 0.02 ~ 0.03 rad/s，實車馬達轉不動 (從停住開始轉：0.05 以下 5%、0.09 ~ 0.12 75%)，
+    # 車子停在「差一點」的地方 15 s 後判失敗 (割草線 39/40 差 8.6° 停住)。
+    # 差 ALIGN_ACCEPT_DEG 以內就直接開這一段 (控制器邊走邊修方向，跟對正之前每一段開頭的情形一樣)；
+    # 差更多就從車子現在的位置重新對正一次，還是不行才照以前當成失敗。
+    ALIGN_ACCEPT_DEG = 15.0
+    ALIGN_RETRY_MAX = 1
+
+    def align_stall_fallback(self, path, label):
+        """對正失敗 (不是暫停造成的) 時：差一點就照開、差很多就再對正一次。有處理回傳 True。"""
+        pose = self.get_robot_pose2d()
+        if pose is None or self._align_target_yaw is None:
+            return False
+        idx = self._current_swath_idx
+        err = math.degrees(abs(math.atan2(math.sin(self._align_target_yaw - pose[2]),
+                                          math.cos(self._align_target_yaw - pose[2]))))
+        if err <= self.ALIGN_ACCEPT_DEG:
+            self._aligned_idx = idx
+            self._current_label = label
+            self.get_logger().warn(
+                f'↪️ [{label}] 原地轉停在差 {err:.1f}° 的地方 (轉不動了)，'
+                f'{self.ALIGN_ACCEPT_DEG:.0f}° 以內直接開這一段')
+            self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
+            self.send_path_to_nav2(path, label)
+            return True
+        n = self._align_retries.get(idx, 0)
+        if n >= self.ALIGN_RETRY_MAX:
+            return False
+        self._align_retries[idx] = n + 1
+        self.get_logger().warn(f'↪️ [{label}] 原地轉卡住 (還差 {err:.0f}°)，從車子現在的位置重新對正一次')
+        return self.send_align(path, label)
 
     def log_mission_summary(self, ended_early=False):
         """任務結束時印一份摘要：總段數 / 完成 / 跳過，以及每個跳過段落的座標。
@@ -2697,6 +2883,13 @@ class MowerManager(Node):
             GoalStatus.STATUS_ABORTED: 'ABORTED',
         }.get(status, f'STATUS_{status}')
 
+        # ---- 0a. 暫停造成的失敗 (2026-10-28) ----
+        # 取消、成功不在這裡處理 (行為與訊息一個位元都不變)。
+        if (path is not None and not self._cancelling
+                and status not in (GoalStatus.STATUS_SUCCEEDED, GoalStatus.STATUS_CANCELED)
+                and self.pause_retry(path, label)):
+            return
+
         # ---- 0. 對正階段的結果 (階段 38 決定 1) ----
         # 取消 (急停 / 離開 mode 1) 不在這裡處理：往下走第 1 條，行為與訊息一個位元都不變。
         if self._align_phase and not (self._cancelling or status == GoalStatus.STATUS_CANCELED):
@@ -2707,6 +2900,8 @@ class MowerManager(Node):
                 self.get_logger().info(f'✅ 對正完成 [{label}]')
                 self.get_logger().info(f'➡️ 送出任務 [{label}] ({len(path.poses)} 個航點)')
                 self.send_path_to_nav2(path, label)
+                return
+            if path is not None and self.align_stall_fallback(path, label):
                 return
             # 對正失敗 = 該段失敗，走下面既有的跳過邏輯 (計入 max_consecutive_failures)。
             # 2026-10-20 起 progress checker 是 PoseProgressChecker：轉了 0.5 rad 也算進展，
@@ -2802,6 +2997,7 @@ class MowerManager(Node):
             f'（臨時障礙物不應該讓整片草坪停擺）')
         self._current_swath_idx += 1
         if label == 'approach':
+            self._approach_failed += 1
             # 繞路的 approach 有好幾段：這一段沒走完，後面幾段的起點已經不是車子所在的地方，
             # 一起丟掉；送下一段之前 maybe_insert_approach 會從車子當下的位置重新規劃。
             dropped = 0
