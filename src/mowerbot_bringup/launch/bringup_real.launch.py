@@ -44,7 +44,7 @@ def generate_launch_description():
     serial_port = LaunchConfiguration('serial_port')
     max_vel_scale = LaunchConfiguration('max_vel_scale')
     speed_scale = LaunchConfiguration('speed_scale', default='1.0')
-    edge_loops = LaunchConfiguration('edge_loops', default='1.10,0.75')
+    edge_loops = LaunchConfiguration('edge_loops', default='1.10,0.75,0.25')
     saved_map = LaunchConfiguration('saved_map', default='')
     map_start_pose = LaunchConfiguration('map_start_pose', default='')
     allow_provisional = LaunchConfiguration('allow_provisional')
@@ -244,8 +244,9 @@ def generate_launch_description():
             description='用存好的地圖時車子在地圖上的哪裡 "x,y,朝向(度)"。空 = 上次關機前記下的位置。'),
         DeclareLaunchArgument(
             'edge_loops',
-            default_value='1.10,0.75',
-            description='沿邊多繞幾圈 (2026-10-21 will 同意)：離邊界幾公尺各繞一圈，逗號分開；空 = 不繞。'),
+            default_value='1.10,0.75,0.25',
+            description='沿邊多繞幾圈 (2026-10-21 will 同意)：離邊界幾公尺各繞一圈，逗號分開；空 = 不繞。'
+                        '0.25 是貼外框那一圈 (2026-10-30)，只在圈了草地外框時繞 (車身會伸出外框幾公分)。'),
 
         LogInfo(msg=['[bringup_real] 啟動實車節點 (driver_type=', driver_type,
                      ', encoder_ticks_per_rev=', ticks_per_rev,

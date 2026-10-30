@@ -378,7 +378,7 @@ tr.rtn td { color: var(--fg-3); }
               <span><i style="background:repeating-linear-gradient(135deg,var(--fg-3) 0 2px,transparent 2px 5px)"></i>禁區</span>
               <span><i style="background:var(--mown)"></i>已割</span>
               <span><i style="border-top:1.5px dashed var(--route)"></i>還沒割</span>
-              <span id="lgEdge" hidden><i style="border-top:2px dotted var(--route)"></i>沿邊兩圈</span>
+              <span id="lgEdge" hidden><i style="border-top:2px dotted var(--route)"></i>沿邊</span>
               <span><i style="border-top:2.5px solid var(--sel)"></i>現在這段</span>
               <span><i style="border:1.5px dashed var(--fg-3)"></i>停止區 0.4 m</span>
             </div>
@@ -511,7 +511,7 @@ tr.rtn td { color: var(--fg-3); }
                   <button type="button" class="btn" id="btnLawnClear">清除外框</button>
                 </div>
                 <p class="note" id="lawnWhy" hidden></p>
-                <p class="note">外框 = 你開車走過的那一圈，割草只在它裡面。草地旁邊沒有牆（水泥地、步道），或地圖從玻璃漏出去，就要圈。建圖中（用存好的地圖時，定位對上之後）把車開到要割的範圍邊上，按「開始圈外框」，用手把沿著邊開一圈，開回起點（總覽地圖上的虛線圓，1 m 內）按「結束」。開錯了不用重來：用手把沿原路倒車，退過的線會擦掉，退到開錯之前再往前開。按「結束」時外框自己交叉了，開歪繞出來的小圈會自動拿掉；拿不掉的會在地圖上畫紅圈，只要修錯的那一段：把車開到錯的地方前面的紅色虛線上，按「修一段」，沿著正確的邊開過去、接回紅色虛線，按「結束」。圈好的外框有一段不對，也可以這樣只修那一段。記的是後輪中間走過的線，割草線和沿邊兩圈都在它裡面。外框跟著地圖存：下次用同一張存好的地圖啟動會自動載回來，建新地圖就要重圈。</p>
+                <p class="note">外框 = 你開車走過的那一圈，割草只在它裡面。草地旁邊沒有牆（水泥地、步道），或地圖從玻璃漏出去，就要圈。建圖中（用存好的地圖時，定位對上之後）把車開到要割的範圍邊上，按「開始圈外框」，用手把沿著邊開一圈，開回起點（總覽地圖上的虛線圓，1 m 內）按「結束」。開錯了不用重來：用手把沿原路倒車，退過的線會擦掉，退到開錯之前再往前開。按「結束」時外框自己交叉了，開歪繞出來的小圈會自動拿掉；拿不掉的會在地圖上畫紅圈，只要修錯的那一段：把車開到錯的地方前面的紅色虛線上，按「修一段」，沿著正確的邊開過去、接回紅色虛線，按「結束」。圈好的外框有一段不對，也可以這樣只修那一段。記的是後輪中間走過的線，割草線和沿邊都在它裡面；沿邊選「貼外框」時，最外面那一圈貼著外框繞，車身會伸出外框幾公分（轉角多一點，最多 37 公分），外框外面要是車子壓得過去的地方。外框跟著地圖存：下次用同一張存好的地圖啟動會自動載回來，建新地圖就要重圈。</p>
               </div>
             </div>
             <div class="panel">
@@ -784,7 +784,9 @@ function demoSource() {
 
   // 網頁「割草路線」選的間距、沿邊 (展示版的路線只有割草線跟著間距變；沿邊沒畫)
   function demoSpacing() { return (sim.planOpt && sim.planOpt.spacing) || 0.3; }
-  function demoEdge() { return sim.planOpt && sim.planOpt.edge != null ? sim.planOpt.edge : '1.10,0.75'; }
+  // 展示版的沿邊選項 (跟 web.py PLAN_EDGE_CHOICES 一樣)
+  const DEMO_EDGE_CHOICES = [['貼外框', '1.10,0.75,0.25'], ['兩圈', '1.10,0.75'], ['一圈', '0.85'], ['不繞', '']];
+  function demoEdge() { return sim.planOpt && sim.planOpt.edge != null ? sim.planOpt.edge : '1.10,0.75,0.25'; }
   function buildRoute(from) {
     if (SITE.base) return routeFromSegs(customSegs(from));
     const { W, peri } = SITE, segs = [], P0 = W(...peri[0]);
@@ -822,7 +824,7 @@ function demoSource() {
   // 圖上一格 = 0.05 m (跟車上存的地圖一樣)。白 = 空地、黑 = 牆、灰 = 沒掃到、紅 = 禁區。
   // 路線是展示用的簡化版：只有割草線 (離邊 1.2 m = 車上的地頭寬度，原地轉身掃得到的範圍；
   // 線頭離牆 1.6 m = 車上的 WallClearance，前方停止區才不會一直看到牆)，轉場繞開牆。
-  // 車上是 Fields2Cover 算的，還有周邊環繞、沿邊兩圈，形狀會不一樣。
+  // 車上是 Fields2Cover 算的，還有周邊環繞、沿邊幾圈，形狀會不一樣。
   const CUSTOM_MARGIN = 1.2, CUSTOM_WALL = 1.6;
   const TRANSIT_WALL = [1.45, 1.0], TRANSIT_EDGE = 0.5, CUSTOM_MIN_AREA = 10;   // 1.45 m = 前方停止區最遠的角 (0.975 + 0.40, 半寬 0.47)
   function chamfer(mask, W, H) {
@@ -1066,7 +1068,7 @@ function demoSource() {
       v: 0.175, w: 0, navV: 0.175, pose: { ...SITE.start }, joy: { connected: true, latched: false },
       obstacle: null, blockedFor: 0, skipped: [], authority: 'here', freezeUntil: 0, alarms: [], events: [], scan: [], zoneN: 0,
       scale: 0.25, ko: [], koUndo: [], mapVer: 1, loc: null, locName: '', siteKo: true, savingUntil: 0, lawnRec: null, lawnPts: null, lawnFix: null, frameTries: 0,
-      resume: null, planOpt: sim.planOpt || { spacing: 0.3, edge: '1.10,0.75' },
+      resume: null, planOpt: sim.planOpt || { spacing: 0.3, edge: '1.10,0.75,0.25' },
     });
     const R = sim.route; let g = R.segs.findIndex(sg => /^割草線 4\//.test(sg.label));
     if (g < 0) g = Math.floor(R.segs.length / 3);
@@ -1217,8 +1219,8 @@ function demoSource() {
       vel: { v: sim.v, w: sim.w, nav: sim.navV, out: sim.v },
       map: { ready: up && sim.mapping, name: sim.mapping ? sim.mapName : null, ver: up && sim.mapping ? sim.mapVer : 0, res: RES, x0: RB.x0, y0: RB.y0, w: RW, h: RH },
       speed: { joy: up ? sim.scale : null, nav: up ? sim.scale : null, choices: [0.10, 0.15, 0.25, 0.35, 0.50] },
-      planopts: up ? { spacing: demoSpacing(), overlap_ratio: 1 - demoSpacing() / 0.5, blade: 0.5, edge_loops: demoEdge(), default_spacing: 0.3, default_overlap: 0.4, default_edge_loops: '1.10,0.75', saved: true,
-        spacing_choices: [0.30, 0.35, 0.40], edge_choices: [['兩圈', '1.10,0.75'], ['一圈', '0.85'], ['不繞', '']] } : null,
+      planopts: up ? { spacing: demoSpacing(), overlap_ratio: 1 - demoSpacing() / 0.5, blade: 0.5, edge_loops: demoEdge(), default_spacing: 0.3, default_overlap: 0.4, default_edge_loops: '1.10,0.75,0.25', saved: true,
+        spacing_choices: [0.30, 0.35, 0.40], edge_choices: DEMO_EDGE_CHOICES } : null,
       keepout: { zones: sim.koZones || 0, area: sim.koArea || 0, undo: sim.koUndo.length > 0 },
       saving: up && Date.now() < (sim.savingUntil || 0),
       lawn: (() => {
@@ -1318,7 +1320,7 @@ function demoSource() {
       sim.mapName = mapName(Date.now()); sim.savingUntil = Date.now() + 12000;
       sim.route = buildRoute(sim.pose); sim.routeShown = true; sim.s = 0; sim.mown = [[0, 0]]; sim.skipped = []; sim.mstate = 0;
       sim.msg = '路線預覽：割草線 ' + sim.route.lines + ' 條 (方向 ' + sim.route.deg + '°)，共 ' + sim.route.segs.length + ' 段。車子不會動；OK 就按「自動割草」。'
-        + (SITE.base ? '（展示版的簡化路線：車上會用 Fields2Cover 算，還有周邊環繞、沿邊兩圈）' : '（展示版的路線是固定的，車上算的路線會避開你畫的禁區）');
+        + (SITE.base ? '（展示版的簡化路線：車上會用 Fields2Cover 算，還有周邊環繞、沿邊幾圈）' : '（展示版的路線是固定的，車上算的路線會避開你畫的禁區）');
       logEv('網頁 (' + LABEL + ')', '預覽路線，存地圖 ' + sim.mapName);
       return { ok: true };
     },
@@ -1458,7 +1460,7 @@ function demoSource() {
       if (sim.mode === 1) return { ok: false, text: '自動割草中不能改，先切手動（這一趟照原本的割完；接著割也照原本的）' };
       const what = [];
       if (a.spacing != null) { sim.planOpt.spacing = +a.spacing; what.push('割草線間距 ' + fx(+a.spacing, 2) + ' m'); }
-      if (a.edge != null) { sim.planOpt.edge = a.edge; what.push('沿邊' + ({ '1.10,0.75': '兩圈', '0.85': '一圈', '': '不繞' })[a.edge]); }
+      if (a.edge != null) { sim.planOpt.edge = a.edge; what.push('沿邊' + DEMO_EDGE_CHOICES.find(c => c[1] === a.edge)[0]); }
       logEv('網頁 (' + LABEL + ')', '割草路線改成' + what.join('、'));
       return { ok: true, text: '改好了：' + what.join('、') + '。下一次規劃才用，按「預覽路線」看新的路線要多久' };
     },
@@ -2050,7 +2052,7 @@ function cancelMapBlock(st) {
   return null;
 }
 // 割草路線的說明 (2026-10-22)：刀盤寬 - 間距 = 相鄰兩條重疊多少；沿邊少一圈，邊上沒割到的帶變寬
-const EDGE_TEXT = { '兩圈': '邊上沒割到的最窄', '一圈': '邊上多約 10 公分沒割到', '不繞': '邊上多約 60 公分沒割到' };
+const EDGE_TEXT = { '貼外框': '兩圈，有圈外框時再貼著外框繞一圈：邊上幾乎都割得到，戶外約多 3～4 分鐘；車身會伸出外框幾公分', '兩圈': '外框往內約 60 公分沒割到', '一圈': '比兩圈多約 10 公分沒割到', '不繞': '比兩圈多約 60 公分沒割到' };
 function spacingText(po, sp) {
   const cm = Math.round((po.blade - sp) * 100);
   return '相鄰兩條重疊 ' + cm + ' 公分' + (cm <= 10 ? '，車子走偏 5 公分就可能漏一條細縫' : '');

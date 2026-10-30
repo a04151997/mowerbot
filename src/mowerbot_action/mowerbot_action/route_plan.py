@@ -569,7 +569,9 @@ class TransitPlanner:
 #   * 進圈、出圈各一條斜斜的「匝道」：從離邊界 safe_offset (地頭寬，原地轉身掃不到邊界) 的點
 #     斜著開進這一圈，繞完一圈再斜著開出去。原地轉身只會發生在匝道的兩頭。
 #   * 一圈切成幾段交給 Nav2，段與段之間方向連續，manager 不再原地對正 (見 manager 的 send_next_swath)。
-#   * 每一個位置都檢查整個車身在割草範圍裡 (離邊緣至少 EDGE_MARGIN)；有給 walls (地圖上真的牆) 時，
+#   * 每一個位置都檢查整個車身在割草範圍裡 (離邊緣至少 EDGE_MARGIN)；圈了草地外框時，車身整台放不進去的
+#     那一圈 (貼外框，離邊界 < 車寬一半 + EDGE_MARGIN) 車身可以伸出外圈 overhang (2026-10-30，manager 的
+#     frame_overhang)，其他圈照舊，內環 (禁區、障礙物) 不放寬；有給 walls (地圖上真的牆) 時，
 #     光達停止區也不能掃到牆 (掃到車子就停，那一段 15 s 後判失敗)。檢查不過的地方那一圈就斷開，
 #     剩下的部分各自進圈出圈，太短就不割。
 # 用點陣算 (跟 TransitPlanner 同一套)，格子細一點。
@@ -790,10 +792,12 @@ class EdgeLoops:
     walls：(bool 網格, 解析度, origin_x, origin_y)，地圖上真的牆 (光達看得到)；None = 不檢查停止區。
     stop_len / stop_side：光達停止區 (車頭前緣往前 stop_len、左右比車身各寬 stop_side)。
     turn_wall：要原地轉身的點 (匝道兩頭、escape 的終點) 離牆至少這麼遠 (第 4 節)；0 = 不查。
+    overhang：車身可以伸出割草範圍外圈多遠 (圈了草地外框時)；0 = 整台車都在範圍裡。只用在車身整台放不進去的
+    那幾圈 (hug：離邊界 < half_w + EDGE_MARGIN)，離邊界更遠的圈照舊整台車在範圍裡。
     """
 
     def __init__(self, rings, front, rear, half_w, walls=None, stop_len=0.40, stop_side=0.05,
-                 turn_wall=0.0):
+                 turn_wall=0.0, overhang=0.0):
         outer = np.asarray(rings[0], dtype=float)
         lo, hi = outer.min(axis=0), outer.max(axis=0)
         span = float(max(hi - lo))
@@ -819,6 +823,7 @@ class EdgeLoops:
         self._body = _box_samples(-self.rear, self.front, self.half_w, 0.1)
         self.wall = None
         self._zone = None
+        occ = None                      # 地圖上所有的佔據格 (車身伸出外圈時用)
         if walls is not None:
             grid, wres, wox, woy = walls
             cx = self.origin[0] + (np.arange(w) + 0.5) * res
@@ -830,6 +835,7 @@ class EdgeLoops:
             wall = np.zeros((h, w), bool)
             if ok_u.any() and ok_v.any():
                 wall[np.ix_(ok_v, ok_u)] = grid[np.ix_(cv_[ok_v], cu[ok_u])]
+            occ = wall
             wall = _big_walls(wall, res)
             self.wall = wall
             zw = self.half_w + stop_side
@@ -840,7 +846,26 @@ class EdgeLoops:
             self._wall_near = self.wall_dist <= EDGE_ZONE_MARGIN + 0.5 * res
             self.zone_front, self.zone_half = self.front + stop_len, zw
         self.turn_wall = float(turn_wall) if self.wall is not None else 0.0
+        # 車身可以伸出割草範圍外圈多遠 (圈了草地外框時，manager 給；內環 = 禁區、障礙物不放寬)。
+        # 伸出去的地方離地圖上的佔據格還是至少 EDGE_WALL_GAP (跟割草範圍離牆一樣)。
+        self.overhang = max(0.0, float(overhang))
+        # 整台車放得進去的圈 (離邊界 >= 車寬一半 + EDGE_MARGIN) 照舊不伸出去，形狀、轉角跟沒圈外框時一樣
+        # (10-30 模擬：每一圈都放寬的話兩圈的形狀跟著變，周邊環繞反而省不掉，實驗室多跑 4 分鐘)
+        self.hug_below = self.half_w + EDGE_MARGIN if self.overhang > 0.0 else 0.0
+        self.body_dist = self.dist
+        if self.overhang > 0.0:
+            outer_fill = np.zeros((h, w), np.uint8)
+            cv2.fillPoly(outer_fill, [px(rings[0])], 1, lineType=cv2.LINE_8, shift=4)
+            allowed = _distance(outer_fill == 0, res) <= self.overhang
+            allowed &= ~((outer_fill > 0) & (mask == 0))          # 內環照舊整台車都不能進去
+            if occ is not None:
+                allowed &= _distance(~occ, res) > EDGE_WALL_GAP
+            self.body_dist = _distance(allowed, res)
         self._items = {}                # items() 算過的 (offsets, safe_offset)
+
+    def hug(self, d):
+        """離邊界 d 的那一圈是不是貼外框 (車身可以伸出外圈 overhang)。"""
+        return float(d) < self.hug_below
 
     # ---- 查格子 ----
     def _cells(self, xy):
@@ -872,14 +897,18 @@ class EdgeLoops:
         y = pts[:, 1:2] + s * local[None, :, 0] + c * local[None, :, 1]
         return np.stack([x, y], axis=-1)
 
-    def poses_ok(self, pts, yaw, margin=EDGE_MARGIN):
+    def poses_ok(self, pts, yaw, margin=EDGE_MARGIN, hug=False):
         """每一個位姿 (pts[i], yaw[i]) 車身是不是都在範圍裡 (離邊緣 >= margin)，停止區有沒有掃到牆
-        (車頭方向偏 ±EDGE_YAW_TOL 都算，離牆 EDGE_ZONE_MARGIN 以內就算掃到)。"""
+        (車頭方向偏 ±EDGE_YAW_TOL 都算，離牆 EDGE_ZONE_MARGIN 以內就算掃到)。hug：貼外框那一圈，車身可以伸出外圈。"""
         pts = np.asarray(pts, dtype=float).reshape(-1, 2)
         yaw = np.asarray(yaw, dtype=float).reshape(-1)
         if len(pts) == 0:
             return np.zeros(0, bool)
-        ok = self.clearance_at(self._sample(pts, yaw, self._body)).min(axis=1) >= margin
+        g, inside = self._cells(self._sample(pts, yaw, self._body))
+        body = np.zeros(inside.shape, np.float32)
+        field = self.body_dist if hug else self.dist
+        body[inside] = field[g[inside][:, 1], g[inside][:, 0]]
+        ok = body.min(axis=1) >= margin
         if self.wall is not None:
             g, inside = self._cells(self._sample(pts, yaw, self._zone))
             hit = np.zeros(inside.shape, bool)
@@ -890,7 +919,7 @@ class EdgeLoops:
     # ---- 一圈 ----
     def loops(self, d):
         """離邊界 d 的那幾圈 (每一塊、每一個內環各一圈)，每圈是等間距的閉合折線，割草範圍在行進方向的左邊。"""
-        r = corner_radius(d, self.front, self.half_w)
+        r = corner_radius(d + (self.overhang if self.hug(d) else 0.0), self.front, self.half_w)
         if r is None:
             return []
         region = self._opened(self.dist, d, max(r, EDGE_MIN_RADIUS))
@@ -937,7 +966,7 @@ class EdgeLoops:
             return np.zeros(dist.shape, bool)
         return _distance(~core, self.res) <= r
 
-    def _ramp(self, p, yaw, off, length, entry, rot_need):
+    def _ramp(self, p, yaw, off, length, entry, rot_need, hug=False):
         """匝道：entry 時從 q 斜斜開到 p，否則從 p 斜斜開到 q。q 在 p 的後方 (或前方) length、往裡面 off。
 
         q 要能原地轉身 (離邊緣 >= rot_need、離牆夠遠)，整條匝道車身都要在範圍裡。不行回傳 None。
@@ -957,14 +986,15 @@ class EdgeLoops:
                 continue
             line = _line(q, p, EDGE_STEP) if entry else _line(p, q, EDGE_STEP)
             hd = math.atan2(*(line[-1] - line[0])[::-1])
-            if not self.poses_ok(line, np.full(len(line), hd)).all():
+            if not self.poses_ok(line, np.full(len(line), hd), hug=hug).all():
                 continue
             return line[:-1] if entry else line[1:]
         return None
 
-    def _ramp_lengths(self):
-        """匝道長度依序試這些：要查離牆 (turn_wall) 時最後再試更長的。"""
-        return EDGE_RAMPS + (EDGE_RAMPS_LONG if self.turn_wall > 0.0 else ())
+    def _ramp_lengths(self, hug=False):
+        """匝道長度依序試這些：要查離牆 (turn_wall) 或貼外框那一圈 (hug) 時最後再試更長的
+        (貼外框那一圈離邊界只有 0.25 m，匝道太斜的話車頭外角會伸出外框太多)。"""
+        return EDGE_RAMPS + (EDGE_RAMPS_LONG if self.turn_wall > 0.0 or hug else ())
 
     def _straightness(self, pts, yaw, closed, half):
         """每一點前後 half 個點之內，方向最多偏離這一點多少 (rad)。開放折線兩端以外當成無限大。"""
@@ -982,25 +1012,25 @@ class EdgeLoops:
                 dev = np.maximum(dev, np.where(valid, np.abs(_wrap(yaw[jj] - yaw)), np.inf))
         return dev
 
-    def _full_loop(self, loop, yaw, off, rot_need):
+    def _full_loop(self, loop, yaw, off, rot_need, hug=False):
         """整圈都走得過去：挑直的地方當起點 (進出匝道都放得下)。回傳路線或 None。"""
-        for length in self._ramp_lengths():
+        for length in self._ramp_lengths(hug):
             half = int(round(length / EDGE_STEP))
             dev = self._straightness(loop, yaw, True, half)
             for i in np.argsort(dev, kind='stable')[:60]:
                 if dev[i] > EDGE_RAMP_MAX_TURN:
                     break
-                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need)
+                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need, hug)
                 if rin is None:
                     continue
-                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need)
+                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need, hug)
                 if rout is None:
                     continue
                 body = np.vstack([loop[i:], loop[:i], loop[i:i + 1]])
                 return np.vstack([rin, body, rout]), len(rin), len(rout)
         return None
 
-    def _full_loop_options(self, loop, yaw, off, rot_need, max_n):
+    def _full_loop_options(self, loop, yaw, off, rot_need, max_n, hug=False):
         """整圈可以從哪幾個地方進出 (2026-10-22)：夠直、放得下進出匝道的地方，彼此沿著圈至少隔
         EDGE_ENTRY_GAP (圈長 / max_n 比較大就用它)，最多 max_n 個。匝道長的先挑 (比較平緩)，
         長的放不下的地方再用短的 (跟 _full_loop 一樣的幾種長度、一樣的檢查)。
@@ -1009,7 +1039,7 @@ class EdgeLoops:
         n = len(loop)
         gap = max(EDGE_ENTRY_GAP, n * EDGE_STEP / max(max_n, 1))
         taken, out = [], []
-        for length in self._ramp_lengths():
+        for length in self._ramp_lengths(hug):
             half = int(round(length / EDGE_STEP))
             dev = self._straightness(loop, yaw, True, half)
             tried = 0
@@ -1019,10 +1049,10 @@ class EdgeLoops:
                 if any(min(abs(i - j), n - abs(i - j)) * EDGE_STEP < gap for j in taken):
                     continue
                 tried += 1
-                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need)
+                rin = self._ramp(loop[i], yaw[i], off, length, True, rot_need, hug)
                 if rin is None:
                     continue
-                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need)
+                rout = self._ramp(loop[i], yaw[i], off, length, False, rot_need, hug)
                 if rout is None:
                     continue
                 body = np.vstack([loop[i:], loop[:i], loop[i:i + 1]])
@@ -1030,17 +1060,17 @@ class EdgeLoops:
                 out.append((np.vstack([rin, body, rout]), len(rin), len(rout)))
         return out
 
-    def _open_piece(self, pts, yaw, off, rot_need):
+    def _open_piece(self, pts, yaw, off, rot_need, hug=False):
         """斷開的一段 (開放折線)：從前面找得到進圈匝道的第一點、從後面找得到出圈匝道的最後一點。"""
         n = len(pts)
         need = int(round(EDGE_MIN_PIECE / EDGE_STEP))
-        for length in self._ramp_lengths():
+        for length in self._ramp_lengths(hug):
             half = int(round(length / EDGE_STEP))
             dev = self._straightness(pts, yaw, False, half)
             start = None
             for i in range(0, n - need):
                 if dev[i] <= EDGE_RAMP_MAX_TURN:
-                    rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need)
+                    rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need, hug)
                     if rin is not None:
                         start = (i, rin)
                         break
@@ -1048,7 +1078,7 @@ class EdgeLoops:
                 continue
             for j in range(n - 1, start[0] + need - 1, -1):
                 if dev[j] <= EDGE_RAMP_MAX_TURN:
-                    rout = self._ramp(pts[j], yaw[j], off, length, False, rot_need)
+                    rout = self._ramp(pts[j], yaw[j], off, length, False, rot_need, hug)
                     if rout is not None:
                         i, rin = start
                         return np.vstack([rin, pts[i:j + 1], rout]), len(rin), len(rout)
@@ -1057,7 +1087,8 @@ class EdgeLoops:
     def items(self, offsets, safe_offset):
         """要繞的每一圈 (整圈走得過去) 或每一截 (走不過去的地方斷開)，還沒挑從哪裡進圈。
 
-        回傳 [{'d', 'off', 'full', 'pts', 'yaw'}]：full 的 pts 是閉合的一圈，否則是開放的一截。
+        回傳 [{'d', 'off', 'full', 'pts', 'yaw', 'hug'}]：full 的 pts 是閉合的一圈，否則是開放的一截；
+        hug = 貼外框那一圈 (車身可以伸出外圈)。
         同樣的 offsets、safe_offset 算過就用上次的 (manager 先用 routes 算周邊環繞重不重複，再用 plan 排順序)。
         """
         key = (tuple(float(d) for d in offsets), float(safe_offset))
@@ -1066,11 +1097,13 @@ class EdgeLoops:
         out = []
         for d in offsets:
             off = max(0.0, float(safe_offset) - float(d))
+            hug = self.hug(d)
             for loop in self.loops(d):
                 yaw = _headings(loop, True)
-                ok = self.poses_ok(loop, yaw)
+                ok = self.poses_ok(loop, yaw, hug=hug)
                 if ok.all():
-                    out.append({'d': float(d), 'off': off, 'full': True, 'pts': loop, 'yaw': yaw})
+                    out.append({'d': float(d), 'off': off, 'full': True, 'pts': loop, 'yaw': yaw,
+                                'hug': hug})
                     continue
                 # 走不過去的地方斷開：一段一段 (環狀) 各自進出
                 n = len(loop)
@@ -1086,7 +1119,7 @@ class EdgeLoops:
                     if len(run) * EDGE_STEP >= EDGE_MIN_PIECE:
                         piece = loop[run]
                         out.append({'d': float(d), 'off': off, 'full': False, 'pts': piece,
-                                    'yaw': _headings(piece, False)})
+                                    'yaw': _headings(piece, False), 'hug': hug})
                     run = []
         self._items[key] = out
         return out
@@ -1103,17 +1136,19 @@ class EdgeLoops:
 
         一整圈從最直的地方進出；斷開的一截只能從前面進、後面出。
         """
+        hug = item.get('hug', False)
         if item['full']:
-            r = self._full_loop(item['pts'], item['yaw'], item['off'], rot_need)
+            r = self._full_loop(item['pts'], item['yaw'], item['off'], rot_need, hug)
         else:
-            r = self._open_piece(item['pts'], item['yaw'], item['off'], rot_need)
+            r = self._open_piece(item['pts'], item['yaw'], item['off'], rot_need, hug)
         return None if r is None else self._as_route(item, r)
 
     def route_options(self, item, rot_need, max_n=None):
         """items() 的一項可以怎麼繞：一整圈有好幾個進圈的地方 (_full_loop_options)，斷開的一截只有一種。"""
         if item['full']:
             return [self._as_route(item, r) for r in self._full_loop_options(
-                item['pts'], item['yaw'], item['off'], rot_need, max_n or EDGE_ENTRY_OPTIONS)]
+                item['pts'], item['yaw'], item['off'], rot_need, max_n or EDGE_ENTRY_OPTIONS,
+                item.get('hug', False))]
         r = self.route_item(item, rot_need)
         return [] if r is None else [r]
 
@@ -1166,36 +1201,42 @@ class EdgeLoops:
         if n < need + 2:
             return None
         yaw = _headings(pts, False)
-        off = max(0.0, float(safe_offset) - float(np.median(self.clearance_at(pts))))
-        lengths = [(length, int(round(length / EDGE_STEP))) for length in self._ramp_lengths()]
+        d = float(np.median(self.clearance_at(pts)))
+        off = max(0.0, float(safe_offset) - d)
+        hug = self.hug(d)
+        lengths = [(length, int(round(length / EDGE_STEP))) for length in self._ramp_lengths(hug)]
         for i in range(0, n - need):
             for length, half in lengths:        # 越前面越好 (少割的最少)，同一個點先試長的匝道
                 if i + half >= n:
                     continue
                 if np.abs(_wrap(yaw[i:i + half + 1] - yaw[i])).max() > EDGE_RAMP_MAX_TURN:
                     continue
-                rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need)
+                rin = self._ramp(pts[i], yaw[i], off, length, True, rot_need, hug)
                 if rin is not None:
                     return i, rin
         return None
 
     def rotation_ok(self, xy, yaw0, yaw1, step=math.radians(5.0)):
-        """在 xy 原地從 yaw0 轉到 yaw1 (走比較短的那一邊)，整個過程車身都在範圍裡嗎。"""
+        """在 xy 原地從 yaw0 轉到 yaw1 (走比較短的那一邊)，整個過程車身都在範圍裡嗎
+        (車子在貼外框那一圈上時，車身可以伸出外圈)。"""
+        xy = np.asarray(xy, float)
+        hug = self.hug(float(self.clearance_at(xy)))
         dy = _wrap(yaw1 - yaw0)
         n = max(int(math.ceil(abs(dy) / step)), 1)
         yaws = yaw0 + dy * np.linspace(0.0, 1.0, n + 1)
-        pts = np.repeat(np.asarray(xy, float).reshape(1, 2), len(yaws), axis=0)
-        return bool(self.poses_ok(pts, yaws).all())
+        pts = np.repeat(xy.reshape(1, 2), len(yaws), axis=0)
+        return bool(self.poses_ok(pts, yaws, hug=hug).all())
 
     def escape(self, xy, yaw, rot_need, max_len=3.0):
         """沿邊那一段失敗、車子停在離邊很近的地方時，往前斜斜開回能原地轉身的地方。
 
         方向試 yaw 偏 0、±10、±20、±30 度 (先試偏得少的)：原地轉到那個方向的過程、
-        往前開的整條直線，車身都要在範圍裡；開到離邊緣 >= rot_need、離牆夠遠 (turn_ok) 就停
-        (最多 max_len)。
+        往前開的整條直線，車身都要在範圍裡 (從貼外框那一圈退出時，車身可以伸出外圈)；
+        開到離邊緣 >= rot_need、離牆夠遠 (turn_ok) 就停 (最多 max_len)。
         回傳 (直線的點, 方向)，找不到回傳 None。
         """
         p = np.asarray(xy, dtype=float)
+        hug = self.hug(float(self.clearance_at(p)))
         for deg in (0, 10, -10, 20, -20, 30, -30):
             hd = yaw + math.radians(deg)
             line = _line(p, p + max_len * np.array([math.cos(hd), math.sin(hd)]), EDGE_STEP)
@@ -1205,7 +1246,7 @@ class EdgeLoops:
             line = line[:max(int(reach[0]), 2) + 1]
             if not self.rotation_ok(p, yaw, hd):
                 continue
-            if self.poses_ok(line[1:], np.full(len(line) - 1, hd)).all():
+            if self.poses_ok(line[1:], np.full(len(line) - 1, hd), hug=hug).all():
                 return line, hd
         return None
 

@@ -332,6 +332,14 @@ class MowerManager(Node):
         # 離地圖上的牆要夠遠，停止區轉一圈才掃不到牆 (route_plan 第 4 節，2026-10-21)。
         self.declare_parameter('stop_zone_active', False)
         self.stop_zone_active = bool(self.get_parameter('stop_zone_active').value)
+        # 貼外框 (2026-10-30 will：外圍割太少，改成新的)：圈了草地外框時，沿邊那幾圈的車身最多伸出外框線
+        # 這麼遠 (公尺；0 = 車身整台在框裡，以前的做法)。外框是後輪中心開過的線，圈的時候車身本來就伸出去
+        # 半個車寬 (0.42 m)，所以 0.37 (留 5 公分) 還在圈外框時車子壓過的地方裡面。離外框 0.25 m 那一圈
+        # (edge_loops 的 0.25，刀盤剛好割到外框線往內 0.10 m) 直線的地方車身只伸出 7 公分，轉角多一點。
+        # 沒有外框時 (外圈是牆) 不放寬：那一圈繞不了，跟以前一樣。
+        self.declare_parameter('frame_overhang', 0.37)
+        self.frame_overhang = float(self.get_parameter('frame_overhang').value)
+        self.lawn_frame_on = False      # 有沒有草地外框 (/lawn_boundary)
         self.edge_offsets = self.parse_edge_loops(str(self.get_parameter('edge_loops').value))
         self._edge = None               # 這一趟的 route_plan.EdgeLoops (執行中失敗時算退出路線)
         self._edge_cont = set()         # 沿邊路線「接著上一段」的那幾段 (id(Path))：不原地對正
@@ -858,7 +866,9 @@ class MowerManager(Node):
             except ValueError:
                 bad.append('裡的 %r 不是數字' % part)
                 continue
-            low = self.LEAD_IN_BOUNDARY_CLEARANCE + route_plan.EDGE_MARGIN
+            # 圈了外框時車身可以伸出外框 frame_overhang，最外圈可以更靠邊
+            low = max(0.0, self.LEAD_IN_BOUNDARY_CLEARANCE + route_plan.EDGE_MARGIN
+                      - self.frame_overhang - route_plan.EDGE_WALL_GAP - route_plan.EDGE_MARGIN)
             if not low < d < self.headland_width:
                 bad.append('的 %.2f m 不合理 (要大於車身半寬 + 餘裕 %.2f、小於地頭 %.2f)'
                            % (d, low, self.headland_width))
@@ -2125,6 +2135,12 @@ class MowerManager(Node):
             self.get_logger().error('🪢 沿邊繞圈算不出來 (%s: %s)，這一趟不繞。' % (type(e).__name__, e))
             return [], start_xy, []
         self._edge = edge
+        hug = self.LEAD_IN_BOUNDARY_CLEARANCE + route_plan.EDGE_MARGIN
+        no_frame = [d for d in self.edge_offsets if edge.overhang <= 0.0 and d < hug]
+        if no_frame:
+            self.get_logger().info(
+                '🪢 離邊界 %s m 那一圈要圈了草地外框才繞 (貼外框，車身會伸出邊界)，這一趟不繞'
+                % '、'.join('%.2f' % d for d in no_frame))
         walls = edge.wall
         if walls is None:
             self.get_logger().warn('🪢 還沒收到地圖：沿邊繞圈不知道哪裡是真的牆，牆邊轉角光達停止區有可能擋車')
@@ -2167,13 +2183,21 @@ class MowerManager(Node):
             self.get_logger().info('🪢 沿邊多繞：範圍太窄或太彎，這一趟沒有可以繞的圈')
         return entries, here, display
 
+    def edge_overhang(self):
+        """沿邊車身可以伸出割草範圍外圈多遠：外框線外 frame_overhang，加上割草範圍比外框內縮的
+        EDGE_WALL_GAP 與 EdgeLoops 自己留的 EDGE_MARGIN。沒有外框 (外圈是牆) 時 0。"""
+        if not self.lawn_frame_on or self.frame_overhang <= 0.0:
+            return 0.0
+        return self.frame_overhang + route_plan.EDGE_WALL_GAP + route_plan.EDGE_MARGIN
+
     def new_edge_loops(self, rings, walls):
         return route_plan.EdgeLoops(
             rings, self.FRONT_EXTENT, self.REAR_EXTENT, self.LEAD_IN_BOUNDARY_CLEARANCE,
             walls=walls,
             stop_len=float(self.get_parameter('stop_zone_length').value),
             stop_side=float(self.get_parameter('stop_zone_side_margin').value),
-            turn_wall=self.turn_wall_need if walls is not None else 0.0)
+            turn_wall=self.turn_wall_need if walls is not None else 0.0,
+            overhang=self.edge_overhang())
 
     def edge_loops_for(self, rings):
         """這一次規劃的沿邊 route_plan.EdgeLoops (周邊環繞重不重複、沿邊路線共用一份)；沒開沿邊、建不起來回傳 None。"""
@@ -3359,6 +3383,7 @@ class MowerManager(Node):
             self.publish_resume_info()
 
     def lawn_fp_cb(self, msg):
+        self.lawn_frame_on = len(msg.polygon.points) >= 3
         self._fp['lawn'] = mission_resume.poly_fingerprint(
             [(p.x, p.y) for p in msg.polygon.points])
         if self._resume_offer is not None:

@@ -200,7 +200,8 @@ def route_yaw(pts):
 def check_route(el, r):
     pts = r['pts']
     yaw = route_yaw(pts)
-    assert el.poses_ok(pts, yaw, margin=0.0).all()               # 車身 (與停止區) 從頭到尾都在範圍裡
+    hug = el.hug(r['d'])                                          # 貼外框那一圈：車身可以伸出外圈
+    assert el.poses_ok(pts, yaw, margin=0.0, hug=hug).all()      # 車身 (與停止區) 從頭到尾都在範圍裡
     assert el.clearance_at(pts[0]) >= ROT_NEED - 1e-6           # 匝道兩頭掉得了頭
     assert el.clearance_at(pts[-1]) >= ROT_NEED - 1e-6
     steps = np.hypot(*np.diff(pts, axis=0).T)
@@ -270,6 +271,72 @@ def test_edge_loops_wall_on_one_side_cuts_the_inner_loop():
     body = r['pts'][r['ramp_in']:len(r['pts']) - r['ramp_out']]
     assert body[:, 1].min() > 0.75 + 0.1                       # 沒有沿著下緣 (牆) 走
     assert r['length'] > 2 * h                                 # 另外三邊大部分都有
+
+
+# 貼外框 (2026-10-30)：車身可以伸出外圈 OVERHANG (manager：frame_overhang 0.37 + 腐蝕 0.10 + 餘裕 0.05)
+OVERHANG = 0.52
+
+
+def body_outside(el, pts, yaw, w, h):
+    """每一個位姿車身伸出長方形 (0..w, 0..h) 多遠：車身取樣點離長方形最遠的那一點 (在裡面 = 0)。"""
+    smp = el._sample(np.asarray(pts, float), np.asarray(yaw, float), el._body)
+    dx = np.maximum(np.maximum(-smp[..., 0], smp[..., 0] - w), 0.0)
+    dy = np.maximum(np.maximum(-smp[..., 1], smp[..., 1] - h), 0.0)
+    return np.hypot(dx, dy).max(axis=1)
+
+
+def test_edge_loops_overhang_hugs_the_frame():
+    """圈了外框：離邊界 0.25 m 那一圈 (刀盤割到邊界) 整圈繞得了，車身伸出外圈不超過 OVERHANG - 0.05；
+    車身整台要在範圍裡 (以前) 的話這一圈根本沒有。"""
+    w, h = 10.0, 6.0
+    inside = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W)
+    assert inside.routes([0.25], SAFE, ROT_NEED) == []
+    el = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W, overhang=OVERHANG)
+    routes = el.routes([0.25], SAFE, ROT_NEED)
+    assert len(routes) == 1 and routes[0]['full']
+    r = routes[0]
+    check_route(el, r)
+    body = r['pts'][r['ramp_in']:len(r['pts']) - r['ramp_out']]
+    assert abs(float(np.median(el.clearance_at(body))) - 0.25) < 0.03
+    out = body_outside(el, r['pts'], route_yaw(r['pts']), w, h)
+    assert out.max() <= OVERHANG - route_plan.EDGE_MARGIN + 0.03        # 伸出去最多 0.47 (外框外 0.37)
+    assert 0.12 < float(np.median(out)) < 0.22                          # 直的地方伸出約 0.17 (外框外 7 公分)
+    assert el.hug(0.25) and not el.hug(0.75) and not inside.hug(0.25)
+
+
+def test_edge_loops_overhang_keeps_inner_loops():
+    """放寬只給貼外框那一圈：1.10、0.75 那兩圈跟沒圈外框時一模一樣，車身整台在範圍裡
+    (10-30 模擬：兩圈也放寬的話形狀變了，周邊環繞反而省不掉)。"""
+    for rings in ([rect(10.0, 6.0)], field_with_hole()):
+        a = route_plan.EdgeLoops(rings, FRONT, REAR, HALF_W).routes([1.10, 0.75], SAFE, ROT_NEED)
+        el = route_plan.EdgeLoops(rings, FRONT, REAR, HALF_W, overhang=OVERHANG)
+        b = el.routes([1.10, 0.75], SAFE, ROT_NEED)
+        assert len(a) == len(b) > 0
+        for ra, rb in zip(a, b):
+            assert ra['d'] == rb['d'] and np.array_equal(ra['pts'], rb['pts'])
+            assert el.poses_ok(rb['pts'], route_yaw(rb['pts']), margin=0.0).all()
+
+
+def test_edge_loops_overhang_not_into_holes_or_walls():
+    """伸出去只限外圈：障礙物 (內環) 照舊整台車都不能碰；外圈外面是牆 (佔據格) 的地方也不伸出去。"""
+    el = route_plan.EdgeLoops(field_with_hole(), FRONT, REAR, HALF_W, overhang=OVERHANG)
+    x0, y0, x1, y1 = BOX
+    for r in el.routes([1.10, 0.75, 0.25], SAFE, ROT_NEED):
+        check_route(el, r)
+        yaw = route_yaw(r['pts'])
+        smp = el._sample(r['pts'], yaw, el._body).reshape(-1, 2)
+        inside = (smp[:, 0] > x0) & (smp[:, 0] < x1) & (smp[:, 1] > y0) & (smp[:, 1] < y1)
+        assert not inside.any()
+    w, h = 12.0, 8.0
+    el = route_plan.EdgeLoops([rect(w, h)], FRONT, REAR, HALF_W, walls=room_walls(w, h, 'bottom'),
+                              overhang=OVERHANG)
+    hug = el.routes([0.25], SAFE, ROT_NEED)
+    assert hug and all(not r['full'] for r in hug)                     # 牆邊斷開
+    for r in hug:
+        check_route(el, r)
+        body = r['pts'][r['ramp_in']:len(r['pts']) - r['ramp_out']]
+        assert body[:, 1].min() > 0.5                                  # 沒有沿著下緣 (牆) 走
+    assert sum(r['length'] for r in hug) > w - 3.0                      # 上緣 (離牆遠) 照繞
 
 
 def test_tolerant_box_and_swept_zone():

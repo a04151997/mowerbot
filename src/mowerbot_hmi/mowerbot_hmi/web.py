@@ -117,10 +117,11 @@ NAV_SPEED_KEYS = ('max_vel_x', 'max_speed_xy', 'max_vel_theta')
 NAV_SPEED_FULL = {'max_vel_x': 0.7, 'max_speed_xy': 0.7, 'max_vel_theta': 1.2}     # 讀不到 nav2_params.yaml 時用
 SPEED_READ_PERIOD = 2.0
 # 網頁「割草路線」(2026-10-22 will：跑一趟太久)：割草線間距與沿邊圈數，改 mower_manager 的參數，下一次規劃才用。
-# 間距 = 刀盤寬 (0.5 m) x (1 - 重疊率)，0.30 是原本的 (重疊 0.4)。沿邊 = 離邊界幾公尺各繞一圈 (edge_loops)，
-# 兩圈是實車原本的 (bringup_real.launch.py)，一圈 0.85 m 夾在兩圈中間，邊上沒割到的帶多約 0.1 m。
+# 間距 = 刀盤寬 (0.5 m) x (1 - 重疊率)，0.30 是原本的 (重疊 0.4)。沿邊 = 離邊界幾公尺各繞一圈 (edge_loops)。
+# 貼外框 (2026-10-30，實車原本的，bringup_real.launch.py) = 兩圈 + 離邊界 0.25 m 一圈，那一圈只在圈了草地外框時繞
+# (車身伸出外框幾公分)；一圈 0.85 m 夾在兩圈中間，邊上沒割到的帶多約 0.1 m。
 PLAN_SPACING_CHOICES = (0.30, 0.35, 0.40)
-PLAN_EDGE_CHOICES = (('兩圈', '1.10,0.75'), ('一圈', '0.85'), ('不繞', ''))
+PLAN_EDGE_CHOICES = (('貼外框', '1.10,0.75,0.25'), ('兩圈', '1.10,0.75'), ('一圈', '0.85'), ('不繞', ''))
 
 # 網頁畫禁區 (2026-10-21 will)：總覽地圖上點幾個角圍一塊，或下載地圖圖片用紅筆畫好再上傳。
 # 寫到 keepout_server 讀的 active.yaml (跟 keepout_tool apply 同一個檔)，再叫它載入。

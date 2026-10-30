@@ -439,7 +439,8 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'edge_loops',
             default_value='',
-            description='沿邊多繞幾圈 (2026-10-21)：離邊界幾公尺各繞一圈，逗號分開 (實車 "1.10,0.75")。'
+            description='沿邊多繞幾圈 (2026-10-21)：離邊界幾公尺各繞一圈，逗號分開 (實車 "1.10,0.75,0.25"，'
+                        '0.25 只在圈了草地外框時繞)。'
                         '空 = 不繞 (模擬預設，跟以前一樣)。轉角邊走邊轉，只在進出圈的匝道兩頭原地轉身。'),
         # 模擬時預設不啟動 robot_state_publisher (由 gazebo.launch.py 負責)
         DeclareLaunchArgument(
