@@ -371,6 +371,8 @@ class BoundaryRecorder(Node):
             resp.message = (f'草地邊界完成：{n_track} 個取樣點 -> {len(poly)} 個頂點，'
                             f'面積 {result["area"]:.1f} m²、周長 {result["perimeter"]:.1f} m、'
                             f'終點離起點 {result["gap"]:.2f} m{knots}{saved}')
+        # 圈完車子停在外框線上，manager 不讓它在這裡開始 (轉身會掃出去)：10-24、10-30 實車都在這裡卡了好幾次
+        resp.message += '。車子現在在外框線上：按 LB + B 開始割之前，先用手把往裡面開 1～2 m'
         self.set_mode('idle', resp.message)
         self.get_logger().info('✅ ' + resp.message)
         return resp

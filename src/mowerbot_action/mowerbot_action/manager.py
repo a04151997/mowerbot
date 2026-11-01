@@ -269,6 +269,8 @@ class MowerManager(Node):
         self.headland_width = float(self.get_parameter('headland_width').value)
         self._angle_executor = None
         self._angle_job = None
+        # 預覽 (手把 Y) 時車子停的位置還不能開始：照樣算路線給人看，這句接在路線摘要後面 (2026-11-01)
+        self._preview_warn = None
         self.create_timer(0.05, self.poll_angle_job)
         # 送給 F2C 的請求 (編號, 送出時間)：F2C_TIMEOUT 內沒回來就中止，晚到的結果不用
         self._f2c_seq = 0
@@ -1183,15 +1185,25 @@ class MowerManager(Node):
 
         # 規劃之前先看車子自己站得下站不下。這一項擋的是「車子當下停的位置」，
         # 與階段 21 那些針對「規劃出來的段落」的檢查互補 —— 見 start_pose_blocked()。
+        # 預覽不擋 (2026-11-01)：圈完外框車子就停在外框線上，10-24、10-30 實車按 Y 各被擋 6 次，
+        # 每次都沒有路線，看起來像算不出來。預覽車子不會動，照樣算出路線，摘要後面說要先開進去；
+        # LB + B 照舊擋。
+        self._preview_warn = None
         blocked = self.start_pose_blocked()
         if blocked is not None:
-            text = ('車子現在的位置沒辦法開始：%s，不足以原地掉頭。'
-                    '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m%s以上的開闊處，再按一次。'
-                    % (blocked, '、離牆 %.1f m ' % self.turn_wall_need
-                       if self.wall_turn() is not None else ' '))
-            self.get_logger().error('🚫 ' + text)
-            self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
-            return
+            room = '、離牆 %.1f m ' % self.turn_wall_need if self.wall_turn() is not None else ' '
+            if preview:
+                self._preview_warn = (
+                    '⚠️ 但車子現在的位置還不能開始：%s，不足以原地掉頭。按 LB + B 之前，先用手把把車開到'
+                    '割草範圍裡、離邊 1.1 m%s以上的開闊處。' % (blocked, room))
+                self.get_logger().warn('👀 ' + self._preview_warn)
+            else:
+                text = ('車子現在的位置沒辦法開始：%s，不足以原地掉頭。'
+                        '用手把 (LB + X 手動) 把車開到割草範圍裡、離邊 1.1 m%s以上的開闊處，再按一次。'
+                        % (blocked, room))
+                self.get_logger().error('🚫 ' + text)
+                self.set_mission_state(MissionStatus.STATE_ABORTED, message=text)
+                return
 
         if not self.f2c_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().error('⚠️ F2C 伺服器未上線，請確認 f2c_server 已經啟動！')
@@ -3323,14 +3335,14 @@ class MowerManager(Node):
 
                 self.publish_plan(queue, 'preview' if preview else 'mission', transit, robot_xy)
                 if preview:
-                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。%s車子不會動；'
-                            'OK 就按 LB + B 開始割。'
+                    text = ('路線預覽：割草線 %d 條 (方向 %.0f°)%s%s%s，共 %d 段。%s車子不會動；%s'
                             % (total, math.degrees(angle) % 180.0,
                                '、分 %d 塊割' % oinfo['chains'] if oinfo['changed'] else '',
                                '、周邊環繞 %d 段' % n_edges if n_edges else '',
                                '、割完再沿邊多繞 %d 段' % len(edge_entries) if edge_entries else '',
                                len(queue),
-                               '外圈 (周邊環繞 %.0f m) 跟沿邊重複，不繞。' % dropped if dropped else ''))
+                               '外圈 (周邊環繞 %.0f m) 跟沿邊重複，不繞。' % dropped if dropped else '',
+                               self._preview_warn or 'OK 就按 LB + B 開始割。'))
                     self.get_logger().info('👀 ' + text)
                     self.set_mission_state(MissionStatus.STATE_IDLE, message=text)
                     return
