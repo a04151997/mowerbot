@@ -441,6 +441,14 @@ class TransitPlanner:
             return float(self.dist[v, u])
         return 0.0
 
+    def turn_ok(self, x, y):
+        """這一點能不能原地轉身 (離邊界 / 障礙物 >= turn_clearance、離牆夠遠)；範圍外是 False。
+        繞過擋路的東西之後要在哪裡接回原來那一段用 (obstacle_detour，2026-11-03)。"""
+        u, v = self._cell((x, y))
+        if 0 <= v < self.turnable.shape[0] and 0 <= u < self.turnable.shape[1]:
+            return bool(self.turnable[v, u])
+        return False
+
     def _visible(self, p, qs, relax_p=0.0, relax_q=0.0):
         """從 p 直線開到 qs 裡每一點走不走得過去 (bool 陣列)。離 p 或 q 這麼近的取樣點不檢查。"""
         qs = np.asarray(qs, dtype=float).reshape(-1, 2)

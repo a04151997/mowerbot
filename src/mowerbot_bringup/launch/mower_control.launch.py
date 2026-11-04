@@ -81,6 +81,13 @@ def stop_zone_active(context):
     return (not sim) if v.strip() == '' else launch_bool(v, 'collision_monitor')
 
 
+def obstacle_avoid(context):
+    """路線上有東西擋住先停、等一下、還在就繞過去 (2026-11-03)：留空 = 跟著光達停止區 (實車開、模擬關，
+    Gazebo 的既有測試行為不變)。"""
+    v = LaunchConfiguration('obstacle_avoid', default='').perform(context)
+    return stop_zone_active(context) if v.strip() == '' else launch_bool(v, 'obstacle_avoid')
+
+
 def plan_options_file(context):
     """網頁「割草路線」選的割草線間距、沿邊圈數存在哪 (2026-10-22)：實車存，下次開機照用；
     模擬不存 (空)，測試照 launch 參數跑。"""
@@ -406,6 +413,9 @@ def generate_launch_description():
                 'stop_zone_active': stop_zone_active(context),
                 'stop_zone_length': float(
                     LaunchConfiguration('stop_zone_length', default='0.40').perform(context)),
+                # 路線上有東西擋住 (2026-11-03 will)：車頭前 1.3 m 先停、等 10 秒、還在就離它 1.0 m 繞過去，
+                # 沒割到的最後補割 (obstacle_detour.py)
+                'obstacle_avoid': obstacle_avoid(context),
                 # 用存好的地圖 (2026-10-21)：定位對上 (map_session) 才讓自動割草出發
                 'saved_map': LaunchConfiguration('mowerbot_saved_map').perform(context),
                 # 停下來之後接著割 (2026-10-22)：割草進度跟著地圖 (session) 存，用同一張存好的地圖開機找得回來
@@ -500,6 +510,12 @@ def generate_launch_description():
             default_value='',
             description='割草線方向：auto = 每次規劃挑掉頭最少的方向，數字 = 固定角度 (度，從 map 的 x 軸量)。'
                         '留空 = 跟著 use_sim_time：實車 auto、模擬 0。'
+        ),
+        DeclareLaunchArgument(
+            'obstacle_avoid',
+            default_value='',
+            description='割草中路線上有東西擋住：車頭前 1.3 m 先停、等 10 秒，還在就離它 1.0 m 從旁邊繞過去，'
+                        '沒割到的最後補割。留空 = 跟著光達停止區 (實車開、模擬關)。'
         ),
         DeclareLaunchArgument(
             'save_map_before_f2c',
