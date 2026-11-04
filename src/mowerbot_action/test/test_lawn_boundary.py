@@ -1,0 +1,328 @@
+"""lawn_boundary 的單元測試 (不需要 ROS，pytest 直接跑)。"""
+import math
+
+import numpy as np
+import pytest
+
+from mowerbot_action import lawn_boundary as lb
+
+
+def square_track(x0, y0, side, step=0.1, gap=0.0):
+    """沿正方形逆時針取樣的軌跡，最後一點離起點 gap 公尺 (模擬沒有剛好開回起點)。"""
+    pts = []
+    n = int(round(side / step))
+    corners = [(x0, y0), (x0 + side, y0), (x0 + side, y0 + side), (x0, y0 + side)]
+    for k in range(4):
+        ax, ay = corners[k]
+        bx, by = corners[(k + 1) % 4]
+        for i in range(n):
+            t = i / n
+            pts.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    pts.append((x0, y0 + gap))
+    return pts
+
+
+def test_append_if_moved_skips_small_moves():
+    track = []
+    assert lb.append_if_moved(track, 0.0, 0.0)
+    assert not lb.append_if_moved(track, 0.05, 0.0)
+    assert lb.append_if_moved(track, 0.10, 0.0)
+    assert track == [(0.0, 0.0), (0.10, 0.0)]
+
+
+def test_square_closes_to_four_corners():
+    res = lb.close_and_simplify(square_track(1.0, 2.0, 6.0, gap=0.3))
+    poly = res['polygon']
+    assert len(poly) == 4
+    assert res['area'] == pytest.approx(36.0, rel=0.03)
+    assert res['perimeter'] == pytest.approx(24.0, rel=0.03)
+    assert res['gap'] == pytest.approx(0.3, abs=1e-6)
+    xs = [p[0] for p in poly]
+    ys = [p[1] for p in poly]
+    assert min(xs) == pytest.approx(1.0, abs=0.06)
+    assert max(xs) == pytest.approx(7.0, abs=0.06)
+    assert min(ys) == pytest.approx(2.0, abs=0.06)
+    assert max(ys) == pytest.approx(8.0, abs=0.06)
+
+
+def test_noisy_track_simplifies_within_tolerance():
+    rng = np.random.default_rng(0)
+    track = [(x + rng.normal(0, 0.01), y + rng.normal(0, 0.01))
+             for x, y in square_track(0.0, 0.0, 5.0)]
+    res = lb.close_and_simplify(track)
+    assert len(res['polygon']) <= 12
+    assert res['area'] == pytest.approx(25.0, rel=0.05)
+
+
+def test_open_track_is_rejected():
+    with pytest.raises(ValueError, match='終點離起點'):
+        lb.close_and_simplify(square_track(0.0, 0.0, 6.0, gap=1.5))
+
+
+def test_too_few_points_is_rejected():
+    with pytest.raises(ValueError, match='還不是一圈'):
+        lb.close_and_simplify([(0.0, 0.0), (0.1, 0.0)])
+
+
+def test_tiny_area_is_rejected():
+    with pytest.raises(ValueError, match='面積'):
+        lb.close_and_simplify(square_track(0.0, 0.0, 0.5, step=0.05))
+
+
+def test_figure_eight_is_rejected():
+    # (0,0)->(3,3)->(3,0)->(0,3)->(0,0) 是蝴蝶結 (8 字形)，兩條對角線在 (1.5, 1.5) 交叉
+    corners = [(0.0, 0.0), (3.0, 3.0), (3.0, 0.0), (0.0, 3.0)]
+    track = []
+    for k in range(4):
+        ax, ay = corners[k]
+        bx, by = corners[(k + 1) % 4]
+        n = int(math.hypot(bx - ax, by - ay) / 0.1)
+        for i in range(n):
+            t = i / n
+            track.append((ax + (bx - ax) * t, ay + (by - ay) * t))
+    track.append((0.0, 0.05))
+    with pytest.raises(ValueError, match='交叉'):
+        lb.close_and_simplify(track, min_area=0.0)
+
+
+def rect_loop_with_overshoot(overshoot, noise=0.02, seed=1):
+    """5 x 4 m 的長方形繞一圈，回到起點後沿著第一條邊再往前開 overshoot 公尺 (加上手開的雜訊)。"""
+    rng = np.random.default_rng(seed)
+    corners = [(0.0, 0.0), (5.0, 0.0), (5.0, 4.0), (0.0, 4.0), (0.0, 0.0), (overshoot, 0.0)]
+    pts = []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        n = int(math.hypot(bx - ax, by - ay) / 0.1)
+        for i in range(n):
+            t = i / n
+            pts.append((ax + (bx - ax) * t + rng.normal(0, noise), ay + (by - ay) * t + rng.normal(0, noise)))
+    pts.append(corners[-1])
+    track = []
+    for x, y in pts:
+        lb.append_if_moved(track, x, y)
+    return track
+
+
+@pytest.mark.parametrize('overshoot', [0.3, 0.6, 0.9])
+def test_overshoot_past_start_is_trimmed(overshoot):
+    # 開回起點時開過頭：以前收出來自己交叉、按完成會失敗 (10-20 實算 0.3 / 0.6 / 0.9 m 都失敗)，
+    # 現在剪掉過頭的那段
+    track = rect_loop_with_overshoot(overshoot)
+    with pytest.raises(lb.SelfIntersectError):     # 不剪的話確實會交叉 (確認這個測試有測到剪的那條路)
+        lb._close_once(track, lb.MAX_CLOSE_GAP_M, lb.SIMPLIFY_EPS_M, lb.MIN_AREA_M2)
+    res = lb.close_and_simplify(track)
+    assert res['area'] == pytest.approx(20.0, rel=0.05)
+    assert res['gap'] < 0.15
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_trim_overshoot_keeps_track_that_stops_short():
+    track = square_track(0.0, 0.0, 5.0)[:-6]          # 停在起點前 0.6 m
+    assert lb.trim_overshoot(track) == track
+
+
+def test_trim_overshoot_ignores_earlier_pass_near_start():
+    # 中途經過起點附近 (0.8 m) 之後又開走，最後才開回來：終點只能在最後一段裡找
+    track = [(0.1 * k, 0.0) for k in range(30)]                       # 往右 3 m
+    track += [(3.0, 0.1 * k) for k in range(1, 30)]                   # 往上 3 m
+    track += [(3.0 - 0.1 * k, 2.9) for k in range(1, 31)]             # 往左到 x = 0
+    track += [(0.0, 2.9 - 0.1 * k) for k in range(1, 22)]             # 往下到 y = 0.8 (離起點 0.8 m)
+    track += [(-0.1 * k, 0.8) for k in range(1, 16)]                  # 往左離開 1.5 m
+    track += [(-1.5, 0.8 - 0.1 * k) for k in range(1, 9)]             # 往下
+    track += [(-1.5 + 0.1 * k, 0.0) for k in range(1, 18)]            # 往右開過起點 0.2 m
+    out = lb.trim_overshoot(track)
+    assert len(out) > len(track) - 20                    # 只剪掉最後過頭的幾點
+    assert math.hypot(*out[-1]) < 0.06
+
+
+def test_self_intersects_control_cases():
+    assert not lb.self_intersects([(0, 0), (1, 0), (1, 1), (0, 1)])
+    assert lb.self_intersects([(0, 0), (1, 1), (1, 0), (0, 1)])
+
+
+def test_rasterize_matches_map_convention():
+    # 地圖 200 x 200 格、0.05 m，原點 (-5, -5)：多邊形 (0,0)~(2,1) 應該落在
+    # col 100~140、row 100~120 (row 對應 y、col 對應 x)
+    poly = [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (0.0, 1.0)]
+    mask = lb.rasterize(poly, -5.0, -5.0, 0.05, 200, 200)
+    rows, cols = np.nonzero(mask)
+    assert cols.min() == 100 and cols.max() == 140
+    assert rows.min() == 100 and rows.max() == 120
+    assert mask[110, 120] == 255
+    assert mask[110, 150] == 0      # x = 2.5 m，在外面
+    assert mask[130, 120] == 0      # y = 1.5 m，在外面
+
+
+def test_rasterize_empty_polygon_is_all_zero():
+    assert not lb.rasterize([], 0.0, 0.0, 0.05, 10, 10).any()
+
+
+def test_yaml_roundtrip(tmp_path):
+    poly = [(0.0, 0.0), (4.0, 0.0), (4.0, 3.0), (0.0, 3.0)]
+    path = tmp_path / 'lawn.yaml'
+    lb.save_yaml(str(path), poly, 'map', stamp_sec=123.0)
+    loaded, frame = lb.load_yaml(str(path))
+    assert frame == 'map'
+    assert loaded == poly
+
+
+# ---- 倒車擦掉 (2026-10-22 will：圈外框開錯了要能倒回去) ----
+def _drive(track, pts, yaw_of, state):
+    """照 boundary_recorder.sample 的邏輯一點一點開過 pts：倒車時擦、前進時記。yaw_of(i) = 車頭方向。"""
+    for i, (x, y) in enumerate(pts):
+        if state['xy'] is None:
+            state['xy'] = (x, y)
+        else:
+            step = lb.motion_direction(state['xy'], (x, y), yaw_of(i))
+            if step != 0:
+                state['xy'] = (x, y)
+                state['rev'] = step < 0
+        if state['rev']:
+            lb.erase_back(track, x, y)
+        else:
+            lb.append_if_moved(track, x, y)
+
+
+def test_motion_direction():
+    assert lb.motion_direction((0, 0), (0.1, 0.0), 0.0) == 1
+    assert lb.motion_direction((0, 0), (-0.1, 0.0), 0.0) == -1
+    assert lb.motion_direction((0, 0), (0.0, 0.1), 0.0) == 0         # 往旁邊滑
+    assert lb.motion_direction((0, 0), (-0.01, 0.0), 0.0) == 0       # 還沒動夠遠
+    assert lb.motion_direction((0, 0), (0.0, -0.1), math.pi / 2) == -1
+
+
+def test_reverse_erases_the_wrong_part_and_continues():
+    track, st = [], {'xy': None, 'rev': False}
+    # 往東開 6 m (前 4 m 對，後 2 m 開錯)
+    fwd = [(0.02 * i, 0.0) for i in range(301)]
+    _drive(track, fwd, lambda i: 0.0, st)
+    assert track[-1][0] == pytest.approx(6.0, abs=0.11)
+    # 沿原路倒車退回 x = 4 (車頭還是朝東)
+    back = [(6.0 - 0.02 * i, 0.0) for i in range(1, 101)]
+    _drive(track, back, lambda i: 0.0, st)
+    assert max(p[0] for p in track) <= 4.0 + 0.11
+    # 轉 90° 往北開 3 m：從 x = 4 接著記
+    north = [(4.0, 0.02 * i) for i in range(1, 151)]
+    _drive(track, north, lambda i: math.pi / 2, st)
+    assert max(p[0] for p in track) <= 4.0 + 0.11
+    assert track[-1] == pytest.approx((4.0, 3.0), abs=0.11)
+    steps = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(track[:-1], track[1:])]
+    assert max(steps) < 0.25                                       # 中間沒有跳接
+
+
+def test_reverse_off_the_track_erases_nothing():
+    track = [(0.1 * i, 0.0) for i in range(51)]
+    before = list(track)
+    assert lb.erase_back(track, 3.0, 1.0) == 0.0                   # 離原路 1 m 倒車
+    assert track == before
+
+
+def test_reverse_near_the_start_only_touches_the_tail():
+    # 繞一個 2 x 2 m 的方形快回到起點，在起點旁邊倒車一點點：只擦尾巴，不會對到起點那一頭
+    sq = [(0.1 * i, 0.0) for i in range(20)] + [(2.0, 0.1 * i) for i in range(20)]
+    sq += [(2.0 - 0.1 * i, 2.0) for i in range(20)] + [(0.0, 2.0 - 0.1 * i) for i in range(17)]
+    track = list(sq)                                               # 尾巴停在 (0, 0.4)
+    gone = lb.erase_back(track, 0.0, 0.55)
+    assert 0.0 < gone < 0.3
+    assert len(track) > len(sq) - 4
+    # 尾巴之前的那一段 (lookback 外) 不會被找到
+    track = list(sq)
+    assert lb.erase_back(track, 1.0, 0.0, lookback=2.0) == 0.0
+
+
+# ---- 只修錯的那一段 (2026-10-28 will：圈外框失敗只修錯的地方，不要整趟重跑) ----
+def walk(corners, step=0.1):
+    """照 corners 一段一段走 (含最後一點)，每 step 一個點。"""
+    pts = []
+    for (ax, ay), (bx, by) in zip(corners, corners[1:]):
+        n = max(int(round(math.hypot(bx - ax, by - ay) / step)), 1)
+        pts += [(ax + (bx - ax) * t / n, ay + (by - ay) * t / n) for t in range(n)]
+    return pts + [tuple(corners[-1])]
+
+
+def test_ring_crossings_finds_the_place():
+    assert lb.ring_crossings([(0, 0), (1, 0), (1, 1), (0, 1)]) == []
+    found = lb.ring_crossings([(0, 0), (2, 2), (2, 0), (0, 2)])
+    assert len(found) == 1
+    assert found[0][2] == pytest.approx((1.0, 1.0))
+    # 頂點碰到別的邊也算 (跟以前的 self_intersects 一樣)
+    assert lb.ring_crossings([(0, 0), (2, 0), (1, 0), (1, 2), (0, 2)])
+
+
+def test_small_knot_is_removed_automatically():
+    # 6 x 4 m 繞一圈，下面那條邊中間原地繞了一個 0.5 m 的小圈 (倒車、原地轉身弄出來的)
+    track = walk([(0, 0), (3.0, 0)])
+    track += walk([(3.0, 0), (3.5, 0.4), (3.0, 0.6), (2.8, -0.1)])[1:]
+    track += walk([(2.8, -0.1), (3.2, 0.0), (6, 0), (6, 4), (0, 4), (0, 0.3)])[1:]
+    with pytest.raises(lb.SelfIntersectError):
+        lb._close_once(track, lb.MAX_CLOSE_GAP_M, lb.SIMPLIFY_EPS_M, lb.MIN_AREA_M2)
+    res = lb.close_and_simplify(track)
+    assert len(res['knots']) >= 1
+    assert all(a < lb.KNOT_MAX_AREA for _x, _y, a in res['knots'])
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_out_and_back_excursion_is_removed():
+    # 右邊那條邊開到草地外面 3 m 又開回來，回來時壓過去的線 (細細的一圈、面積很小)：自動拿掉
+    track = walk([(0, 0), (6, 0), (6, 1.9), (9, 2.1), (6, 1.8), (6, 4), (0, 4), (0, 0.3)])
+    res = lb.close_and_simplify(track)
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert max(x for x, _y in res['polygon']) < 6.2
+
+
+def big_crossing_track():
+    """6 x 4 m 的一圈，右邊那條邊開歪了：往左上斜斜切過去又開回右邊，交叉圍出兩塊大的 (小的那塊 3.5 m²)。"""
+    return walk([(0, 0), (6, 0), (6, 1), (1, 3.5), (1, 0.8), (6, 3.5), (6, 4), (0, 4), (0, 0.3)])
+
+
+def test_big_crossing_reports_where():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    assert len(e.value.crossings) == 1
+    x, y = e.value.crossings[0]
+    assert x == pytest.approx(3.6, abs=0.1) and y == pytest.approx(2.2, abs=0.1)
+    assert '修一段' in str(e.value)
+    assert e.value.ring is not None and len(e.value.ring) > 100
+
+
+def test_fix_one_piece_replaces_the_wrong_part():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    base = e.value.ring
+    # 從右下角上面一點 (6, 0.6) 沿著真的邊 (x = 6) 開到 (6, 3.8)，接回原來的線
+    patch = walk([(6.05, 0.6), (6.05, 3.8)])
+    out = lb.splice(base, patch)
+    assert out['crossings'] == []
+    assert 12.0 < out['replaced'] < 16.0              # 換掉的是開歪的那一截 (約 14 m)，不是其他的
+    res = lb.finish_ring(out['ring'])
+    assert res['area'] == pytest.approx(24.0, rel=0.03)
+    assert not lb.self_intersects(res['polygon'])
+
+
+def test_fix_driven_in_the_opposite_direction():
+    with pytest.raises(lb.SelfIntersectError) as e:
+        lb.close_and_simplify(big_crossing_track())
+    patch = walk([(6.05, 3.8), (6.05, 0.6)])         # 反方向開也一樣
+    out = lb.splice(e.value.ring, patch)
+    assert out['crossings'] == []
+    assert lb.finish_ring(out['ring'])['area'] == pytest.approx(24.0, rel=0.03)
+
+
+def test_fix_a_finished_frame_adds_a_missed_corner():
+    # 圈好的 6 x 4 m 外框漏了右上角一塊：從右邊開出去繞過那一塊再接回上面那條邊
+    poly = lb.close_and_simplify(walk([(0, 0), (6, 0), (6, 4), (0, 4), (0, 0.3)]))['polygon']
+    base = lb.densify(poly)
+    patch = walk([(6.0, 3.0), (7.5, 3.0), (7.5, 5.5), (5.0, 5.5), (5.0, 4.0)])
+    out = lb.splice(base, patch)
+    assert out['crossings'] == []
+    res = lb.finish_ring(out['ring'])
+    # 原來 24 m² + 右上那一塊 (x 5~7.5、y 3~5.5 扣掉原來就在裡面的 x 5~6、y 3~4)
+    assert res['area'] == pytest.approx(24.0 + 2.5 * 2.5 - 1.0, rel=0.03)
+
+
+def test_fix_far_from_the_frame_is_refused():
+    base = lb.densify([(0, 0), (6, 0), (6, 4), (0, 4)])
+    with pytest.raises(ValueError, match='起點離原來的外框'):
+        lb.splice(base, walk([(3, 2), (3, 3)]))
+    with pytest.raises(ValueError, match='終點離原來的外框'):
+        lb.splice(base, walk([(6, 1), (4, 2)]))

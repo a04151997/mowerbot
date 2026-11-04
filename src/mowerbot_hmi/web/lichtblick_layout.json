@@ -1,0 +1,145 @@
+{
+  "configById": {
+    "3D!mowerbot": {
+      "cameraState": {
+        "perspective": false,
+        "distance": 30,
+        "phi": 0.001,
+        "thetaOffset": 90,
+        "target": [
+          0,
+          0,
+          0
+        ],
+        "targetOffset": [
+          0,
+          0,
+          0
+        ],
+        "targetOrientation": [
+          0,
+          0,
+          0,
+          1
+        ],
+        "fovy": 45,
+        "near": 0.5,
+        "far": 5000
+      },
+      "followMode": "follow-position",
+      "followTf": "base_footprint",
+      "scene": {
+        "enableStats": false,
+        "transforms": {
+          "showLabel": false,
+          "axisScale": 0.5
+        }
+      },
+      "transforms": {},
+      "topics": {
+        "/map": {
+          "visible": true
+        },
+        "/keepout_mask": {
+          "visible": true,
+          "colorMode": "custom",
+          "minColor": "#00000000",
+          "maxColor": "#e5393599",
+          "unknownColor": "#00000000",
+          "invalidColor": "#00000000"
+        },
+        "/scan": {
+          "visible": true,
+          "pointSize": 4,
+          "colorMode": "flat",
+          "flatColor": "#ff1744ff"
+        },
+        "/f2c_path": {
+          "visible": true,
+          "lineWidth": 0.06,
+          "gradient": [
+            "#1e88e5ff",
+            "#1e88e5ff"
+          ]
+        },
+        "/edge_path": {
+          "visible": true,
+          "lineWidth": 0.06,
+          "gradient": [
+            "#00897bff",
+            "#00897bff"
+          ]
+        },
+        "/plan": {
+          "visible": true,
+          "lineWidth": 0.05,
+          "gradient": [
+            "#fb8c00ff",
+            "#fb8c00ff"
+          ]
+        },
+        "/f2c_boundary": {
+          "visible": true,
+          "color": "#43a047ff"
+        },
+        "/lawn_boundary": {
+          "visible": true,
+          "color": "#8e24aaff"
+        },
+        "/boundary_recorder/track": {
+          "visible": true,
+          "lineWidth": 0.05,
+          "gradient": [
+            "#8e24aaff",
+            "#8e24aaff"
+          ]
+        },
+        "/local_costmap/published_footprint": {
+          "visible": true,
+          "color": "#212121ff"
+        },
+        "/robot_description": {
+          "visible": true
+        }
+      },
+      "layers": {
+        "grid": {
+          "layerId": "foxglove.Grid",
+          "visible": true,
+          "frameId": "map",
+          "size": 50,
+          "divisions": 50,
+          "lineWidth": 1,
+          "color": "#9e9e9e40",
+          "position": [
+            0,
+            0,
+            0
+          ],
+          "rotation": [
+            0,
+            0,
+            0
+          ],
+          "order": 1
+        }
+      },
+      "publish": {
+        "type": "point",
+        "poseTopic": "/move_base_simple/goal",
+        "pointTopic": "/clicked_point",
+        "poseEstimateTopic": "/initialpose",
+        "poseEstimateXDeviation": 0.5,
+        "poseEstimateYDeviation": 0.5,
+        "poseEstimateThetaDeviation": 0.26179939
+      },
+      "imageMode": {}
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": {
+    "speed": 1
+  },
+  "layout": "3D!mowerbot"
+}

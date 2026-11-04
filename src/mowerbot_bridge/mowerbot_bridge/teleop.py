@@ -4,6 +4,9 @@ from sensor_msgs.msg import Joy                         # 接收手把原始資�
 from geometry_msgs.msg import Twist                     # 發布速度指令 (linear.x, angular.z)
 from mowerbot_interfaces.srv import SetDriveMode        # 自定義的模式切換服務
 from mowerbot_interfaces.msg import JoyStatus           # 手把連線狀態 (給 HMI 看)
+from mowerbot_interfaces.msg import MowerStatus         # 目前模式 (Y 存圖要看)
+from std_srvs.srv import Trigger                        # Y 存圖 (map_autosave)
+from rcl_interfaces.msg import SetParametersResult      # 網頁改速度 (speed_scale)
                                                         
 class MowerTeleop(Node):
     def __init__(self):
@@ -13,6 +16,7 @@ class MowerTeleop(Node):
             namespace='',
             parameters=[
                 ('scale_linear', 0.7),('scale_angular', 1.2),
+                ('speed_scale', 1.0),
                 ('axis_linear', 1),('axis_angular',0),
                 ('button_a', 0),('button_b', 1),('button_x',2),('button_y',3),('button_deadman',4),('button_stop',5)
             ]
@@ -24,12 +28,34 @@ class MowerTeleop(Node):
          'button_a' , 'button_b' , 'button_x' , 'button_y' , 'button_deadman','button_stop'
         ]
         }
+        # 速度上限比例 (2026-10-20 D1)：car-start 的速度上限以前在 bridge 乘，現在手把和 Nav2 各自乘，
+        # bridge 不縮放。joystick.yaml 不用改 (N150 上有 will 自己改過的版本)。
+        speed_scale = float(self.get_parameter('speed_scale').value)
+        if not 0.05 <= speed_scale <= 1.0:
+            raise ValueError('speed_scale 要在 0.05 ~ 1.0 之間，收到 %r' % speed_scale)
+        self._full = (self.p['scale_linear'], self.p['scale_angular'])
+        self._apply_speed_scale(speed_scale)
+        # 網頁改速度 (2026-10-21)：執行中改 speed_scale 參數就換手把的上限，不用重開。
+        # Nav2 那邊網頁另外改 controller_server 的參數 (見 mowerbot_hmi/web.py 的 set_speed)。
+        self.add_on_set_parameters_callback(self._on_params)
 
         # 訂閱 joy 話題，讀取手把硬體狀態
         self.joy_sub = self.create_subscription(Joy,'joy',self.joy_callback,10)
         # 發布 cmd_vel_joy，給 Manager 
         self.vel_pub = self.create_publisher(Twist,'/cmd_vel_joy',10)
         self.mode_client = self.create_client(SetDriveMode ,'change_mower_mode')
+
+        # ---- Y = 存圖 + 預覽割草路線 (2026-10-19 will) ----
+        # 存圖：呼叫 /map_autosave/save (save_map.sh，跟 car-savemap 同一支)，存成 map_<月日>_<時分秒>。
+        # 預覽：呼叫 /mower_manager/preview，照 LB + B 的流程算一次路線發到 /f2c_path，不執行；
+        # 看了 OK 再按 LB + B 開始割 (同一張圖、同一個禁區，算出來的路線一樣)。
+        # 存圖不會讓車子動，所以不用按住 LB；自動割草 (mode 1 / 3) 中不存：存圖時 slam_toolbox
+        # 序列化地圖要吃 CPU，不要在車子自己走的時候做。結果寫在 log 與 /map_autosave/last (car-status 看得到)。
+        self.save_client = self.create_client(Trigger, 'map_autosave/save')
+        self.preview_client = self.create_client(Trigger, 'mower_manager/preview')
+        self._save_future = None
+        self._mode = None
+        self.create_subscription(MowerStatus, 'mower_status', self._status_cb, 10)
 
         self.last_button = [0]*12
 
@@ -44,13 +70,29 @@ class MowerTeleop(Node):
 
         #手把鎖定
         #False表示目前是鎖定
-        # Y 不列出來：它對應 mode 3，那是保留值、沒有實作(階段 23)。
-        # 按鍵繫結本身沒有動 —— 模式仲裁的行為不在這次的變更範圍內，
-        # 而且 manager 對 mode 3 的處理是定義好而且安全的(擋手把、急停有效)。
-        # 這裡只是不再把它當成一個可用功能宣傳。
-        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）')
+        self.get_logger().info('手把目前為鎖定狀態，按下LB即可解鎖，解鎖後可選擇模式：A（建圖）, B（自動割草）, X（手動）；'
+                               'Y = 存圖 + 預覽割草路線 (不用按 LB)')
         #按鈕B是：1 按鈕A是：0 按鈕X是：2 按鈕Y是：3
         #滾輪左右是0 上下是1 左LB是4 右LB是5
+
+    def _apply_speed_scale(self, speed_scale):
+        self.p['scale_linear'] = self._full[0] * speed_scale
+        self.p['scale_angular'] = self._full[1] * speed_scale
+        self.get_logger().info('手把推到底：%.3f m/s、%.3f rad/s (speed_scale %.2f)'
+                               % (self.p['scale_linear'], self.p['scale_angular'], speed_scale))
+
+    def _on_params(self, params):
+        for prm in params:
+            if prm.name != 'speed_scale':
+                continue
+            try:
+                v = float(prm.value)
+            except (TypeError, ValueError):
+                return SetParametersResult(successful=False, reason='speed_scale 要是數字')
+            if not 0.05 <= v <= 1.0:
+                return SetParametersResult(successful=False, reason='speed_scale 要在 0.05 ~ 1.0 之間')
+            self._apply_speed_scale(v)
+        return SetParametersResult(successful=True)
 
     @staticmethod
     def _button(buttons, index):
@@ -85,12 +127,56 @@ class MowerTeleop(Node):
         msg.last_msg_age = float(min(age, 999.0))
         self.joy_status_pub.publish(msg)
 
+    def _status_cb(self, msg):
+        self._mode = msg.mode
+
+    def save_map(self):
+        """Y：預覽割草路線 + 存一份地圖。只在這裡判斷能不能做，實際規劃與存圖交給 manager 與 map_autosave。"""
+        if self._mode in (1, 3):
+            self.get_logger().warn('Y 存圖：自動割草中不存圖。LB + X 回手動 (車子會停) 再按 Y。')
+            return
+        # 預覽先送：規劃約 1 秒，存圖要 10 ~ 30 秒，路線不用等存圖
+        if self.preview_client.service_is_ready():
+            self.preview_client.call_async(Trigger.Request()).add_done_callback(self._preview_done)
+        else:
+            self.get_logger().error('Y 預覽路線：mower_manager 的預覽服務沒有開。')
+        if self._save_future is not None and not self._save_future.done():
+            self.get_logger().warn('Y 存圖：上一次還在存，等它存完 (約 10 ~ 30 秒)。')
+            return
+        if not self.save_client.service_is_ready():
+            self.get_logger().error('Y 存圖：存圖服務 (map_autosave) 沒有開。')
+            return
+        self.get_logger().info('Y 存圖：開始存圖 (約 10 ~ 30 秒)...')
+        self._save_future = self.save_client.call_async(Trigger.Request())
+        self._save_future.add_done_callback(self._save_done)
+
+    def _preview_done(self, future):
+        res = future.result()
+        if res is not None and res.success:
+            self.get_logger().info('Y 預覽路線：開始規劃，結果看 /f2c_path 與 car-status 的任務訊息')
+        else:
+            self.get_logger().warn('Y 預覽路線：沒有預覽 (%s)' % (res.message if res is not None else '沒有回應'))
+
+    def _save_done(self, future):
+        res = future.result()
+        if res is not None and res.success:
+            self.get_logger().info('Y 存圖：已存 %s' % res.message)
+        else:
+            self.get_logger().error('Y 存圖：失敗 (%s)' % (res.message if res is not None else '沒有回應'))
+
     def joy_callback(self, data):
         # 先記下狀態再處理控制：下面的急停分支會提早 return，
         # 記在後面的話急停按住期間 /joy_status 就會停在舊資料。
         self._last_joy_time = self.get_clock().now()
-        self._deadman_held = self._button(data.buttons, self.p['button_deadman'])
-        self._stop_pressed = self._button(data.buttons, self.p['button_stop'])
+        deadman = self._button(data.buttons, self.p['button_deadman'])
+        stop = self._button(data.buttons, self.p['button_stop'])
+        changed = (deadman != self._deadman_held or stop != self._stop_pressed)
+        self._deadman_held = deadman
+        self._stop_pressed = stop
+        # LB / 急停鍵一變化就立刻多發一筆 /joy_status，不等 5 Hz timer (最多晚 0.2 s)：
+        # mower_manager 用這個話題判斷自動模式能不能動 (手把連線、LB；2026-10-15 / 10-19)
+        if changed:
+            self.publish_joy_status()
 
         if self.last_button is None:
             self.last_button = list(data.buttons)
@@ -112,6 +198,11 @@ class MowerTeleop(Node):
             self.last_button = list(data.buttons)
             return
 
+        # Y = 存圖 (按下的瞬間)。跟 LB 無關，所以放在 LB 判斷之前；急停按住時上面已經 return，不會存。
+        if (self._button(data.buttons, self.p['button_y'])
+                and not self._button(self.last_button, self.p['button_y'])):
+            self.save_map()
+
         LB_ishold = data.buttons[self.p['button_deadman']] ==1
         if LB_ishold:            
                 if data.buttons[self.p['button_a']] == 1 and self.last_button[self.p['button_a']] == 0:
@@ -123,14 +214,8 @@ class MowerTeleop(Node):
                 elif data.buttons[self.p['button_x']] == 1 and self.last_button[self.p['button_x']] == 0:
                     self.call_service(2) #手動
                     self.get_logger().info('切換至手動模式')
-                # Y 鍵沒有繫結（階段 23）。
-                # 它以前呼叫 change_mower_mode(3)，但 mode 3 是保留值、沒有實作
-                # （需要 planner_server + bt_navigator，見 architecture.md 3.1）。
-                # 留著一顆會把車切進未實作模式的按鍵，等於在實車上提供一個
-                # 沒有人測過用途的入口，所以整個分支拿掉。
-                # **不要拿 Y 去做別的事** —— 按鍵語意改變在實車上比沒有功能危險。
-                # button_y 這個參數本身留著：joystick.yaml 還在宣告它，
-                # 刪掉會讓現有的設定檔變成「未宣告的參數」而啟動失敗。
+                # Y 不切模式：以前 (階段 23 之前) LB + Y 會切到沒有實作的 mode 3，已經拿掉。
+                # 2026-10-19 will 決定 Y 改成存圖 (見上面 save_map)，不會讓車子動。
 
                 #處理速度輸出：只有按住 LB (deadman) 時才把搖桿值算進 twist
                 twist = Twist()

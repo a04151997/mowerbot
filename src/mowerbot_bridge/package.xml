@@ -13,6 +13,7 @@
   <depend>mowerbot_interfaces</depend>
   <depend>nav_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>std_srvs</depend>
   <exec_depend>joy</exec_depend>
   <exec_depend>mowerbot_description</exec_depend>
   <!-- drivers/wheeltec.py 的序列埠 -->

@@ -27,7 +27,10 @@ SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{seria
 # CH9102（Ubuntu 22.04 走核心內建 cdc_acm → ttyACM*；裝了沁恆的 ch343 驅動則是 ttyCH343USB*）
 SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d4", ATTRS{serial}=="0002", SYMLINK+="mowerbot_base", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
 
-# ---- 光達（TODO：型號待 hw_probe 確認） ------------------------------------
-# 型號確認之後，照驅動板的寫法加一行，SYMLINK+="mowerbot_lidar"。
-# 輪趣慣例裡光達的序號是 "0001"，但光達不一定是跟輪趣買的，以 hw_probe 的結果為準。
-# SUBSYSTEM=="tty", ATTRS{idVendor}=="<VID>", ATTRS{idProduct}=="<PID>", ATTRS{serial}=="<序號>", SYMLINK+="mowerbot_lidar", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"
+# ---- 光達 Slamtec RPLIDAR S3 ----------------------------------------------
+# 2026-10-12 實機確認：光達 S3M1、韌體 1.02、1 Mbps；轉接板序號如下。
+# 原廠轉接板是 CP2102（10c4:ea60），跟上面 C30D 的 CP2102 那一行同一組 VID:PID，
+# 所以一定要比對序號。實驗室有三個轉接板，只有這一個能跟光達通訊；換轉接板就要改序號：
+#   udevadm info -a -n /dev/ttyUSB0 | grep -m1 'ATTRS{serial}'
+# 若改用其他 USB 轉 TTL 模組（CH340 是 1a86:7523、FT232 是 0403:6001），VID:PID 也要跟著改。
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="8098c8baeb0aee11b7f74702f59e3369", SYMLINK+="mowerbot_lidar", GROUP="dialout", MODE="0660", ENV{ID_MM_DEVICE_IGNORE}="1"

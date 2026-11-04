@@ -13,7 +13,12 @@ controller_server:
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.5
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.3
+    # 0.3 -> 2.0 (2026-10-28，10-24 實車資料)：一邊割一邊建圖時，建圖程式重算地圖 (閉環) 在 N150 上
+    # 卡住約 1.7 s，map -> odom 的時間戳停住 (slam transform_timeout 1.0 s 之後就過期)，控制器有 0.2 ~ 0.7 s
+    # 查不到車子在地圖上的位置 ("Unable to transform robot pose into global plan's frame")。
+    # 0.3 s 就放棄那一段：10-24 因此直接失敗 3 段、連帶 2 段。查不到的這段時間控制器送零速度 (車子停住)，
+    # 等久一點不影響安全；collision_monitor 跟這個無關，照常用光達擋車。
+    failure_tolerance: 2.0
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["general_goal_checker", "approach_goal_checker", "align_goal_checker"]
     # AlignController (階段 38 決定 1)：每段開始前先原地對正的控制器。
@@ -24,9 +29,13 @@ controller_server:
     controller_plugins: ["FollowPath", "AlignController"]
 
     # 割草機速度慢，進度檢查的時間給寬一點，避免正常慢速前進被誤判成卡住
+    # 2026-10-20 will 同意 (D1)：SimpleProgressChecker 只看平移，原地對正一律要 15 s 內轉完，
+    # 慢速時 180° 很容易超過。PoseProgressChecker 轉了 required_movement_angle 也算在動；
+    # 真的卡住 (位置、角度都不動，包括停止區 / 手把斷線的暫停) 照樣 15 s 判失敗。
     progress_checker:
-      plugin: "nav2_controller::SimpleProgressChecker"
+      plugin: "nav2_controller::PoseProgressChecker"
       required_movement_radius: 0.5
+      required_movement_angle: 0.5
       movement_time_allowance: 15.0
 
     # 覆蓋作業不在意最終朝向，yaw 容忍放寬
@@ -61,8 +70,6 @@ controller_server:
     # 等於不檢查朝向，對正目標又就在車子當下位置 —— 送出的瞬間就會假成功，一度都沒轉。
     align_goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      # xy_goal_tolerance 不寫在這裡：navigation.launch.py 從 approach_goal_checker 注入 (沿用 0.10，單一來源)
-      #
       # yaw_goal_tolerance = 0.10 是【實驗值，非推導值】。
       # 依據：docs/stage38_align_and_perimeter.md 與 simulation_results.md 38.13 的容忍值掃描
       #   (0.03 / 0.05 / 0.10 各 5 次：收斂 2/5、3/5、4/5；成功後 1 s 的最終誤差 0.16~0.17 / 0.15~0.17 / 0.09~0.12)。
@@ -71,6 +78,12 @@ controller_server:
       # ⚠ 這是【模擬限制下的值】，不是物理上的最佳值。模擬的低角速度行為已知不可信
       #   (低速死區、停不住、旋轉中心漂移)；實機量到原地旋轉角速度與停止精度後必須重新定案。
       yaw_goal_tolerance: 0.10
+      # xy 容忍 0.50 (2026-10-28，10-24 實車資料)：以前從 approach_goal_checker 注入 0.10。
+      # AlignController 不能平移 (max_vel_x = 0)，位置差了也修不回來；實車原地轉一開始會滑開
+      # (90° 以上的原地轉 42 次有 39 次滑開 5 cm 以上，最多 16 cm)，建圖修正位置也會讓它差得更多。
+      # 0.10 的時候方向已經對了 (差 0.7°、1°) 也永遠算不到「轉好」，15 s 後判失敗 (10-24 有 2 段)。
+      # 「對正期間真的沒有前進」由測試 N8 用 approach_goal_checker 的 0.10 檢查，那個判準不動。
+      xy_goal_tolerance: 0.50
       # stateful 必須是 false：對正的重點就是朝向，latch 掉 xy 之後只檢查 yaw 看似無害，
       # 但 stateful 已經讓 approach 假成功過一次 (階段 25)，這裡不冒險。
       stateful: false
@@ -83,15 +96,17 @@ controller_server:
 
     # AlignController 自己的鍵 (注入不歸它管的部分；權重 / max_vel_x / xy_goal_tolerance 寫在這裡會被注入蓋掉並印 WARN)
     AlignController:
-      # 對正階段的角速度下限 (階段 38 後續 4 / 6)。
-      # 實車的減速馬達有靜摩擦 (stiction)，85 kg 的車對 0.06 rad/s 的命令多半也轉不動；
-      # 「對正時角速度要有下限」很可能是實車上的真實需求，但這個值仍需實機驗證。
-      # 目前 0.0 = 不作用 (與加入前的行為完全相同)。理由 (simulation_results.md 38.17)：
-      #   在本檔的 yaw 容忍 0.10 下，0.3 收斂 1/5、0.5 收斂 0/5，都沒達到採用標準 (>= 4/5)，
-      #   而且比不設 (9/15) 還差。展示用設定 (yaw 容忍 0.25 + 0.3) 由
-      #   test/tools/stage38_demo_run.sh 0.25 <目錄>  搭配  ALIGN_MST=0.3  重現；
-      #   yaw 容忍不能在本檔改成 0.25：N7 的判準直接讀它，改了等於放寬測試。
-      min_speed_theta: 0.0
+      # 對正階段的角速度下限 (階段 38 後續 4 / 6；2026-10-28 用 10-24 實車資料定成 0.30)。
+      # 實車量到的 (卡住原因_1024.md，停著的車子給同一個指令 1 s，有沒有轉起來)：
+      #   0.03 ~ 0.05 rad/s 5 % (328 次)、0.09 ~ 0.12 75 %、0.15 ~ 0.20 3 次都有、
+      #   0.22 有一次 1 s 都沒轉、0.30 ~ 0.70 每次都轉得起來 (23 次)。
+      # 以前是 0.0 (不設)：DWB 快轉到時給 0.02 ~ 0.03 rad/s，馬達不動，10-24 因此 1 段停在差 8.6° 的地方、
+      # 15 s 後判失敗。0.30 = 實車每次都轉得起來的最小值。
+      # 以前 0.3 不採用 (simulation_results.md 38.17：yaw 容忍 0.10 時收斂 1/5) 是 Gazebo 的結果，
+      # 當時 Gazebo 給 0.31 rad/s 實際只轉 0.002 ~ 0.017，那是模擬的問題，實車沒有。
+      # speed_scale 低到 FollowPath.max_vel_theta 比它小時 (0.25 以下)，navigation.launch.py 會把它降到
+      # max_vel_theta，不然 DWB 一個合法的速度都沒有。
+      min_speed_theta: 0.30
       # 這個值在這裡【不是速度限制】,而是一道開關。
       # DWB 的 isValidSpeed() 要求「平移 < min_speed_xy」且
       # 「|θ| < min_speed_theta」同時成立才剔除取樣。
@@ -100,6 +115,12 @@ controller_server:
       # 它不改變任何速度上限,FollowPath 完全未動。
       # (前提 max_vel_x == 0 由 navigation.launch.py 的啟動斷言檢查，不成立就 abort。)
       min_speed_xy: 0.01
+      # 往後預測 0.5 s (2026-10-30；以前跟 FollowPath 一樣 2.0 s)。最低轉速 0.30 以上時，預測 2 s
+      # 每一個選擇都轉過頭 40° 左右，快轉到的時候分不出該繼續轉還是轉回來，再加上實車 /odom 的轉速
+      # 每三筆有一筆是 0 (控制板 20 Hz、bridge 30 Hz)，車子就在目標前後來回晃：10-30 實車 72 次對正
+      # 有 14 次超過 9 s、4 次卡住重轉。模擬 (馬達延遲 + 同樣的 /odom) 各 30 次：
+      # 2.0 s 共 150 s、2 次卡住、4 次超過 9 s；0.5 s 共 69 s、0 次卡住、最久 5.5 s。
+      sim_time: 0.5
 
     FollowPath:
       plugin: "dwb_core::DWBLocalPlanner"
@@ -187,7 +208,24 @@ local_costmap:
       # costmap 從它自動算出內接半徑 0.155 (inflation 的 inscribed 帶) 與外接半徑 1.06。
       # 不要改用 robot_radius。
 
-      plugins: ["obstacle_layer", "inflation_layer"]
+      # keepout_layer (2026-10-18)：使用者在地圖上用紅色畫的禁區 (keepout_server 發布的
+      # /keepout_mask，map 座標系)。光達看不到的玻璃、坑洞，Nav2 也當成牆 —— 主要是擋
+      # approach 那種直線路徑。排在第一個：obstacle_layer 取最大值疊上去，inflation_layer
+      # 也會把禁區膨脹，跟真的牆一樣。沒畫禁區時 keepout_server 發的是 1 x 1、值 0 的遮罩，
+      # 等於沒有這一層 (放在 odom 座標系：實車按 LB + A 之前沒有 map，見 keepout_server.py)。
+      # 不用 Nav2 的 KeepoutFilter：Humble 的 filter 不會擴大更新範圍，遮罩只在其他圖層
+      # 剛好更新到的格子裡生效。實測 (只有 inflation_layer 時) 開機後才載入的禁區一格都沒標上。
+      # 推論 (沒有實測)：戶外光達前方沒東西、obstacle_layer 的更新範圍很小時也會這樣。
+      # StaticLayer 在 rolling window 下每次都更新整個視窗，而且會把 map 座標系的遮罩換算到
+      # odom (實測 map->odom 旋轉 0.5 rad 時位置完全吻合)。
+      plugins: ["keepout_layer", "obstacle_layer", "inflation_layer"]
+
+      keepout_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_topic: /keepout_mask
+        map_subscribe_transient_local: true
+        subscribe_to_updates: false
+        transform_tolerance: 0.5
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"

@@ -239,17 +239,20 @@ class MowerBridge(Node):
         now = self.get_clock().now()
 
         # ---- watchdog ----
+        # 觸發之後每一次 timer 都送零，直到重新收到 /cmd_vel (2026-10-20 will 同意)。
+        # 以前只送一包：控制板沒有指令逾時，那一包沒送到 (寫入逾時、板子丟掉) 的話，
+        # 車子會照最後的速度一直開。log 只印觸發的那一次。
         elapsed = (now - self._last_cmd_time).nanoseconds * 1e-9
-        if (not self.read_only and elapsed > self.cmd_vel_timeout
-                and not self._watchdog_tripped):
-            self._watchdog_tripped = True
-            self.get_logger().warn(
-                '⏱️ 超過 %.2f 秒沒收到 /cmd_vel（實際 %.2f 秒），送零速度'
-                % (self.cmd_vel_timeout, elapsed))
+        if not self.read_only and elapsed > self.cmd_vel_timeout:
+            if not self._watchdog_tripped:
+                self._watchdog_tripped = True
+                self.get_logger().warn(
+                    '⏱️ 超過 %.2f 秒沒收到 /cmd_vel（實際 %.2f 秒），持續送零速度'
+                    % (self.cmd_vel_timeout, elapsed))
             try:
                 self.driver.stop()
             except DriverError as exc:
-                self.get_logger().error('驅動層停止失敗: %s' % exc)
+                self.get_logger().error('驅動層停止失敗: %s' % exc, throttle_duration_sec=2.0)
 
         # ---- 讀編碼器並積分 ----
         dt = (now - self._last_odom_time).nanoseconds * 1e-9

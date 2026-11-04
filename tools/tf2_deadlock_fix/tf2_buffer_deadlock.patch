@@ -1,0 +1,127 @@
+diff --git a/tf2_ros/src/buffer.cpp b/tf2_ros/src/buffer.cpp
+index da5e5ec..9e57773 100644
+--- a/tf2_ros/src/buffer.cpp
++++ b/tf2_ros/src/buffer.cpp
+@@ -208,12 +208,33 @@ Buffer::waitForTransform(
+   auto promise = std::make_shared<std::promise<geometry_msgs::msg::TransformStamped>>();
+   TransformStampedFuture future(promise->get_future());
+ 
+-  auto cb = [this, promise, callback, future](
+-    tf2::TransformableRequestHandle request_handle, const std::string & target_frame,
+-    const std::string & source_frame, tf2::TimePoint time, tf2::TransformableResult result)
++  // [mowerbot patch] 修正 AB-BA 死鎖：
++  //   原版 waitForTransform 持有 timer_to_request_map_mutex_ 時呼叫 addTransformableRequest
++  //   (需要 BufferCore 的 transformable_requests_mutex_)；而 TF 監聽執行緒的
++  //   setTransform -> testTransformableRequests 持有 transformable_requests_mutex_ 時呼叫 cb，
++  //   cb 又要 timer_to_request_map_mutex_ -> 兩邊互等，/tf 監聽執行緒永久卡住。
++  //   現在 addTransformableRequest 不在 timer mutex 底下呼叫；cb 若早於 timer 登記完成就被呼叫，
++  //   先把結果放進 state->early（只用 leaf mutex state->m），登記完成後再補送。
++  struct EarlyState
++  {
++    std::mutex m;
++    bool inserted = false;
++    bool has_early = false;
++    tf2::TransformableRequestHandle handle = 0;
++    std::string target, source;
++    tf2::TimePoint time;
++    tf2::TransformableResult result = tf2::TransformAvailable;
++  };
++  auto state = std::make_shared<EarlyState>();
++
++  using DeliverFn = std::function<void(
++        tf2::TransformableRequestHandle, const std::string &, const std::string &,
++        tf2::TimePoint, tf2::TransformableResult)>;
++  auto deliver = std::make_shared<DeliverFn>(
++    [this, promise, callback, future](
++      tf2::TransformableRequestHandle request_handle, const std::string & target_frame,
++      const std::string & source_frame, tf2::TimePoint time, tf2::TransformableResult result)
+     {
+-      (void) request_handle;
+-
+       bool timeout_occurred = true;
+       {
+         std::lock_guard<std::mutex> lock(this->timer_to_request_map_mutex_);
+@@ -244,30 +265,46 @@ Buffer::waitForTransform(
+               "Failed to transform from " + source_frame + " to " + target_frame)));
+       }
+       callback(future);
++    });
++
++  auto cb = [state, deliver](
++    tf2::TransformableRequestHandle request_handle, const std::string & target_frame,
++    const std::string & source_frame, tf2::TimePoint time, tf2::TransformableResult result)
++    {
++      {
++        std::lock_guard<std::mutex> lock(state->m);
++        if (!state->inserted) {
++          state->has_early = true;
++          state->handle = request_handle;
++          state->target = target_frame;
++          state->source = source_frame;
++          state->time = time;
++          state->result = result;
++          return;
++        }
++      }
++      (*deliver)(request_handle, target_frame, source_frame, time, result);
+     };
+ 
+   bool call_callback = false;
+-  {
+-    // Putting the lock here to avoid a race condition where the callback is called before
+-    // the timer handle is inserted into timer_to_request_map_. Otherwise, it gets wrongly
+-    // discarded.
+-    std::lock_guard<std::mutex> lock(timer_to_request_map_mutex_);
+-    auto handle = addTransformableRequest(cb, target_frame, source_frame, time);
+-    future.setHandle(handle);
+-    if (0 == handle) {
+-      // Immediately transformable
+-      geometry_msgs::msg::TransformStamped msg_stamped = lookupTransform(
+-        target_frame, source_frame, time);
+-      promise->set_value(msg_stamped);
+-      call_callback = true;
+-    } else if (0xffffffffffffffffULL == handle) {
+-      // Never transformable
+-      promise->set_exception(
+-        std::make_exception_ptr(
+-          tf2::LookupException(
+-            "Failed to transform from " + source_frame + " to " + target_frame)));
+-      call_callback = true;
+-    } else {
++  auto handle = addTransformableRequest(cb, target_frame, source_frame, time);
++  future.setHandle(handle);
++  if (0 == handle) {
++    // Immediately transformable
++    geometry_msgs::msg::TransformStamped msg_stamped = lookupTransform(
++      target_frame, source_frame, time);
++    promise->set_value(msg_stamped);
++    call_callback = true;
++  } else if (0xffffffffffffffffULL == handle) {
++    // Never transformable
++    promise->set_exception(
++      std::make_exception_ptr(
++        tf2::LookupException(
++          "Failed to transform from " + source_frame + " to " + target_frame)));
++    call_callback = true;
++  } else {
++    {
++      std::lock_guard<std::mutex> lock(timer_to_request_map_mutex_);
+       auto timer_handle = timer_interface_->createTimer(
+         clock_,
+         timeout,
+@@ -276,6 +313,15 @@ Buffer::waitForTransform(
+       // Save association between timer and request handle
+       timer_to_request_map_[timer_handle] = handle;
+     }
++    bool replay = false;
++    {
++      std::lock_guard<std::mutex> lock(state->m);
++      state->inserted = true;
++      replay = state->has_early;
++    }
++    if (replay) {
++      (*deliver)(state->handle, state->target, state->source, state->time, state->result);
++    }
+   }
+   if (call_callback) {
+     callback(future);

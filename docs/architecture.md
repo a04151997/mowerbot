@@ -80,13 +80,18 @@ graph LR
     MGR -->|"generate_coverage_path<br/>（service）"| F2C["f2c_server<br/>Fields2Cover"]
     F2C -->|"coverage_path<br/>周邊環繞 + 弓字形"| MGR
     MGR -->|"一次一條<br/>follow_path（action）"| NAV["controller_server<br/>DWB"]
-    NAV -->|"/cmd_vel_nav"| MGR
+    NAV -->|"/cmd_vel_nav_raw<br/>（實車）"| CM["collision_monitor<br/>光達停止區（實車）"]
+    LIDAR -->|"/scan"| CM
+    CM -->|"/cmd_vel_nav"| MGR
+    NAV -.->|"/cmd_vel_nav<br/>（模擬：沒有停止區）"| MGR
+    LIDAR -->|"/scan（實車：中斷就停）"| MGR
     JOY["搖桿"] -->|"/joy"| TEL["teleop_node"]
     TEL -->|"/cmd_vel_joy"| MGR
     MGR -->|"/cmd_vel<br/>（唯一出口）"| CHASSIS["底盤<br/>模擬：diff_drive plugin<br/>實車：bridge_node"]
     CHASSIS --> ODO
     MGR -->|"/mower_status<br/>/mission_status（5 Hz）"| HMI["hmi_node<br/>人機介面"]
     TEL -->|"/joy_status（5 Hz）"| HMI
+    TEL -->|"/joy_status<br/>（實車：自動模式要按住 LB）"| MGR
     HMI -->|"change_mower_mode"| MGR
 ```
 
@@ -96,6 +101,21 @@ Nav2 的輸出被 remap 成 `/cmd_vel_nav`、搖桿的輸出是 `/cmd_vel_joy`�
 兩者都必須經過 manager 的模式仲裁才會變成 `/cmd_vel`。
 這是安全設計：急停（mode 4）只要讓 manager 不轉發，
 任何來源都到不了底盤。詳見 `simulation_results.md` 1.2 節與 N4 測試。
+
+**實車的自動模式還有三道停車條件**（2026-10-15 加入，`Phase S` 驗證）：
+
+* **放開 LB 就停**：mode 1 / 3 下 manager 看 teleop 的 `/joy_status`，
+  沒按住 LB 或手把斷線就送零速度、不轉發 Nav2（`auto_requires_deadman`）。
+  不取消任務：再按住就從原地接著走；暫停超過 15 s（progress checker）那一段會被跳過。
+* **光達停止區**：Nav2 的輸出先經過 `collision_monitor` 才到 `/cmd_vel_nav`。
+  車頭前緣往前 0.40 m、比車身左右各寬 0.05 m 的長方形裡有超過 3 個光達點就送零速度
+  （`navigation.launch.py` 的 `STOP_ZONE_LENGTH`）。只看得到光達那個高度的東西。
+* **光達中斷就停**：Humble 的 `collision_monitor` 在光達資料逾時的時候會照常放行，
+  所以 manager 自己看 `/scan`，0.5 s 沒有新資料就送零速度（`auto_requires_scan`）。
+
+三個都只在實車開（`use_sim_time:=false`；`bringup_real.launch.py` 強制開）。
+模擬沒有手把，有牆的模擬場地在割草線終點車頭離牆只有約 0.33 m，會被停止區誤擋，所以模擬預設關。
+手動模式（0 / 2）不經過停止區。
 
 ---
 
@@ -128,7 +148,7 @@ stateDiagram-v2
 | mode | 名稱 | `/cmd_vel` 的來源 | 介面上可選 |
 |------|------|------------------|:---------:|
 | 0 | 建圖（SLAM） | `/cmd_vel_joy`（搖桿，且要按住 deadman） | ✓ |
-| 1 | F2C 割草 | `/cmd_vel_nav`（Nav2） | ✓ |
+| 1 | F2C 割草 | `/cmd_vel_nav`（Nav2；實車要按住 LB、光達停止區淨空） | ✓ |
 | 2 | 手動 | `/cmd_vel_joy`（搖桿，且要按住 deadman） | ✓ |
 | 3 | **保留，未實作** | `/cmd_vel_nav`（轉發規則與 mode 1 相同） | ✗ |
 | 4 | 急停 | 無，全部攔截 | ✓（獨立的大按鈕） |
@@ -240,7 +260,7 @@ graph LR
     H -.->|"不依賴模擬<br/>可單獨跑"| N
 ```
 
-共 **49 項**。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
+共 **49 項**，另加 2026-10-15 的 Phase S 7 項。開發時只跑受影響的 Phase（改 F2C 跑 B + N、改 manager 跑 D + N、
 改 bridge_node 跑 H），收尾才跑完整套件。
 
 | Phase | 內容 | 需要 Gazebo |
@@ -255,6 +275,7 @@ graph LR
 | O | 臨時障礙物擋住割草線時跳過該段並繼續（固定用 `demo_lawn_obstacle.world`） | ✓ |
 | P | 狀態發布（`/mower_status`、`/mission_status`、`/joy_status`）、邊界防呆、HMI 無頭啟動、五個模式的急停鍵與手把仲裁 | ✓ |
 | Q | 真實 SLAM 地圖 → 邊界 → F2C → 路徑與**佇列**可通行性（含掉頭空間，規劃出轉不過去的點就擋下來）＋**任務開始前車子自己的淨空** | ✓ |
+| S | 實車的停車條件：自動模式放開 LB、手把斷線、光達中斷、光達停止區；手動模式不受停止區影響 | ✗ |
 
 覆蓋率拆帳不在測試套件裡（它要跑一次 23 分鐘的完整任務），
 用 `test/tools/coverage_run.py` + `test/tools/coverage_budget.py` 手動量，

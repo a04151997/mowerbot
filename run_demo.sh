@@ -187,6 +187,10 @@ source "${ROS_SETUP}"
 if [ -f "${WS_SETUP}" ]; then
     # shellcheck disable=SC1090
     source "${WS_SETUP}"
+    # tf2_ros 死鎖修正 overlay (docs/tf2_deadlock_fix.md)：存在就疊上去，沒有就用系統版
+    TF2_FIX_SETUP="${TF2_FIX_WS:-$HOME/tf2_fix_ws}/install/setup.bash"
+    # shellcheck disable=SC1090
+    [ -f "${TF2_FIX_SETUP}" ] && source "${TF2_FIX_SETUP}"
     set -u
 else
     set -u

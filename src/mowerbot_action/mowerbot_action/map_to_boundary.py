@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
+import math
 import rclpy
+import tf2_ros
 from rclpy.node import Node
 from nav_msgs.msg import OccupancyGrid
 from geometry_msgs.msg import PolygonStamped, Point32, Polygon
 from mowerbot_interfaces.msg import ObstaclePolygons
 # 導入 ROS 2 關鍵的 QoS 套件
 from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.time import Time
 import numpy as np
 import cv2
+
+from mowerbot_action import keepout
+from mowerbot_action import lawn_boundary
 
 class MapToBoundaryNode(Node):
 
@@ -38,6 +44,14 @@ class MapToBoundaryNode(Node):
     # 真正需要繞開的東西不會低於這個尺寸。
     MIN_OBSTACLE_AREA = 0.09
 
+    # 禁區 (2026-10-18) 套到地圖上時往外多擴 1 格：建圖中的地圖 origin 不一定跟存圖時對齊，
+    # 換格子時最多差半格，多擴 1 格保證禁區只會變大、不會縮小。
+    KEEPOUT_DILATE_CELLS = 1
+
+    # 車子所在的那一塊 (2026-10-19)：車子的格子剛好不是空地 (例如停在禁區或牆的膨脹邊上) 時，
+    # 往外找這個距離內最近的空地格。0.5 m 約是半個車寬，再遠就不能說「車子在這一塊」。
+    ROBOT_REGION_SEARCH_M = 0.5
+
     def __init__(self):
         super().__init__('map_to_boundary')
         
@@ -58,9 +72,82 @@ class MapToBoundaryNode(Node):
         self.obstacle_pub = self.create_publisher(
             ObstaclePolygons, '/f2c_obstacles', 10)
         
+        # 草地邊界 (2026-10-08)：boundary_recorder 記下的「沿草地邊緣開一圈」的多邊形。
+        # 收到之後自由區域只取它裡面的部分 (戶外草地旁邊是水泥地時，光達看不出草地在哪結束)。
+        # 沒收到、或收到空的多邊形 (清除) 時，行為與之前完全相同。
+        # 發布端是 transient local，這裡也要 transient local 才收得到比自己早發的那一個。
+        self.lawn_polygon = None
+        self.last_map = None
+        self.lawn_sub = self.create_subscription(
+            PolygonStamped, '/lawn_boundary', self.lawn_callback, map_qos)
+
+        # 禁區 (2026-10-18)：使用者在存好的地圖上用紅色畫的區域，由 keepout_server 發布。
+        # 禁區裡的格子當成不能割：在作業區中間就變成內部障礙物 (F2C 的內環)，碰到外圈就切掉外圈。
+        # 收到「沒有禁區」(全部是 0) 時行為與之前完全相同。
+        self.keepout = None
+        self.keepout_sub = self.create_subscription(
+            OccupancyGrid, '/keepout_mask', self.keepout_callback, map_qos)
+
+        # 割草範圍取哪一塊 (2026-10-19 will)：
+        #   robot   = 車子所在的那一塊 (預設)。用紅線圍一圈、車子停在圈裡，就只割圈裡面。
+        #   largest = 面積最大的那一塊 (之前的行為)。
+        # 之前用 largest 時，10-19 will 在 lab1 用紅線圍出中間那一塊 (195 m²)，
+        # 程式卻選了紅線外面的右邊房間 (217 m²)；車子不在那一塊裡，manager 會拒絕開始，
+        # 但拒絕的訊息是「不足以原地掉頭」，看不出真正的原因。
+        # 整張地圖連在一起 (沒有畫紅線切開) 時兩種結果相同。查不到車子位置時一律退回 largest。
+        self.declare_parameter('boundary_region', 'robot')
+        self.boundary_region = str(self.get_parameter('boundary_region').value)
+        if self.boundary_region not in ('robot', 'largest'):
+            self.get_logger().error(
+                f'⚠️ boundary_region 只能是 robot 或 largest，收到 {self.boundary_region!r}，改用 robot。')
+            self.boundary_region = 'robot'
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+        self.get_logger().info(f'割草範圍取：{self.boundary_region}')
+
         self.get_logger().info('✅ 邊界提取節點已成功掛載 Transient Local QoS，開始監聽 /map...')
 
+    def lawn_callback(self, msg):
+        pts = [(p.x, p.y) for p in msg.polygon.points]
+        if len(pts) < 3:
+            self.lawn_polygon = None
+            self.get_logger().info('🌱 草地邊界已清除，割草範圍回到只由地圖決定。')
+        elif msg.header.frame_id and msg.header.frame_id != 'map':
+            # 這個節點把地圖格子直接換算成 map 座標，不做 TF 轉換
+            self.get_logger().error(
+                f'⚠️ 草地邊界的 frame_id 是 {msg.header.frame_id}，不是 map，忽略。')
+            return
+        else:
+            self.lawn_polygon = pts
+            self.get_logger().info(
+                f'🌱 收到草地邊界：{len(pts)} 個頂點、面積 '
+                f'{lawn_boundary.polygon_area(pts):.1f} m²，之後的割草範圍只取它裡面的部分。')
+        # 不用等下一張地圖，拿最近一張馬上重算
+        if self.last_map is not None:
+            self.map_callback(self.last_map)
+
+    def keepout_callback(self, msg):
+        grid = np.array(msg.data, dtype=np.int8).reshape((msg.info.height, msg.info.width)) > 50
+        # 沒有禁區的空遮罩 keepout_server 放在 odom (還沒開始建圖時沒有 map)，空的就不必看座標系
+        if grid.any() and msg.header.frame_id and msg.header.frame_id != 'map':
+            self.get_logger().error(
+                f'⚠️ 禁區的 frame_id 是 {msg.header.frame_id}，不是 map，忽略。')
+            return
+        if not grid.any():
+            if self.keepout is not None:
+                self.get_logger().info('⛔ 禁區已清除，割草範圍回到只由地圖決定。')
+            self.keepout = None
+        else:
+            self.keepout = (grid, msg.info.resolution,
+                            msg.info.origin.position.x, msg.info.origin.position.y)
+            self.get_logger().info(
+                f'⛔ 收到禁區：{int(np.count_nonzero(grid))} 格 '
+                f'({np.count_nonzero(grid) * msg.info.resolution ** 2:.2f} m²)，之後的割草範圍會避開。')
+        if self.last_map is not None:
+            self.map_callback(self.last_map)
+
     def map_callback(self, msg):
+        self.last_map = msg
         width = msg.info.width
         height = msg.info.height
         resolution = msg.info.resolution
@@ -78,9 +165,35 @@ class MapToBoundaryNode(Node):
         img = np.zeros((height, width), dtype=np.uint8)
         free_space_mask = (grid >= 0) & (grid <= 20)
         img[free_space_mask] = 255 
+
+        # 2.5 草地邊界：自由區域只留草地多邊形裡面的部分 (取交集只會變小，不會變大)。
+        # 放在找輪廓之前，所以落在草地外面的未知格、障礙物也不會被當成內部障礙物送出去。
+        if self.lawn_polygon is not None:
+            lawn_mask = lawn_boundary.rasterize(
+                self.lawn_polygon, origin_x, origin_y, resolution, width, height)
+            img = cv2.bitwise_and(img, lawn_mask)
+            self.get_logger().info(
+                f'🌱 套用草地邊界：自由區域 {int(np.count_nonzero(free_space_mask))} 格 -> '
+                f'{int(np.count_nonzero(img))} 格')
         
+        # 2.6 禁區：禁區裡的格子一律當成不能割 (只會讓作業區變小)。跟草地邊界一樣放在找輪廓之前。
+        if self.keepout is not None:
+            ko_grid, ko_res, ko_ox, ko_oy = self.keepout
+            ko = keepout.resample(ko_grid, ko_res, ko_ox, ko_oy,
+                                  width, height, resolution, origin_x, origin_y)
+            if self.KEEPOUT_DILATE_CELLS > 0 and ko.any():
+                k = 2 * self.KEEPOUT_DILATE_CELLS + 1
+                ko = cv2.dilate(ko.astype(np.uint8), np.ones((k, k), np.uint8)) > 0
+            before = int(np.count_nonzero(img))
+            img[ko] = 0
+            self.get_logger().info(
+                f'⛔ 套用禁區：自由區域 {before} 格 -> {int(np.count_nonzero(img))} 格')
+
         # 【影像防錯微調】：給影像四周加上 1 畫素的黑邊，防止草地頂到地圖邊緣導致 OpenCV 找不到輪廓
         padded_img = cv2.copyMakeBorder(img, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+
+        # 2.7 只留車子所在的那一塊 (boundary_region = robot)。查不到時原樣，下面取最大的一塊。
+        padded_img = self.keep_robot_region(padded_img, resolution, origin_x, origin_y)
         
         # 3. 尋找輪廓
         # 【階段 11】改用 RETR_CCOMP：它會回傳兩層 —— 第一層是草地的外輪廓，
@@ -190,6 +303,50 @@ class MapToBoundaryNode(Node):
         self.get_logger().info(
             f'🕳️ 內部障礙物 {len(obs_msg.polygons)} 個已發布至 /f2c_obstacles'
             f' (另有 {n_skipped} 個小於 {self.MIN_OBSTACLE_AREA} m² 或頂點不足，已略過)')
+
+    def keep_robot_region(self, padded, resolution, origin_x, origin_y):
+        """只留下車子所在的那一塊自由區域 (padded 是四周加了 1 格黑邊的 0/255 影像)。
+
+        查不到車子位置、或車子附近沒有空地時原樣回傳，map_callback 會照舊取面積最大的一塊。
+        別塊自由區域被拿掉之後，原本在洞裡的小島也一起消失，那個洞整個當成障礙物，不會被割。
+        """
+        if self.boundary_region != 'robot':
+            return padded
+        try:
+            tf = self.tf_buffer.lookup_transform('map', 'base_footprint', Time())
+        except Exception as exc:
+            self.get_logger().warn(
+                f'⚠️ 查不到車子在地圖上的位置 ({type(exc).__name__})，割草範圍這次取面積最大的一塊。')
+            return padded
+        x, y = tf.transform.translation.x, tf.transform.translation.y
+        # 8 連通：跟 findContours 對前景的連通定義一致
+        n, labels = cv2.connectedComponents(padded, connectivity=8)
+        u = int(math.floor((x - origin_x) / resolution)) + 1   # +1：四周的黑邊
+        v = int(math.floor((y - origin_y) / resolution)) + 1
+        r = int(math.ceil(self.ROBOT_REGION_SEARCH_M / resolution))
+        h, w = labels.shape
+        v0, v1, u0, u1 = max(v - r, 0), min(v + r + 1, h), max(u - r, 0), min(u + r + 1, w)
+        label = 0
+        if v0 < v1 and u0 < u1:
+            win = labels[v0:v1, u0:u1]
+            vs, us = np.nonzero(win)
+            if len(vs):
+                d2 = (vs + v0 - v) ** 2 + (us + u0 - u) ** 2
+                k = int(np.argmin(d2))
+                if d2[k] <= r * r:
+                    label = int(win[vs[k], us[k]])
+        if label == 0:
+            self.get_logger().warn(
+                f'⚠️ 車子 ({x:.2f}, {y:.2f}) 附近 {self.ROBOT_REGION_SEARCH_M:.1f} m 內沒有空地，'
+                f'割草範圍這次取面積最大的一塊。')
+            return padded
+        region = np.where(labels == label, 255, 0).astype(np.uint8)
+        area = np.count_nonzero(region) * resolution ** 2
+        self.get_logger().info(
+            f'🚗 割草範圍取車子 ({x:.2f}, {y:.2f}) 所在的那一塊：{area:.1f} m²'
+            f'（地圖上共 {n - 1} 塊分開的空地）')
+        return region
+
 
 def main(args=None):
     rclpy.init(args=args)
